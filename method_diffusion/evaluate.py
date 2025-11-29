@@ -207,7 +207,7 @@ def main():
     model = DiffusionPast(args).to(device)
 
     # 加载检查点
-    checkpoint_path = Path(args.checkpoint_dir) / 'checkpoint_epoch_50.pth'  # 根据需要修改
+    checkpoint_path = Path(args.checkpoint_dir) / 'checkpoint_epoch_1.pth'
     if checkpoint_path.exists():
         checkpoint = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])

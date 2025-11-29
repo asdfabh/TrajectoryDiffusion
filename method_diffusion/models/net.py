@@ -80,7 +80,12 @@ class DiffusionPast(nn.Module):
         else:
             return self.forward_test(hist, hist_mask, nbrs, nbrs_mask, nbrs_num)
 
+    # 将堆叠的nbrs转换为稀疏表达形式，并且将Mask转化为稀疏表示
+    # 输入的hist，nbrs为完整轨迹，先进行mask
     def preprossess_input(self, hist, hist_mask, nbrs, nbrs_mask, nbrs_num):
+
+        hist[~hist_mask.bool()] = 0.0
+        nbrs[~nbrs_mask.bool()] = 0.0
         hist_norm = self.norm(hist)
         nbrs_norm = self.norm(nbrs)
 
@@ -105,12 +110,13 @@ class DiffusionPast(nn.Module):
         ego_mask = hist_mask.unsqueeze(1)  # [B, 1, T]
 
         inputs = torch.cat([ego_expanded, nbrs_sparse], dim=1)
-        masks = torch.cat([ego_mask, nbrs_sparse_mask], dim=1)
+        masks = torch.cat([ego_mask, nbrs_sparse_mask], dim=1) # mask size: [B, 1+max_num, T]
         return inputs, masks
 
     def forward_train(self, hist, hist_mask, nbrs, nbrs_mask, nbrs_num):
         inputs, masks = self.preprossess_input(hist, hist_mask, nbrs, nbrs_mask, nbrs_num)
         B, N, T, dim = inputs.shape  # N includes ego and nbrs, N = 40
+        print(f"B = {B}, N = {N}, T = {T}, dim = {dim}")
         device = hist.device
         inputs = inputs.view(B, N * T, dim)
         masks = masks.view(B, N * T).unsqueeze(-1) # size [B, N*T, 1]
@@ -127,10 +133,36 @@ class DiffusionPast(nn.Module):
         input_embedded = self.input_embedding(noisy_inputs) + self.pos_embedding(noisy_inputs)
         atten_mask = (masks.squeeze(-1) == 0)  # [B, N*T]  True表示填充位置
         pred = self.dit(x=input_embedded, t=timestpes, neighbor_current_mask=atten_mask)
-        input_gt = inputs[..., 0:2]
-        loss = self.loss(pred, input_gt, masks)
+
+        pred = pred.view(B, N, T, 2)
+
+        pred_ego = pred[:, 0, :, :]  # [B, T, 2]
+        pred_nbrs_dense = pred[:, 1:, :, :]  # [B, 39, T, 2]
+
+        # ✅ 将稠密的 nbrs 转换回稀疏表示
+        pred_nbrs_sparse = []
+        for b in range(B):
+            count = int(nbrs_num[b])
+            if count > 0:
+                pred_nbrs_batch = pred_nbrs_dense[b, 0:count, :, :]  # [count, T, 2]
+                pred_nbrs_sparse.append(pred_nbrs_batch)
+
+        if pred_nbrs_sparse:
+            pred_nbrs = torch.cat(pred_nbrs_sparse, dim=0)  # [N_total, T, 2]
+        else:
+            pred_nbrs = torch.empty(0, T, 2, device=device)
+
+        loss_ego = self.loss(pred_ego, hist[..., 0:2], hist_mask.unsqueeze(-1))
+        loss_nbrs = self.loss(pred_nbrs, nbrs[..., 0:2], nbrs_mask.unsqueeze(-1))
+        loss = loss_ego + loss_nbrs
+        pred = torch.cat((pred_ego, pred_nbrs), dim=-1)
+        print(f"shape of pred in train: {pred.shape}")
 
         return loss, pred
+        # input_gt = inputs[..., 0:2]
+        # loss = self.loss(pred, input_gt, masks)
+        #
+        # return loss, pred
 
     def forward_test(self, hist, hist_mask, nbrs, nbrs_mask, nbrs_num, num_inference_steps=50):
         inputs, masks = self.preprossess_input(hist, hist_mask, nbrs, nbrs_mask, nbrs_num)
@@ -168,12 +200,32 @@ class DiffusionPast(nn.Module):
 
             noisy_inputs = torch.clamp(noisy_inputs, -5, 5)
 
-        # 最终输出
-        final_pred = noisy_inputs[..., 0:2]
-        target = inputs[..., 0:2]
-        loss = self.loss(final_pred, target, masks)
+        final_pred = noisy_inputs[..., 0:2]  # [B, N*T, 2]
 
-        return loss, final_pred
+        pred = final_pred.view(B, N, T, 2)
+
+        pred_ego = pred[:, 0, :, :]  # [B, T, 2]
+        pred_nbrs_dense = pred[:, 1:, :, :]  # [B, 39, T, 2]
+
+        pred_nbrs_sparse = []
+        for b in range(B):
+            count = int(nbrs_num[b])
+            if count > 0:
+                pred_nbrs_batch = pred_nbrs_dense[b, 0:count, :, :]  # [count, T, 2]
+                pred_nbrs_sparse.append(pred_nbrs_batch)
+
+        if pred_nbrs_sparse:
+            pred_nbrs = torch.cat(pred_nbrs_sparse, dim=0)  # [N_total, T, 2]
+        else:
+            pred_nbrs = torch.empty(0, T, 2, device=device)
+
+        loss_ego = self.loss(pred_ego, hist[..., 0:2], hist_mask.unsqueeze(-1))
+        loss_nbrs = self.loss(pred_nbrs, nbrs[..., 0:2], nbrs_mask.unsqueeze(-1)) if pred_nbrs.numel() > 0 else 0.0
+        loss = loss_ego + loss_nbrs
+
+        pred = torch.cat([pred_ego, pred_nbrs], dim=0)  # [B + N_total, T, 2]
+        print(f"shape of pred in test: {pred.shape}")
+        return loss, pred
 
     # hist = [B, T, dim], nbrs = [N_total, T, dim]. dim = x, y, v, a, laneID, class
     def norm(self, x):

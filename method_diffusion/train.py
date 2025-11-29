@@ -69,10 +69,10 @@ def train_epoch(model, dataloader, optimizer, device, epoch, input_dim,
     total_loss = 0.0
     num_batches = 0
 
-    # pbar = tqdm(enumerate(dataloader), total=len(dataloader),
-    #             desc=f"Epoch {epoch}", ncols=100)
+    pbar = tqdm(enumerate(dataloader), total=len(dataloader),
+                desc=f"Epoch {epoch}", ncols=100)
 
-    for batch_idx, batch in enumerate(dataloader):
+    for batch_idx, batch in pbar:
         # 数据拼接和掩码生成
         hist, nbrs, hist_mask, nbrs_mask, nbrs_num = prepare_input_data(
             batch, input_dim, mask_type=mask_type, mask_prob=mask_prob
@@ -98,15 +98,15 @@ def train_epoch(model, dataloader, optimizer, device, epoch, input_dim,
         total_loss += loss.item()
         num_batches += 1
 
-        # pbar.set_postfix({
-        #     'loss': f'{loss.item():.4f}',
-        #     'avg_loss': f'{total_loss/num_batches:.4f}',
-        #     'mask': f'{mask_type}({mask_prob})'
-        # })
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'avg_loss': f'{total_loss/num_batches:.4f}',
+            'mask': f'{mask_type}({mask_prob})'
+        })
 
-        if batch_idx % 50 == 0:
-            print(f"Epoch [{epoch}] Batch [{batch_idx}/{len(dataloader)}] "
-                  f"Loss: {loss.item():.4f} | Mask: {mask_type}({mask_prob})")
+        # if batch_idx % 50 == 0:
+        #     print(f"Epoch [{epoch}] Batch [{batch_idx}/{len(dataloader)}] "
+        #           f"Loss: {loss.item():.4f} | Mask: {mask_type}({mask_prob})")
 
     avg_loss = total_loss / num_batches
     return avg_loss
