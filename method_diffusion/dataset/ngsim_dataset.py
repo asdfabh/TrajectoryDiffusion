@@ -311,11 +311,12 @@ class NgsimDataset(Dataset):
 
         # Initialize social mask batch:
         pos = [0, 0]
-        mask_batch = torch.zeros(len(samples), self.grid_size[1], self.grid_size[0], self.enc_size)  # (batch,3,13,h)
-        temporal_mask_batch = torch.zeros(len(samples), self.grid_size[1], self.grid_size[0], 6)  # (batch,3,13,h)
         map_position = torch.zeros(0, 2)
-        mask_batch = mask_batch.bool()
-        temporal_mask_batch = temporal_mask_batch.bool()
+        mask_batch = torch.zeros(len(samples), self.grid_size[1], self.grid_size[0]).bool()
+        # mask_batch = torch.zeros(len(samples), self.grid_size[1], self.grid_size[0], self.enc_size)  # (batch,3,13,h)
+        # temporal_mask_batch = torch.zeros(len(samples), self.grid_size[1], self.grid_size[0], 6)  # (batch,3,13,h)
+        # mask_batch = mask_batch.bool()
+        # temporal_mask_batch = temporal_mask_batch.bool()
 
         # Initialize history, history lengths, future, output mask, lateral maneuver and longitudinal maneuver batches:
         hist_batch = torch.zeros(len(samples), maxlen, 2)  # (len1,batch,2)
@@ -383,8 +384,9 @@ class NgsimDataset(Dataset):
                     nbrs_valid_mask[count, :nbr_len, 0] = True
                     pos[0] = id % self.grid_size[0]
                     pos[1] = id // self.grid_size[0]
-                    mask_batch[sampleId, pos[1], pos[0], :] = torch.ones(self.enc_size).byte()
-                    temporal_mask_batch[sampleId, pos[1], pos[0], :] = torch.ones(6).byte()
+                    mask_batch[sampleId, pos[1], pos[0]] = True
+                    # mask_batch[sampleId, pos[1], pos[0], :] = torch.ones(self.enc_size).byte()
+                    # temporal_mask_batch[sampleId, pos[1], pos[0], :] = torch.ones(6).byte()
                     map_position = torch.cat((map_position, torch.tensor([[pos[1], pos[0]]])), 0)
                     count += 1
             for id, nbrva in enumerate(neighborsva):
@@ -434,7 +436,7 @@ class NgsimDataset(Dataset):
             "nbrs_class": nbrsclass_batch,
             "map_position": map_position,
             "nbrs_num": nbrs_num_batch,
-            "temporal_mask": temporal_mask_batch,
+            # "temporal_mask": temporal_mask_batch,
         }
 
     def compute_stats(self, save_path=None, sample_limit=None):

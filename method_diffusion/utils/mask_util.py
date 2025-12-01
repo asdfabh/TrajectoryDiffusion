@@ -20,12 +20,27 @@ def apply_mask_keep_length(traj, mask, fill_value=0):
     masked_traj[~mask] = fill_value
     return masked_traj
 
-def random_mask_traj(traj, p=0.4):
-    T = traj.shape[0]
-    if T == 0:
-        return np.array([], dtype=bool)
+# def random_mask_traj(traj, p=0.4):
+#     T = traj.shape[0]
+#     if T == 0:
+#         return np.array([], dtype=bool)
+#
+#     mask = np.random.rand(T) < p
+#     return mask
 
-    mask = np.random.rand(T) < p
+def random_mask_traj(traj, p=0.4):
+    if isinstance(traj, np.ndarray):
+        traj = torch.from_numpy(traj)
+
+    if traj.dim() == 2:
+        T = traj.shape[0]
+        if T == 0:
+            return torch.empty(0, dtype=torch.bool, device=traj.device)
+        mask = torch.rand(T, device=traj.device) < p
+    else:  # [B, T, 2]
+        B, T, _ = traj.shape
+        mask = torch.rand(B, T, device=traj.device) < p
+
     return mask
 
 def random_prefix_keep_traj(traj, p=0.6):
@@ -39,13 +54,24 @@ def random_prefix_keep_traj(traj, p=0.6):
     # print(f"keep_len: {keep_len}, mask = {mask}")
     return mask
 
-def block_mask_traj(traj, missing_ratio=0.3):
-    T = traj.shape[0]
-    if T == 0:
-        return np.array([], dtype=bool)
+# def block_mask_traj(traj, missing_ratio=0.3):
+#     T = traj.shape[0]
+#     if T == 0:
+#         return np.array([], dtype=bool)
+#
+#     block_len = max(1, min(T, int(round(T * missing_ratio))))
+#     start = np.random.randint(0, T - block_len + 1)
+#     mask = np.ones(T, dtype=bool)
+#     mask[start:start + block_len] = 0
+#     return mask
 
+
+def block_mask_traj(traj, missing_ratio=0.3):
+    """支持单条轨迹 [T, 2]"""
+    T = traj.shape[0]
     block_len = max(1, min(T, int(round(T * missing_ratio))))
-    start = np.random.randint(0, T - block_len + 1)
-    mask = np.ones(T, dtype=bool)
-    mask[start:start + block_len] = 0
+    start = torch.randint(0, T - block_len + 1, (1,), device=traj.device).item()
+
+    mask = torch.ones(T, dtype=torch.bool, device=traj.device)
+    mask[start:start + block_len] = False
     return mask

@@ -9,18 +9,19 @@ def get_args_parser():
     parser.add_argument('--hidden_dim', default='128', type=int, help="Transformer隐藏层维度")
     parser.add_argument('--output_dim', default='2', type=int, help="预测输出维度，如未来位置(x,y)")
     parser.add_argument('--heads', default='4', type=int, help="Transformer多头注意力头数")
-    parser.add_argument('--depth', default='4', type=int, help="Transformer层数")
+    parser.add_argument('--depth', default='2', type=int, help="Transformer层数")
     parser.add_argument('--dropout', default='0.1', type=float, help="前馈网络扩展倍数(即hidden_dim乘以该倍率)")
     parser.add_argument('--mlp_ratio', default='4', type=int, help="前馈网络扩展倍数(即hidden_dim乘以该倍率)")
     parser.add_argument('--num_train_timesteps', default='100', type=int, help="前馈网络扩展倍数(即hidden_dim乘以该倍率)")
     parser.add_argument('--time_embedding_size', type=int, default=256)
 
     # 训练参数
-    parser.add_argument('--batch_size', type=int, default=48)
+    parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--num_epochs', type=int, default=2)
-    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--save_interval', type=int, default=1)
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
+    parser.add_argument('--resume', default='None', type=str, help="none/latest/best/或直接给定checkpoint路径")
 
     return parser

@@ -1,13 +1,12 @@
 import torch
 from torch.utils.data import DataLoader
 from pathlib import Path
-from method_diffusion.models.net1 import DiffusionPast
+from method_diffusion.models.net_st import DiffusionPast
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.config import get_args_parser
 from method_diffusion.utils.mask_util import random_mask_traj, block_mask_traj
 import numpy as np
 from tqdm import tqdm
-from einops import repeat
 
 import sys
 import os
@@ -15,7 +14,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def prepare_input_data(batch, input_dim, mask_type='random', mask_prob=0.4, device='cuda'):
 
-    # type is torch
+    # torch
     hist = batch['hist']  # [B, T, 2]
     nbrs = batch['nbrs']  # [N_total, T, 2]
     va = batch['va']  # [B, T, 2]
@@ -25,7 +24,6 @@ def prepare_input_data(batch, input_dim, mask_type='random', mask_prob=0.4, devi
     cclass = batch['cclass']  # [B, T, 1]
     nbrs_class = batch['nbrs_class']  # [N_total, T, 1]
     nbrs_num = batch['nbrs_num'].squeeze(-1)  # [B]
-    mask = batch['mask'].to(device) # [B, 3, 13]
 
     # 根据 input_dim 拼接特征
     if input_dim == 6:
@@ -41,72 +39,38 @@ def prepare_input_data(batch, input_dim, mask_type='random', mask_prob=0.4, devi
     B, T, _ = hist.shape
     N_total = nbrs.shape[0]
 
-    # 在mask的基础上生成历史轨迹掩码，并应用掩码
-    mask = mask.view(mask.shape[0], mask.shape[1] * mask.shape[2])  # [B, 39]
-    mask = mask.unsqueeze(-1).expand(-1, -1, input_dim)  # [B, 39, dim]
-    mask = repeat(mask, 'b c n -> b t c n', t=T)  # [B, T, 39, 6]
-    nbrs_grid = torch.zeros_like(mask).float()
-    nbrs_grid = nbrs_grid.masked_scatter_(mask.bool(), nbrs_src)  # size [B, T, 39, dim]
+    if mask_type == 'random':
+        hist_mask = random_mask_traj(hist, p=mask_prob)  # [B, T]
+    else:  # 'block'
+        hist_mask = torch.stack([
+            block_mask_traj(hist[b], missing_ratio=mask_prob)
+            for b in range(B)
+        ])  # [B, T]
 
-    has_trajectory = mask[:, :, :, 0].bool()  # 提取有轨迹标记
-    time_mask = torch.rand(B, T, 39, device=device) < mask_prob
-    time_mask_final = has_trajectory & time_mask
-    time_mask_expanded = time_mask_final.unsqueeze(-1).expand(-1, -1, -1, input_dim)
+    hist_mask = hist_mask.float()
 
-    nbrs_grid = nbrs_grid * (~time_mask_expanded).float()  # 时间掩码应用 size [B, T, 39, dim]
+    # 检测空轨迹: [N_total, T, 2] -> [N_total]
+    nbrs_valid = (nbrs != 0).any(dim=-1).any(dim=-1)  # 至少有一个非零点
 
-    hist_mask = torch.rand(B, T, device=device) < mask_prob
-    hist_mask = hist_mask.unsqueeze(-1).expand(-1, -1, input_dim)
-    hist = src.to(device) * (~hist_mask).float() # 应用时间掩码 size [B, T, dim]
-    hist = hist.unsqueeze(2)
-    # print(f"device of hist: {hist.device}, device of nbrs_grid: {nbrs_grid.device}")
-    # hist_nbrs = torch.cat([hist, nbrs_grid], dim=2)
-    return hist, nbrs_grid, nbrs_num
+    if mask_type == 'random':
+        nbrs_mask_raw = random_mask_traj(nbrs, p=mask_prob)
+    else:  # 'block'
+        nbrs_mask_raw = torch.stack([
+            block_mask_traj(nbrs[n], missing_ratio=mask_prob)
+            for n in range(N_total)
+        ])
 
-def prepare_input_data2(batch, input_dim, mask_type='random', mask_prob=0.4, device='cuda'):
-    # 1. 一次性将所有数据移到 GPU,避免多次传输
-    hist = batch['hist'].to(device)  # [B, T, 2]
-    nbrs = batch['nbrs'].to(device)  # [N_total, T, 2]
-    va = batch['va'].to(device)  # [B, T, 2]
-    nbrs_va = batch['nbrs_va'].to(device)  # [N_total, T, 2]
-    lane = batch['lane'].to(device)  # [B, T, 1]
-    nbrs_lane = batch['nbrs_lane'].to(device)  # [N_total, T, 1]
-    cclass = batch['cclass'].to(device)  # [B, T, 1]
-    nbrs_class = batch['nbrs_class'].to(device)  # [N_total, T, 1]
-    mask = batch['mask'].to(device)  # [B, 3, 13]
+    # 将空轨迹的掩码全部置 0
+    nbrs_mask = nbrs_mask_raw.float() * nbrs_valid.unsqueeze(-1).float()
 
-    B, T, _ = hist.shape
+    src = src.to(device)
+    nbrs_src = nbrs_src.to(device)
+    hist_mask = hist_mask.to(device)
+    nbrs_mask = nbrs_mask.to(device)
+    nbrs_num = nbrs_num.to(device)
 
-    # 2. 提前拼接特征,避免多次条件判断
-    if input_dim == 6:
-        src = torch.cat((hist, cclass, va, lane), dim=-1)  # [B, T, 6]
-        nbrs_src = torch.cat((nbrs, nbrs_class, nbrs_va, nbrs_lane), dim=-1)  # [N_total, T, 6]
-    elif input_dim == 5:
-        src = torch.cat((hist, cclass, va), dim=-1)  # [B, T, 5]
-        nbrs_src = torch.cat((nbrs, nbrs_class, nbrs_va), dim=-1)  # [N_total, T, 5]
-    else:
-        src = hist
-        nbrs_src = nbrs
-
-    # 3. 优化 mask 重构:直接用 view + repeat,避免多次操作
-    mask = mask.view(B, -1, input_dim).unsqueeze(1).expand(-1, T, -1, -1)  # [B, T, 39, dim]
-
-    # 4. 使用 where 替代 masked_scatter_(更快)
-    nbrs_grid = torch.where(mask.bool(),
-                            nbrs_src.view(1, 1, -1, input_dim).expand(B, T, -1, -1),
-                            torch.zeros(1, device=device))  # [B, T, 39, dim]
-
-    # 5. 合并时间掩码生成和应用
-    has_trajectory = mask[..., 0].bool()  # [B, T, 39]
-    time_mask_nbrs = (torch.rand(B, T, 39, device=device) < mask_prob) & has_trajectory
-    nbrs_grid = nbrs_grid.masked_fill(time_mask_nbrs.unsqueeze(-1), 0.0)
-
-    # 6. 简化 hist 掩码生成
-    hist_mask = (torch.rand(B, T, device=device) < mask_prob).unsqueeze(-1)  # [B, T, 1]
-    hist = src.masked_fill(hist_mask, 0.0).unsqueeze(2)  # [B, T, 1, dim]
-
-    return hist, nbrs_grid
-
+    # print(f"device: hist = {src.device}, nbrs = {nbrs_src.device}, hist_mask = {hist_mask.device}, nbrs_mask = {nbrs_mask.device}, nbrs_num = {nbrs_num.device}")
+    return src, nbrs_src, hist_mask, nbrs_mask, nbrs_num
 
 def train_epoch(model, dataloader, optimizer, device, epoch, input_dim,
                 mask_type='random', mask_prob=0.4):
@@ -119,13 +83,13 @@ def train_epoch(model, dataloader, optimizer, device, epoch, input_dim,
                 desc=f"Epoch {epoch}", ncols=100)
 
     for batch_idx, batch in pbar:
-        # 数据拼接、掩码处理 hist: [B, T, 1, dim], nbrs: [B, T, 39, dim]
-        hist, nbrs, nbrs_num = prepare_input_data(
+        # 数据拼接和掩码生成
+        hist, nbrs, hist_mask, nbrs_mask, nbrs_num = prepare_input_data(
             batch, input_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
         )
 
-        # 前向传播，输入为掩码后的轨迹 hist [B, T, 1, dim], nbrs [B, T, 39, dim]
-        loss, pred_ego, pred_nbrs = model.forward_train(hist, nbrs, nbrs_num)
+        # 前向传播
+        loss, pred_ego, pred_nbrs = model.forward_train(hist, hist_mask, nbrs, nbrs_mask, nbrs_num)
 
         # 反向传播
         optimizer.zero_grad()
@@ -170,6 +134,68 @@ def load_checkpoint_if_needed(args, model, optimizer, scheduler, device):
         best_loss = state.get('best_loss', best_loss)
         print(f"Resumed from {ckpt_path} @ epoch {start_epoch}")
     return start_epoch, best_loss
+
+# def main():
+#     args = get_args_parser().parse_args()
+#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+#
+#     # 数据集路径
+#     data_root = Path(__file__).resolve().parent.parent / 'data/ngsimdata'
+#     train_path = str(data_root / 'TrainSet.mat')
+#
+#     # 创建数据集和 DataLoader
+#     train_dataset = NgsimDataset(train_path, t_h=30, t_f=50, d_s=2)
+#     train_loader = DataLoader(
+#         train_dataset,
+#         batch_size=args.batch_size,
+#         shuffle=True,
+#         num_workers=args.num_workers,
+#         collate_fn=train_dataset.collate_fn
+#     )
+#
+#     # 创建模型
+#     model = DiffusionPast(args).to(device)
+#
+#     # 优化器和学习率调度器
+#     optimizer = torch.optim.AdamW(
+#         model.parameters(),
+#         lr=args.learning_rate,
+#         weight_decay=1e-5
+#     )
+#     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+#         optimizer,
+#         T_max=args.num_epochs
+#     )
+#
+#     # 训练循环
+#     for epoch in range(args.num_epochs):
+#         print(f"\n========== Epoch {epoch+1}/{args.num_epochs} ==========")
+#
+#         # 动态切换掩码策略 (可选)
+#         # mask_type = 'random' if epoch < args.num_epochs // 2 else 'block'
+#         mask_type = 'random'
+#         mask_prob = 0.4
+#
+#         avg_loss = train_epoch(
+#             model, train_loader, optimizer, device, epoch+1,
+#             args.feature_dim, mask_type=mask_type, mask_prob=mask_prob
+#         )
+#
+#         print(f"Epoch [{epoch+1}] Average Loss: {avg_loss:.4f}")
+#         scheduler.step()
+#
+#         # 保存检查点
+#         if (epoch + 1) % args.save_interval == 0:
+#             checkpoint_path = Path(args.checkpoint_dir) / f"checkpoint_epoch_{epoch+1}.pth"
+#             checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+#             torch.save({
+#                 'epoch': epoch + 1,
+#                 'model_state_dict': model.state_dict(),
+#                 'optimizer_state_dict': optimizer.state_dict(),
+#                 'scheduler_state_dict': scheduler.state_dict(),
+#                 'loss': avg_loss,
+#             }, checkpoint_path)
+#             print(f"Checkpoint saved to {checkpoint_path}")
 
 def main():
     args = get_args_parser().parse_args()
@@ -232,7 +258,6 @@ def main():
             'loss': avg_loss,
             'best_loss': best_loss,
         }
-
         if (epoch + 1) % args.save_interval == 0:
             torch.save(state, Path(args.checkpoint_dir) / f"checkpoint_epoch_{epoch + 1}.pth")
         if avg_loss < best_loss:

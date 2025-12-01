@@ -22,6 +22,7 @@ class DiffusionLoss(nn.Module):
         mask:   [..., T, 1] 或 [..., T]，1 表示参与损失，0 表示忽略
         """
         # 保证形状一致
+        # print(f"shape of pred in loss: {pred.shape}, shape of target in loss: {target.shape}")
         assert pred.shape == target.shape, "pred 和 target 形状必须一致"
 
         if mask is None:
