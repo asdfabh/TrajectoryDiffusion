@@ -1,17 +1,19 @@
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import torch
 from torch.utils.data import DataLoader
 from pathlib import Path
-from method_diffusion.models.net1 import DiffusionPast
+from method_diffusion.models.net import DiffusionPast
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.config import get_args_parser
+from method_diffusion.utils.visualization import plot_traj_with_mask, plot_traj
 from method_diffusion.utils.mask_util import random_mask_traj, block_mask_traj
 import numpy as np
 from tqdm import tqdm
 from einops import repeat
 
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def prepare_input_data(batch, input_dim, mask_type='random', mask_prob=0.4, device='cuda'):
 
@@ -32,11 +34,11 @@ def prepare_input_data(batch, input_dim, mask_type='random', mask_prob=0.4, devi
         src = torch.cat((hist, cclass, va, lane), dim=-1).to(device)  # [B, T, 6]
         nbrs_src = torch.cat((nbrs, nbrs_class, nbrs_va, nbrs_lane), dim=-1).to(device)  # [N_total, T, 6]
     elif input_dim == 5:
-        src = torch.cat((hist, cclass, va), dim=-1)  # [B, T, 5]
-        nbrs_src = torch.cat((nbrs, nbrs_class, nbrs_va), dim=-1)  # [N_total, T, 5]
+        src = torch.cat((hist, cclass, va), dim=-1).to(device)  # [B, T, 5]
+        nbrs_src = torch.cat((nbrs, nbrs_class, nbrs_va), dim=-1).to(device)  # [N_total, T, 5]
     else:  # input_dim == 2
-        src = hist
-        nbrs_src = nbrs
+        src = hist.to(device)
+        nbrs_src = nbrs.to(device)
 
     B, T, _ = hist.shape
     N_total = nbrs.shape[0]
@@ -53,60 +55,18 @@ def prepare_input_data(batch, input_dim, mask_type='random', mask_prob=0.4, devi
     time_mask_final = has_trajectory & time_mask
     time_mask_expanded = time_mask_final.unsqueeze(-1).expand(-1, -1, -1, input_dim)
 
-    nbrs_grid = nbrs_grid * (~time_mask_expanded).float()  # 时间掩码应用 size [B, T, 39, dim]
+    nbrs_grid_masked = nbrs_grid * (~time_mask_expanded).float()  # 时间掩码应用 size [B, T, 39, dim]
+    obs_nbrs = (has_trajectory & ~time_mask).float().unsqueeze(-1)  #
+    nbrs_grid_masked = torch.cat([nbrs_grid_masked, obs_nbrs], dim=-1)
 
-    hist_mask = torch.rand(B, T, device=device) < mask_prob
-    hist_mask = hist_mask.unsqueeze(-1).expand(-1, -1, input_dim)
-    hist = src.to(device) * (~hist_mask).float() # 应用时间掩码 size [B, T, dim]
-    hist = hist.unsqueeze(2)
-    # print(f"device of hist: {hist.device}, device of nbrs_grid: {nbrs_grid.device}")
-    # hist_nbrs = torch.cat([hist, nbrs_grid], dim=2)
-    return hist, nbrs_grid, nbrs_num
+    # 处理自车历史
+    hist_mask = torch.rand(B, T, device=device) < mask_prob  # [B, T]
+    hist_masked = src.masked_fill(hist_mask.unsqueeze(-1), 0.0)
+    obs_hist = (~hist_mask).float().unsqueeze(-1)  # [B, T, 1]
+    hist_masked = torch.cat([hist_masked, obs_hist], dim=-1).unsqueeze(2)  # [B, T, 1, input_dim+1]
+    src = src.unsqueeze(2)
 
-def prepare_input_data2(batch, input_dim, mask_type='random', mask_prob=0.4, device='cuda'):
-    # 1. 一次性将所有数据移到 GPU,避免多次传输
-    hist = batch['hist'].to(device)  # [B, T, 2]
-    nbrs = batch['nbrs'].to(device)  # [N_total, T, 2]
-    va = batch['va'].to(device)  # [B, T, 2]
-    nbrs_va = batch['nbrs_va'].to(device)  # [N_total, T, 2]
-    lane = batch['lane'].to(device)  # [B, T, 1]
-    nbrs_lane = batch['nbrs_lane'].to(device)  # [N_total, T, 1]
-    cclass = batch['cclass'].to(device)  # [B, T, 1]
-    nbrs_class = batch['nbrs_class'].to(device)  # [N_total, T, 1]
-    mask = batch['mask'].to(device)  # [B, 3, 13]
-
-    B, T, _ = hist.shape
-
-    # 2. 提前拼接特征,避免多次条件判断
-    if input_dim == 6:
-        src = torch.cat((hist, cclass, va, lane), dim=-1)  # [B, T, 6]
-        nbrs_src = torch.cat((nbrs, nbrs_class, nbrs_va, nbrs_lane), dim=-1)  # [N_total, T, 6]
-    elif input_dim == 5:
-        src = torch.cat((hist, cclass, va), dim=-1)  # [B, T, 5]
-        nbrs_src = torch.cat((nbrs, nbrs_class, nbrs_va), dim=-1)  # [N_total, T, 5]
-    else:
-        src = hist
-        nbrs_src = nbrs
-
-    # 3. 优化 mask 重构:直接用 view + repeat,避免多次操作
-    mask = mask.view(B, -1, input_dim).unsqueeze(1).expand(-1, T, -1, -1)  # [B, T, 39, dim]
-
-    # 4. 使用 where 替代 masked_scatter_(更快)
-    nbrs_grid = torch.where(mask.bool(),
-                            nbrs_src.view(1, 1, -1, input_dim).expand(B, T, -1, -1),
-                            torch.zeros(1, device=device))  # [B, T, 39, dim]
-
-    # 5. 合并时间掩码生成和应用
-    has_trajectory = mask[..., 0].bool()  # [B, T, 39]
-    time_mask_nbrs = (torch.rand(B, T, 39, device=device) < mask_prob) & has_trajectory
-    nbrs_grid = nbrs_grid.masked_fill(time_mask_nbrs.unsqueeze(-1), 0.0)
-
-    # 6. 简化 hist 掩码生成
-    hist_mask = (torch.rand(B, T, device=device) < mask_prob).unsqueeze(-1)  # [B, T, 1]
-    hist = src.masked_fill(hist_mask, 0.0).unsqueeze(2)  # [B, T, 1, dim]
-
-    return hist, nbrs_grid
-
+    return hist_masked, nbrs_grid_masked, nbrs_num, src, nbrs_grid
 
 def train_epoch(model, dataloader, optimizer, device, epoch, input_dim,
                 mask_type='random', mask_prob=0.4):
@@ -120,12 +80,12 @@ def train_epoch(model, dataloader, optimizer, device, epoch, input_dim,
 
     for batch_idx, batch in pbar:
         # 数据拼接、掩码处理 hist: [B, T, 1, dim], nbrs: [B, T, 39, dim]
-        hist, nbrs, nbrs_num = prepare_input_data(
+        hist, nbrs, nbrs_num, src, nbrs_src = prepare_input_data(
             batch, input_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
         )
 
         # 前向传播，输入为掩码后的轨迹 hist [B, T, 1, dim], nbrs [B, T, 39, dim]
-        loss, pred_ego, pred_nbrs = model.forward_train(hist, nbrs, nbrs_num)
+        loss, pred_ego, pred_nbrs = model.forward_train(hist, nbrs, nbrs_num, src, nbrs_src)
 
         # 反向传播
         optimizer.zero_grad()
@@ -145,6 +105,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, input_dim,
 
     avg_loss = total_loss / num_batches
     return avg_loss
+
 
 def load_checkpoint_if_needed(args, model, optimizer, scheduler, device):
     start_epoch = 0

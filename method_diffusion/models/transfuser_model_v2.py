@@ -489,7 +489,8 @@ class TrajectoryHead(nn.Module):
 
 
         # 4. begin the stacked decoder
-        poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
+        poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature,
+                        bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
 
         trajectory_loss_dict = {}
         ret_traj_loss = 0

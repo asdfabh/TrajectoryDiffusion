@@ -46,7 +46,7 @@ class NgsimDataset(Dataset):
         self.lane_std = np.array([1.0])
         self.class_mean = np.array([0.0])
         self.class_std = np.array([1.0])
-        self.stats_file = str(Path(__file__).resolve().parent / 'ngsim_stats2.npz')
+        self.stats_file = str(Path(__file__).resolve().parent / 'ngsim_stats.npz')
 
     def __len__(self):
         return len(self.D)

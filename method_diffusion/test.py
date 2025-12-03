@@ -1,237 +1,235 @@
-import math
-import numpy as np
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import torch
 from torch.utils.data import DataLoader
 from pathlib import Path
-import matplotlib.pyplot as plt
-
-from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.net import DiffusionPast
+from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.config import get_args_parser
-from method_diffusion.train import prepare_input_data
+from method_diffusion.utils.visualization import plot_traj_with_mask, plot_traj
+from method_diffusion.utils.mask_util import random_mask_traj, block_mask_traj
+import numpy as np
+from tqdm import tqdm
+from einops import repeat
 
 
-MAX_NEIGHBORS = 39  # 与 DiffusionPast.preprossess_input 中的稀疏槽数量保持一致
+def prepare_input_data(batch, input_dim, mask_type='random', mask_prob=0.4, device='cuda'):
 
+    # type is torch
+    hist = batch['hist']  # [B, T, 2]
+    nbrs = batch['nbrs']  # [N_total, T, 2]
+    va = batch['va']  # [B, T, 2]
+    nbrs_va = batch['nbrs_va']  # [N_total, T, 2]
+    lane = batch['lane']  # [B, T, 1]
+    nbrs_lane = batch['nbrs_lane']  # [N_total, T, 1]
+    cclass = batch['cclass']  # [B, T, 1]
+    nbrs_class = batch['nbrs_class']  # [N_total, T, 1]
+    nbrs_num = batch['nbrs_num'].squeeze(-1)  # [B]
+    mask = batch['mask'].to(device) # [B, 3, 13]
 
-def visualize_batch_with_nbrs(gt_ego, masked_ego, pred_ego,
-                              gt_nbrs_list, masked_nbrs_list, pred_nbrs_list,
-                              save_path=None, show_nbrs=False):
-    """
-    可视化 ego 和 nbrs 的预测结果
+    # 根据 input_dim 拼接特征
+    if input_dim == 6:
+        src = torch.cat((hist, cclass, va, lane), dim=-1).to(device)  # [B, T, 6]
+        nbrs_src = torch.cat((nbrs, nbrs_class, nbrs_va, nbrs_lane), dim=-1).to(device)  # [N_total, T, 6]
+    elif input_dim == 5:
+        src = torch.cat((hist, cclass, va), dim=-1).to(device)  # [B, T, 5]
+        nbrs_src = torch.cat((nbrs, nbrs_class, nbrs_va), dim=-1).to(device)  # [N_total, T, 5]
+    else:  # input_dim == 2
+        src = hist.to(device)
+        nbrs_src = nbrs.to(device)
 
-    Args:
-        gt_ego: [B, T, 2]
-        masked_ego: [B, T, 2]
-        pred_ego: [B, T, 2]
-        gt_nbrs_list: list of [count_b, T, 2], 长度为 B
-        masked_nbrs_list: list of [count_b, T, 2]
-        pred_nbrs_list: list of [count_b, T, 2]
-    """
-    batch = gt_ego.shape[0]
-    cols = min(3, batch)
-    rows = math.ceil(batch / cols)
+    B, T, _ = hist.shape
+    N_total = nbrs.shape[0]
 
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 6, rows * 6))
-    axes = np.atleast_1d(axes).ravel()
+    # 在mask的基础上生成历史轨迹掩码，并应用掩码
+    mask = mask.view(mask.shape[0], mask.shape[1] * mask.shape[2])  # [B, 39]
+    mask = mask.unsqueeze(-1).expand(-1, -1, input_dim)  # [B, 39, dim]
+    mask = repeat(mask, 'b c n -> b t c n', t=T)  # [B, T, 39, 6]
+    nbrs_grid = torch.zeros_like(mask).float()
+    nbrs_grid = nbrs_grid.masked_scatter_(mask.bool(), nbrs_src)  # size [B, T, 39, dim]
 
-    for i in range(batch):
-        ax = axes[i]
+    has_trajectory = mask[:, :, :, 0].bool()  # 提取有轨迹标记
+    time_mask = torch.rand(B, T, 39, device=device) < mask_prob
+    time_mask_final = has_trajectory & time_mask
+    time_mask_expanded = time_mask_final.unsqueeze(-1).expand(-1, -1, -1, input_dim)
 
-        # ========== Ego 可视化 ==========
-        # Ground Truth (蓝色)
-        ax.scatter(gt_ego[i, :, 0], gt_ego[i, :, 1],
-                  color='blue', s=30, label='Ego GT', alpha=0.7, marker='o')
+    nbrs_grid_masked = nbrs_grid * (~time_mask_expanded).float()  # 时间掩码应用 size [B, T, 39, dim]
+    obs_nbrs = (has_trajectory & ~time_mask).float().unsqueeze(-1)  #
+    nbrs_grid_masked = torch.cat([nbrs_grid_masked, obs_nbrs], dim=-1)
 
-        # Masked Input (金色叉号)
-        valid = ~torch.isnan(masked_ego[i, :, 0])
-        if valid.any():
-            ax.scatter(masked_ego[i, valid, 0], masked_ego[i, valid, 1],
-                      color='gold', s=40, marker='x', linewidths=2,
-                      label='Ego Masked', alpha=0.8)
+    # 处理自车历史
+    hist_mask = torch.rand(B, T, device=device) < mask_prob  # [B, T]
+    hist_masked = src.masked_fill(hist_mask.unsqueeze(-1), 0.0)
+    obs_hist = (~hist_mask).float().unsqueeze(-1)  # [B, T, 1]
+    hist_masked = torch.cat([hist_masked, obs_hist], dim=-1).unsqueeze(2)  # [B, T, 1, input_dim+1]
+    src = src.unsqueeze(2)
 
-        # Prediction (绿色)
-        ax.scatter(pred_ego[i, :, 0], pred_ego[i, :, 1],
-                  color='green', s=30, marker='^', label='Ego Pred', alpha=0.7)
+    return hist_masked, nbrs_grid_masked, nbrs_num, src, nbrs_grid
 
-        # ========== Nbrs 可视化 ==========
-        n_nbrs = 0  # 默认无邻车，防止 show_nbrs=False 时未定义
-        if show_nbrs:
-            gt_nbrs = gt_nbrs_list[i]
-            masked_nbrs = masked_nbrs_list[i]
-            pred_nbrs = pred_nbrs_list[i]
+def train_epoch(model, dataloader, optimizer, device, epoch, input_dim,
+                mask_type='random', mask_prob=0.4):
 
-            n_nbrs = gt_nbrs.shape[0]
-            if n_nbrs > 0:
-                # Ground Truth (浅蓝色)
-                for n in range(n_nbrs):
-                    ax.scatter(gt_nbrs[n, :, 0], gt_nbrs[n, :, 1],
-                              color='cyan', s=20, alpha=0.5, marker='o')
+    model.train()
+    total_loss = 0.0
+    num_batches = 0
 
-                # Masked Input (橙色叉号)
-                for n in range(n_nbrs):
-                    valid = ~torch.isnan(masked_nbrs[n, :, 0])
-                    if valid.any():
-                        ax.scatter(masked_nbrs[n, valid, 0], masked_nbrs[n, valid, 1],
-                                  color='orange', s=25, marker='x', linewidths=1.5, alpha=0.6)
+    pbar = tqdm(enumerate(dataloader), total=len(dataloader),
+                desc=f"Epoch {epoch}", ncols=100)
 
-                # Prediction (红色)
-                for n in range(n_nbrs):
-                    ax.scatter(pred_nbrs[n, :, 0], pred_nbrs[n, :, 1],
-                              color='red', s=20, marker='^', alpha=0.6)
-
-        # 图例和格式
-        ax.set_title(f'Sample {i} (Ego + {n_nbrs} Nbrs)', fontsize=10)
-        ax.axis('equal')
-        ax.grid(True, linestyle='--', alpha=0.3)
-
-        # 只在第一个子图显示图例
-        if i == 0:
-            # 手动创建图例
-            from matplotlib.lines import Line2D
-            legend_elements = [
-                Line2D([0], [0], marker='o', color='w', markerfacecolor='blue',
-                      markersize=8, label='Ego GT'),
-                Line2D([0], [0], marker='x', color='w', markerfacecolor='gold',
-                      markersize=8, label='Ego Masked'),
-                Line2D([0], [0], marker='^', color='w', markerfacecolor='green',
-                      markersize=8, label='Ego Pred'),
-            ]
-            if show_nbrs:
-                legend_elements.extend([
-                    Line2D([0], [0], marker='o', color='w', markerfacecolor='cyan',
-                           markersize=6, label='Nbrs GT', alpha=0.5),
-                    Line2D([0], [0], marker='x', color='w', markerfacecolor='orange',
-                           markersize=6, label='Nbrs Masked', alpha=0.6),
-                    Line2D([0], [0], marker='^', color='w', markerfacecolor='red',
-                           markersize=6, label='Nbrs Pred', alpha=0.6),
-                ])
-            ax.legend(handles=legend_elements, loc='upper right', fontsize=8)
-
-    # 删除多余的子图
-    for j in range(batch, len(axes)):
-        fig.delaxes(axes[j])
-
-    plt.tight_layout()
-    if save_path is None:
-        plt.show()
-    else:
-        plt.savefig(save_path, dpi=200, bbox_inches='tight')
-    plt.close(fig)
-
-def run_test(batch_size=5, mask_prob=0.2, num_inference_steps=50, save_path=None, show_nbrs=False):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    args = get_args_parser().parse_args([])
-    args.batch_size = batch_size
-
-    # 加载数据
-    data_root = Path(__file__).resolve().parent / 'data/ngsimdata'
-    data_path = str(data_root / 'TestSet.mat')
-    dataset = NgsimDataset(data_path, t_h=30, t_f=50, d_s=2)
-    loader = DataLoader(
-        dataset, batch_size=batch_size, shuffle=True,
-        num_workers=0, collate_fn=dataset.collate_fn
-    )
-    batch = next(iter(loader))
-
-    # 准备输入
-    hist_in, nbrs_in, hist_mask, nbrs_mask, nbrs_num = prepare_input_data(
-        batch, args.feature_dim, mask_type='random', mask_prob=mask_prob
-    )
-
-    hist_mask_cpu = hist_mask.clone()
-    nbrs_mask_cpu = nbrs_mask.clone()
-
-    hist_in = hist_in.to(device)
-    nbrs_in = nbrs_in.to(device)
-    hist_mask = hist_mask.to(device)
-    nbrs_mask = nbrs_mask.to(device)
-    nbrs_num = nbrs_num.to(device)
-
-    # 模型推理
-    model = DiffusionPast(args).to(device)
-    model.eval()
-    with torch.no_grad():
-        loss, pred = model.forward_test(
-            hist_in, hist_mask, nbrs_in, nbrs_mask, nbrs_num,
-            num_inference_steps=num_inference_steps
+    for batch_idx, batch in pbar:
+        # 数据拼接、掩码处理 hist: [B, T, 1, dim], nbrs: [B, T, 39, dim]
+        hist, nbrs, nbrs_num, src, nbrs_src = prepare_input_data(
+            batch, input_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
         )
-    print(f"Test loss (normalized space): {loss.item():.4f}")
 
-    B, T = batch['hist'].shape[:2]
-    N_total = nbrs_in.shape[0]
+        # 前向传播，输入为掩码后的轨迹 hist [B, T, 1, dim], nbrs [B, T, 39, dim]
+        loss, pred_ego, pred_nbrs = model.forward_train(hist, nbrs, nbrs_num, src, nbrs_src)
+        # loss, pred_ego_norm, pred_nbrs_norm, pred_ego, pred_nbrs, hist_norm, nbrs_norm, src_norm = model.forward_test(hist, nbrs, nbrs_num, src, nbrs_src)
 
-    # ✅ 1. 提取 ego 预测(归一化空间)
-    pred_ego_norm = pred[:B, :, :]  # [B, T, 2]
+        src_norm = src_norm[0, :, 0, :2].detach().cpu().numpy()
+        pred_ego_norm = pred_ego_norm[0, :, 0, :2].detach().cpu().numpy()
+        hist_mask = hist[0, :, 0, -1].detach().cpu().numpy()
+        hist_norm = hist_norm[0, :, 0, :2].detach().cpu().numpy()
+        # print(f"hist_mask: {hist_mask}")
+        # plot_traj([hist])
+        # plot_traj([src])
+        # plot_traj([pred_ego])
 
-    # ✅ 2. 提取 nbrs 预测(归一化空间)
-    if N_total > 0:
-        pred_nbrs_norm = pred[B:, :, :]  # [N_total, T, 2]
-    else:
-        pred_nbrs_norm = torch.empty(0, T, 2, device=device)
+        plot_traj_with_mask(
+            hist_original=[src_norm],
+            hist_masked=[hist_norm],
+            hist_pred=[pred_ego_norm],
+            fig_num1=1,
+            fig_num2=1,
+        )
 
-    # ========== 反归一化 ==========
-    pos_mean = model.pos_mean.view(1, 1, -1)
-    pos_std = model.pos_std.view(1, 1, -1)
+        src = src[0, :, 0, :2].detach().cpu().numpy()
+        pred_ego = pred_ego[0, :, 0, :2].detach().cpu().numpy()
+        hist_mask = hist[0, :, 0, -1].detach().cpu().numpy()
+        hist = hist[0, :, 0, :2].detach().cpu().numpy()
 
-    # Ego 反归一化
-    ego_pred = pred_ego_norm * pos_std + pos_mean  # [B, T, 2]
+        plot_traj_with_mask(
+            hist_original=[src],
+            hist_masked=[hist],
+            hist_pred=[pred_ego],
+            fig_num1=1,
+            fig_num2=1,
+        )
 
-    # Nbrs 反归一化
-    if N_total > 0:
-        nbrs_pred = pred_nbrs_norm * pos_std + pos_mean  # [N_total, T, 2]
-    else:
-        nbrs_pred = torch.empty(0, T, 2)
+        # 反向传播
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
 
-    # ========== 准备 ground truth 和 masked 数据 ==========
-    # Ego
-    gt_ego = batch['hist'][:, :, :2]  # [B, T, 2]
-    masked_ego = gt_ego.clone()
-    mask_bool = hist_mask_cpu.bool().unsqueeze(-1)
-    masked_ego = masked_ego.masked_fill(~mask_bool, float('nan'))
+        # 统计
+        total_loss += loss.item()
+        num_batches += 1
 
-    # Nbrs
-    if N_total > 0:
-        gt_nbrs = batch['nbrs'][:, :, :2]  # [N_total, T, 2]
-        masked_nbrs = gt_nbrs.clone()
-        nbrs_mask_bool = nbrs_mask_cpu.bool().unsqueeze(-1)
-        masked_nbrs = masked_nbrs.masked_fill(~nbrs_mask_bool, float('nan'))
-    else:
-        gt_nbrs = torch.empty(0, T, 2)
-        masked_nbrs = torch.empty(0, T, 2)
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'avg_loss': f'{total_loss/num_batches:.4f}',
+            'mask': f'{mask_type}({mask_prob})'
+        })
 
-    # ========== 按批次重新分组 nbrs ==========
-    nbrs_gt_batched = []
-    nbrs_masked_batched = []
-    nbrs_pred_batched = []
+    avg_loss = total_loss / num_batches
+    return avg_loss
 
-    offset = 0
-    for b in range(B):
-        count = int(nbrs_num[b])
-        if count > 0:
-            nbrs_gt_batched.append(gt_nbrs[offset:offset + count])
-            nbrs_masked_batched.append(masked_nbrs[offset:offset + count])
-            nbrs_pred_batched.append(nbrs_pred[offset:offset + count])
-            offset += count
-        else:
-            nbrs_gt_batched.append(torch.empty(0, T, 2))
-            nbrs_masked_batched.append(torch.empty(0, T, 2))
-            nbrs_pred_batched.append(torch.empty(0, T, 2))
+def load_checkpoint_if_needed(args, model, optimizer, scheduler, device):
+    start_epoch = 0
+    best_loss = float('inf')
+    ckpt_path = None
+    if args.resume == 'latest':
+        ckpts = sorted(Path(args.checkpoint_dir).glob('checkpoint_epoch_*.pth'))
+        if ckpts:
+            ckpt_path = ckpts[-1]
+    elif args.resume == 'best':
+        best_candidate = Path(args.checkpoint_dir) / 'checkpoint_best.pth'
+        if best_candidate.exists():
+            ckpt_path = best_candidate
+    elif args.resume not in ('none', ''):
+        ckpt_path = Path(args.resume)
 
-    # ========== 可视化 ==========
-    visualize_batch_with_nbrs(
-        gt_ego=gt_ego,
-        masked_ego=masked_ego,
-        pred_ego=ego_pred.cpu(),
-        gt_nbrs_list=nbrs_gt_batched,
-        masked_nbrs_list=nbrs_masked_batched,
-        pred_nbrs_list=[n.cpu() for n in nbrs_pred_batched],
-        save_path=save_path,
-        show_nbrs=show_nbrs,
+    if ckpt_path and ckpt_path.exists():
+        state = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(state['model_state_dict'])
+        optimizer.load_state_dict(state['optimizer_state_dict'])
+        scheduler.load_state_dict(state['scheduler_state_dict'])
+        start_epoch = state.get('epoch', 0)
+        best_loss = state.get('best_loss', best_loss)
+        print(f"Resumed from {ckpt_path} @ epoch {start_epoch}")
+    return start_epoch, best_loss
+
+def main():
+    args = get_args_parser().parse_args()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # 数据集路径
+    data_root = Path(__file__).resolve().parent.parent / 'data/ngsimdata'
+    train_path = str(data_root / 'TrainSet.mat')
+
+    # 创建数据集和 DataLoader
+    train_dataset = NgsimDataset(train_path, t_h=30, t_f=50, d_s=2)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        collate_fn=train_dataset.collate_fn
     )
 
+    # 创建模型
+    model = DiffusionPast(args).to(device)
 
+    # 优化器和学习率调度器
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.learning_rate,
+        weight_decay=1e-5
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.num_epochs
+    )
 
+    start_epoch, best_loss = load_checkpoint_if_needed(
+        args, model, optimizer, scheduler, device
+    )
+
+    # 训练循环
+    for epoch in range(args.num_epochs):
+        print(f"\n========== Epoch {epoch + 1}/{args.num_epochs} ==========")
+
+        # 动态切换掩码策略 (可选)
+        # mask_type = 'random' if epoch < args.num_epochs // 2 else 'block'
+        mask_type = 'random'
+        mask_prob = 0.4
+
+        avg_loss = train_epoch(
+            model, train_loader, optimizer, device, epoch + 1,
+            args.feature_dim, mask_type=mask_type, mask_prob=mask_prob
+        )
+
+        print(f"Epoch [{epoch + 1}] Average Loss: {avg_loss:.4f}")
+        scheduler.step()
+
+        state = {
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'loss': avg_loss,
+            'best_loss': best_loss,
+        }
+
+        if (epoch + 1) % args.save_interval == 0:
+            torch.save(state, Path(args.checkpoint_dir) / f"checkpoint_epoch_{epoch + 1}.pth")
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            state['best_loss'] = best_loss
+            torch.save(state, Path(args.checkpoint_dir) / "checkpoint_best.pth")
 
 if __name__ == '__main__':
-    run_test(batch_size=5, mask_prob=0.4, num_inference_steps=50, show_nbrs=False)
+    main()

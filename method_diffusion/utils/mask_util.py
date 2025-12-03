@@ -2,16 +2,7 @@ import numpy as np
 import torch
 
 def apply_mask_keep_length(traj, mask, fill_value=0):
-    """
-    应用掩码，但保持轨迹长度不变。
-    被掩码（Mask=0/False）的部分会被填充为 fill_value。
 
-    Args:
-        traj: (T, 2) 轨迹
-        mask: (T,)  bool掩码, 1代表保留, 0代表缺失
-    Returns:
-        masked_traj: (T, 2) 长度不变，缺失处为0
-    """
     traj = traj.numpy() if isinstance(traj, torch.Tensor) else traj
     mask = mask.numpy() if isinstance(mask, torch.Tensor) else mask
 
@@ -20,13 +11,6 @@ def apply_mask_keep_length(traj, mask, fill_value=0):
     masked_traj[~mask] = fill_value
     return masked_traj
 
-# def random_mask_traj(traj, p=0.4):
-#     T = traj.shape[0]
-#     if T == 0:
-#         return np.array([], dtype=bool)
-#
-#     mask = np.random.rand(T) < p
-#     return mask
 
 def random_mask_traj(traj, p=0.4):
     if isinstance(traj, np.ndarray):
@@ -53,18 +37,6 @@ def random_prefix_keep_traj(traj, p=0.6):
     mask[T - keep_len:] = 1
     # print(f"keep_len: {keep_len}, mask = {mask}")
     return mask
-
-# def block_mask_traj(traj, missing_ratio=0.3):
-#     T = traj.shape[0]
-#     if T == 0:
-#         return np.array([], dtype=bool)
-#
-#     block_len = max(1, min(T, int(round(T * missing_ratio))))
-#     start = np.random.randint(0, T - block_len + 1)
-#     mask = np.ones(T, dtype=bool)
-#     mask[start:start + block_len] = 0
-#     return mask
-
 
 def block_mask_traj(traj, missing_ratio=0.3):
     """支持单条轨迹 [T, 2]"""

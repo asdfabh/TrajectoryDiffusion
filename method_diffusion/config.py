@@ -17,11 +17,17 @@ def get_args_parser():
 
     # 训练参数
     parser.add_argument('--batch_size', type=int, default=128)
-    parser.add_argument('--num_epochs', type=int, default=2)
+    parser.add_argument('--num_epochs', type=int, default=10)
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--save_interval', type=int, default=1)
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
-    parser.add_argument('--resume', default='None', type=str, help="none/latest/best/或直接给定checkpoint路径")
+    parser.add_argument('--resume', default='latest', type=str, help="none/latest/best/或直接给定checkpoint路径")
+    parser.add_argument('--mask_prob', type=float, default=0.4, help="历史轨迹随机掩码概率")
+    parser.add_argument('--num_inference_steps', type=int, default=10, help="DDIM推理步数")
+    parser.add_argument('--preview_limit', type=int, default=8, help="评估阶段最多保存的示例数")
+    parser.add_argument('--num_samples', type=int, default=10, help="evaluate_test 随机抽样的样本数量")
+    parser.add_argument('--sample_ids', type=str, default='', help="逗号分隔的样本索引列表，设置后覆盖 num_samples")
+    parser.add_argument('--sample_seed', type=int, default=None, help="随机抽样时使用的随机种子")
 
     return parser

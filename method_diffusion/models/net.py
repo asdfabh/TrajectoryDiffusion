@@ -21,8 +21,8 @@ class DiffusionPast(nn.Module):
         super(DiffusionPast, self).__init__()
         # Net parameters
         self.args = args
-        self.feature_dim = int(args.feature_dim) # 输入特征维度 default: 6 (x, y, class, v, a, laneID)
-        self.input_dim = int(args.input_dim)     # 输入到Dit的维度 default: 128
+        self.feature_dim = int(args.feature_dim) + 1 # 输入特征维度 default: 6 (x, y, class, v, a, laneID)
+        self.input_dim = int(args.input_dim)   # 输入到Dit的维度 default: 128
         self.hidden_dim = int(args.hidden_dim)
         self.output_dim = int(args.output_dim)
         self.heads = int(args.heads)
@@ -45,7 +45,7 @@ class DiffusionPast(nn.Module):
         )
 
         self.dit_block = dit.DiTBlock(self.input_dim, self.heads, self.dropout, self.mlp_ratio)
-        self.final_layer = dit.FinalLayer(self.hidden_dim, self.output_dim)
+        self.final_layer = dit.FinalLayer(self.hidden_dim, 40, 16, 2)
         self.dit = dit.DiT(
             dit_block=self.dit_block,
             final_layer=self.final_layer,
@@ -55,101 +55,20 @@ class DiffusionPast(nn.Module):
         )
 
         self.loss = DiffusionLoss(reduction="mean")
-        self.norm_config_path = str(Path(__file__).resolve().parent.parent / 'dataset/ngsim_stats2.npz')
+        self.norm_config_path = str(Path(__file__).resolve().parent.parent / 'dataset/ngsim_stats.npz')
         self.norm_config = np.load(self.norm_config_path)
         for key, value in self.norm_config.items():
             self.register_buffer(key, torch.from_numpy(value).float())
 
-    def padding(self, x, mask, fill_value=0.0):
-        x = x.numpy() if isinstance(x, torch.Tensor) else x
-        mask = mask.numpy() if isinstance(mask, torch.Tensor) else mask
-        mask = mask.astype(bool)
-        masked_traj = x.copy()
-        masked_traj[~mask] = fill_value
-        return masked_traj
-
-    """
-    首先进行归一化处理，将从ngsim中拿到的数据归一化，包括自车和周车的历史轨迹，速度加速度信息，历史轨迹以及车辆类型
-    然后将稠密堆叠的周车数据转换为稀疏表达形式，得到Ego和nbrs的矩阵表达
-    构建hist和nbrs的掩码矩阵，表示是否有信息，以及进行非完整轨迹掩码
-    将hist和nbrs进行输入嵌入和位置编码相加，得到Dit的输入
-    hist: [B, T, dim]  nbrs:[N_total, T, dim]
-    """
-    def forward(self, hist, hist_mask, nbrs, nbrs_mask, nbrs_num, timestep):
-        if self.training:
-            return self.forward_train(hist, hist_mask, nbrs, nbrs_mask, nbrs_num)
-        else:
-            return self.forward_test(hist, hist_mask, nbrs, nbrs_mask, nbrs_num)
-
-    # 将堆叠的nbrs转换为稀疏表达形式，并且将Mask转化为稀疏表示
-    # 输入的hist，nbrs为完整轨迹，先进行mask
-    # def preprossess_input(self, hist, hist_mask, nbrs, nbrs_mask, nbrs_num):
-    #
-    #     hist[~hist_mask.bool()] = 0.0
-    #     nbrs[~nbrs_mask.bool()] = 0.0
-    #     hist_norm = self.norm(hist)
-    #     nbrs_norm = self.norm(nbrs)
-    #
-    #     B, T, dim = hist_norm.shape
-    #     max_num = 39
-    #     device = hist.device
-    #
-    #     nbrs_sparse = torch.zeros(B, max_num, T, dim, device=device)
-    #     nbrs_sparse_mask = torch.zeros(B, max_num, T, device=device)
-    #
-    #     offset = 0
-    #     for b in range(B):
-    #         count = int(nbrs_num[b])
-    #         if count > 0:
-    #             traj = nbrs_norm[offset:offset + count]
-    #             mask = nbrs_mask[offset:offset + count]
-    #             nbrs_sparse[b, 0:count] = traj
-    #             nbrs_sparse_mask[b, 0:count] = mask
-    #             offset += count
-    #
-    #     ego_expanded = hist_norm.unsqueeze(1)  # [B, 1, T, dim]
-    #     ego_mask = hist_mask.unsqueeze(1)  # [B, 1, T]
-    #
-    #     inputs = torch.cat([ego_expanded, nbrs_sparse], dim=1)
-    #     masks = torch.cat([ego_mask, nbrs_sparse_mask], dim=1) # mask size: [B, 1+max_num, T]
-    #     return inputs, masks
-    def preprossess_input(self, hist, hist_mask, nbrs, nbrs_mask, nbrs_num):
-        # 归一化
-        hist_norm = self.norm(hist * hist_mask.unsqueeze(-1))
-        nbrs_norm = self.norm(nbrs * nbrs_mask.unsqueeze(-1))
-
-        B, T, dim = hist_norm.shape
-        device = hist.device
-
-        # 向量化掩码: [B, 39]
-        nbrs_exists = torch.arange(39, device=device).unsqueeze(0) < nbrs_num.unsqueeze(1)
-        nbrs_mask_grid = nbrs_exists.unsqueeze(-1).expand(-1, -1, T)  # [B, 39, T]
-
-        # 创建并填充网格
-        nbrs_sparse = torch.zeros(B, 39, T, dim, device=device)
-        nbrs_sparse_mask = torch.zeros(B, 39, T, device=device)
-
-        nbrs_sparse.view(-1, dim).masked_scatter_(
-            nbrs_mask_grid.reshape(-1, 1).expand(-1, dim),
-            nbrs_norm.view(-1, dim)
-        )
-        nbrs_sparse_mask.view(-1).masked_scatter_(
-            nbrs_mask_grid.reshape(-1),
-            nbrs_mask.view(-1)
-        )
-
-        # 拼接
-        return (
-            torch.cat([hist_norm.unsqueeze(1), nbrs_sparse], dim=1),
-            torch.cat([hist_mask.unsqueeze(1), nbrs_sparse_mask], dim=1)
-        )
-
-    def forward_train(self, hist, hist_mask, nbrs, nbrs_mask, nbrs_num):
-        inputs, masks = self.preprossess_input(hist, hist_mask, nbrs, nbrs_mask, nbrs_num) # inputs size: [B, N, T, dim], N=1+39=40
+    def forward_train(self, hist, nbrs, nbrs_num, src, nbrs_src):
+        hist_norm = self.norm(hist)
+        nbrs_norm = self.norm(nbrs)
+        src_norm = self.norm(src)
+        nbrs_src_norm = self.norm(nbrs_src)
+        inputs = torch.cat([hist_norm, nbrs_norm], dim=2)  # [B, T, N_total, dim]
         B, N, T, dim = inputs.shape  # N includes ego and nbrs, N = 40
         device = hist.device
         inputs = inputs.view(B, N * T, dim)
-        masks = masks.view(B, N * T).unsqueeze(-1) # size [B, N*T, 1]
 
         timestpes = torch.randint(0, self.num_train_timesteps, (B,), device=inputs.device)
         noise = torch.randn(inputs.shape, device=device)
@@ -160,21 +79,23 @@ class DiffusionPast(nn.Module):
         ).float()
         noisy_inputs = torch.clamp(noisy_inputs, -5, 5)
 
-        input_embedded = self.input_embedding(noisy_inputs) + self.pos_embedding(noisy_inputs)
-        atten_mask = (masks.squeeze(-1) == 0)  # [B, N*T]  True表示填充位置
-        pred = self.dit(x=input_embedded, t=timestpes, neighbor_current_mask=atten_mask)
+        input_embedded = self.input_embedding(noisy_inputs) + self.pos_embedding(noisy_inputs) # [B, N*T, input_dim]
+        pred = self.dit(x=input_embedded, t=timestpes, neighbor_current_mask=None) # [B, T, N, 2]
 
-        pred = pred.view(B, N, T, 2)
+        pred_ego = pred[:, :, 0:1, :]  # [B, T， 1, 2]
+        pred_nbrs_dense = pred[:, :, 1:, :]  # [B, T, 39, 2]
+        # print(f"shape of pred in train: {pred.shape}")
 
-        pred_ego = pred[:, 0, :, :]  # [B, T, 2]
-        pred_nbrs_dense = pred[:, 1:, :, :]  # [B, 39, T, 2]
+        loss_ego = self.loss(pred_ego, src_norm[..., 0:2], None)
+        loss_nbrs = self.loss(pred_nbrs_dense, nbrs_src_norm[..., 0:2], None)
+        loss = loss_ego + loss_nbrs
 
-        # ✅ 将稠密的 nbrs 转换回稀疏表示
         pred_nbrs_sparse = []
         for b in range(B):
             count = int(nbrs_num[b])
             if count > 0:
-                pred_nbrs_batch = pred_nbrs_dense[b, 0:count, :, :]  # [count, T, 2]
+                pred_nbrs_batch = pred_nbrs_dense[b, :, 0:count, :]
+                pred_nbrs_batch = pred_nbrs_batch.permute(1, 0, 2)  # [count, T, 2]
                 pred_nbrs_sparse.append(pred_nbrs_batch)
 
         if pred_nbrs_sparse:
@@ -182,64 +103,152 @@ class DiffusionPast(nn.Module):
         else:
             pred_nbrs = torch.empty(0, T, 2, device=device)
 
-        loss_ego = self.loss(pred_ego, hist[..., 0:2], hist_mask.unsqueeze(-1))
-        loss_nbrs = self.loss(pred_nbrs, nbrs[..., 0:2], nbrs_mask.unsqueeze(-1))
-        loss = loss_ego + loss_nbrs
+        pred_ego = self.denorm(pred_ego)
+        pred_nbrs = self.denorm(pred_nbrs)
+
         return loss, pred_ego, pred_nbrs
-        # pred = torch.cat((pred_ego, pred_nbrs), dim=-1)
-        # print(f"shape of pred in train: {pred.shape}")
-        # input_gt = inputs[..., 0:2]
-        # loss = self.loss(pred, input_gt, masks)
-        # return loss, pred
 
-    def forward_test(self, hist, hist_mask, nbrs, nbrs_mask, nbrs_num, num_inference_steps=50):
-        inputs, masks = self.preprossess_input(hist, hist_mask, nbrs, nbrs_mask, nbrs_num)
-        B, N, T, dim = inputs.shape
-        device = inputs.device
+    def forward_eval(self, hist, nbrs, nbrs_num, num_inference_steps=10):
+        """
+        推理模式: 使用 DDIM 采样基于掩码输入生成完整历史轨迹
 
-        inputs = inputs.view(B, N * T, dim)
-        masks = masks.view(B, N * T).unsqueeze(-1)
+        Args:
+            hist: [B, T, 1, dim] 掩码后的自车历史 (最后一维是观测标记)
+            nbrs: [B, T, 39, dim] 掩码后的邻车历史 (最后一维是观测标记)
+            nbrs_num: [B] 每个样本的实际邻车数量
+            num_inference_steps: DDIM 推理步数
+        """
+        device = hist.device
+        B, T, _, _ = hist.shape
+        N = 40  # 1 ego + 39 nbrs
 
-        # 设置推理步数
-        self.diffusion_scheduler.set_timesteps(num_inference_steps, device=device)
+        # 1. 提取观测掩码 (最后一维)
+        obs_mask_hist = hist[..., -1:]  # [B, T, 1, 1]
+        obs_mask_nbrs = nbrs[..., -1:]  # [B, T, 39, 1]
+        obs_mask = torch.cat([obs_mask_hist, obs_mask_nbrs], dim=2)  # [B, T, 40, 1]
 
-        # 从纯噪声开始
-        noisy_inputs = torch.randn_like(inputs)
+        # 2. 归一化输入 (去掉观测标记)
+        hist_features = hist[..., :-1]  # [B, T, 1, dim-1]
+        nbrs_features = nbrs[..., :-1]  # [B, T, 39, dim-1]
 
-        # 反向去噪循环
-        for t in self.diffusion_scheduler.timesteps:
-            timestep = torch.full((B,), t, device=device, dtype=torch.long)
+        hist_norm = self.norm(hist_features)
+        nbrs_norm = self.norm(nbrs_features)
 
-            # 嵌入并预测
+        inputs_norm = torch.cat([hist_norm, nbrs_norm], dim=2)  # [B, T, 40, dim-1]
+
+        # 3. 展平为 [B, N*T, dim-1] 并拼接观测掩码
+        obs_mask_flat = obs_mask.permute(0, 2, 1, 3).reshape(B, N * T, 1)
+        inputs_flat = inputs_norm.permute(0, 2, 1, 3).reshape(B, N * T, self.feature_dim - 1)
+        inputs_with_mask = torch.cat([inputs_flat, obs_mask_flat], dim=-1)  # [B, N*T, dim]
+
+        # 4. 初始化: 从截断噪声开始
+        noisy_inputs = torch.randn(B, N * T, self.feature_dim, device=device)
+
+        # 对已观测的点使用真实值
+        noisy_inputs = noisy_inputs * (1 - obs_mask_flat) + inputs_with_mask * obs_mask_flat
+
+        # 5. 设置 DDIM 调度器
+        self.diffusion_scheduler.set_timesteps(num_inference_steps, device)
+
+        # 使用截断扩散 (参考 Transfuser)
+        step_ratio = self.num_train_timesteps / num_inference_steps
+        roll_timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
+        roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
+
+        # 6. DDIM 逐步去噪
+        for timestep in roll_timesteps:
+            # 将时间步扩展到 batch
+            t = timestep if torch.is_tensor(timestep) else torch.tensor([timestep], device=device)
+            t = t.expand(B)
+
+            # 嵌入当前噪声样本
             input_embedded = self.input_embedding(noisy_inputs) + self.pos_embedding(noisy_inputs)
-            attn_mask = masks.squeeze(-1) == 0
-            pred = self.dit(x=input_embedded, t=timestep, neighbor_current_mask=attn_mask)
 
-            # 拼接预测的 x,y 和原始的其他特征
-            pred_full = noisy_inputs.clone()
-            pred_full[..., 0:2] = pred
+            # 模型预测去噪后的轨迹 x_0 [B, T, N, output_dim]
+            pred_x0 = self.dit(x=input_embedded, t=t, neighbor_current_mask=None)
 
-            # 调度器单步去噪
+            # 调整维度: [B, T, N, 2] -> [B, N*T, 2]
+            pred_x0_flat = pred_x0.permute(0, 2, 1, 3).reshape(B, N * T, self.output_dim)
+
+            # 拼接其他特征 (保持输入值不变)
+            pred_x0_full = torch.cat([
+                pred_x0_flat,  # 预测的 (x, y)
+                inputs_flat[..., 2:]  # 保留 (class, v, a, lane)
+            ], dim=-1)
+
+            # 拼接观测掩码
+            pred_x0_with_mask = torch.cat([pred_x0_full, obs_mask_flat], dim=-1)
+
+            # DDIM step: 更新噪声样本
             noisy_inputs = self.diffusion_scheduler.step(
-                model_output=pred_full,
-                timestep=t,
+                model_output=pred_x0_with_mask,
+                timestep=timestep,
                 sample=noisy_inputs
             ).prev_sample
 
-            noisy_inputs = torch.clamp(noisy_inputs, -5, 5)
+            # 强制已观测点保持不变
+            noisy_inputs = noisy_inputs * (1 - obs_mask_flat) + inputs_with_mask * obs_mask_flat
 
-        final_pred = noisy_inputs[..., 0:2]  # [B, N*T, 2]
+        # 7. 获取最终预测 (去掉观测掩码)
+        final_pred_flat = noisy_inputs[..., :-1]  # [B, N*T, dim-1]
 
-        pred = final_pred.view(B, N, T, 2)
+        # 8. 调整维度并拆分
+        final_pred = final_pred_flat.view(B, N, T, self.feature_dim - 1).permute(0, 2, 1, 3)  # [B, T, N, dim-1]
+        pred_ego = final_pred[:, :, 0:1, :]  # [B, T, 1, dim-1]
+        pred_nbrs_dense = final_pred[:, :, 1:, :]  # [B, T, 39, dim-1]
 
-        pred_ego = pred[:, 0, :, :]  # [B, T, 2]
-        pred_nbrs_dense = pred[:, 1:, :, :]  # [B, 39, T, 2]
+        # 9. 转换为稀疏邻车格式
+        pred_nbrs_sparse = []
+        for b in range(B):
+            count = int(nbrs_num[b])
+            if count > 0:
+                pred_nbrs_batch = pred_nbrs_dense[b, :, :count, :].permute(1, 0, 2)  # [count, T, dim-1]
+                pred_nbrs_sparse.append(pred_nbrs_batch)
+
+        pred_nbrs = torch.cat(pred_nbrs_sparse, dim=0) if pred_nbrs_sparse else torch.empty(0, T, self.feature_dim - 1,
+                                                                                            device=device)
+        # 10. 反归一化
+        pred_ego = self.denorm(pred_ego)
+        pred_nbrs = self.denorm(pred_nbrs)
+
+        return pred_ego, pred_nbrs, pred_nbrs_dense
+
+    def forward_test(self, hist, nbrs, nbrs_num, src, nbrs_src):
+        hist_norm = self.norm(hist)
+        nbrs_norm = self.norm(nbrs)
+        src_norm = self.norm(src)
+        nbrs_src_norm = self.norm(nbrs_src)
+        inputs = torch.cat([hist_norm, nbrs_norm], dim=2)  # [B, T, N_total, dim]
+        B, N, T, dim = inputs.shape  # N includes ego and nbrs, N = 40
+        device = hist.device
+        inputs = inputs.view(B, N * T, dim)
+
+        timestpes = torch.randint(0, self.num_train_timesteps, (B,), device=inputs.device)
+        noise = torch.randn(inputs.shape, device=device)
+        noisy_inputs = self.diffusion_scheduler.add_noise(
+            original_samples=inputs,
+            noise=noise,
+            timesteps=timestpes,
+        ).float()
+        noisy_inputs = torch.clamp(noisy_inputs, -5, 5)
+
+        input_embedded = self.input_embedding(noisy_inputs) + self.pos_embedding(noisy_inputs) # [B, N*T, input_dim]
+        pred = self.dit(x=input_embedded, t=timestpes, neighbor_current_mask=None) # [B, T, N, 2]
+
+        pred_ego = pred[:, :, 0:1, :]  # [B, T， 1, 2]
+        pred_nbrs_dense = pred[:, :, 1:, :]  # [B, T, 39, 2]
+        # print(f"shape of pred in train: {pred.shape}")
+
+        loss_ego = self.loss(pred_ego, src_norm[..., 0:2], None)
+        loss_nbrs = self.loss(pred_nbrs_dense, nbrs_src_norm[..., 0:2], None)
+        loss = loss_ego + loss_nbrs
 
         pred_nbrs_sparse = []
         for b in range(B):
             count = int(nbrs_num[b])
             if count > 0:
-                pred_nbrs_batch = pred_nbrs_dense[b, 0:count, :, :]  # [count, T, 2]
+                pred_nbrs_batch = pred_nbrs_dense[b, :, 0:count, :]
+                pred_nbrs_batch = pred_nbrs_batch.permute(1, 0, 2)  # [count, T, 2]
                 pred_nbrs_sparse.append(pred_nbrs_batch)
 
         if pred_nbrs_sparse:
@@ -247,21 +256,18 @@ class DiffusionPast(nn.Module):
         else:
             pred_nbrs = torch.empty(0, T, 2, device=device)
 
-        loss_ego = self.loss(pred_ego, hist[..., 0:2], hist_mask.unsqueeze(-1))
-        loss_nbrs = self.loss(pred_nbrs, nbrs[..., 0:2], nbrs_mask.unsqueeze(-1)) if pred_nbrs.numel() > 0 else 0.0
-        loss = loss_ego + loss_nbrs
+        pred_ego_denorm = self.denorm(pred_ego)
+        pred_nbrs_denorm = self.denorm(pred_nbrs)
 
-        pred = torch.cat([pred_ego, pred_nbrs], dim=0)  # [B + N_total, T, 2]
-        print(f"shape of pred in test: {pred.shape}")
-        return loss, pred
+        return loss, pred_ego, pred_nbrs, pred_ego_denorm, pred_nbrs_denorm, hist_norm, nbrs_norm, self.norm(src)
 
     # hist = [B, T, dim], nbrs = [N_total, T, dim]. dim = x, y, v, a, laneID, class
     def norm(self, x):
         x_norm = x.clone()
         x_norm[..., 0:2] = (x[..., 0:2] - self.pos_mean) / self.pos_std  # x, y
         x_norm[..., 3:5] = (x[..., 3:5] - self.va_mean) / self.va_std  # v, a
-        # x_norm[..., 5] = (x[..., 5] - self.lane_mean) / self.lane_std  # laneID
-        # x_norm[..., 6] = (x[..., 6] - self.class_mean) / self.class_std  # class
+        x_norm[..., 4] = (x[..., 4] - self.lane_mean) / self.lane_std  # laneID
+        x_norm[..., 5] = (x[..., 5] - self.class_mean) / self.class_std  # class
         x_norm = torch.clamp(x_norm, -5.0, 5.0)
 
         return x_norm
@@ -269,10 +275,6 @@ class DiffusionPast(nn.Module):
     def denorm(self, x):
         x_denorm = x.clone()
         x_denorm[..., 0:2] = x[..., 0:2] * self.pos_std + self.pos_mean  # x, y
-        x_denorm[..., 3:5] = x[..., 3:5] * self.va_std + self.va_mean  # v, a
-        # x_denorm[..., 5] = x[..., 5] * self.lane_std + self.lane_mean  # laneID
-        # x_denorm[..., 6] = x[..., 6] * self.class_std + self.class_mean  # class
-
         return x_denorm
 
 

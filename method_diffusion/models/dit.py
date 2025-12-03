@@ -68,55 +68,77 @@ class TimestepEmbedder(nn.Module):
 
 class DiTBlock(nn.Module):
     """
-    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning for ego and Cross-Attention.
+    时空分离的 DiT block,使用 AdaLN-Zero 调制
+    第一个注意力处理时间依赖,第二个注意力处理空间交互
     """
-    def __init__(self, dim=128, heads=6, dropout=0.1, mlp_ratio=4.0):
+    def __init__(self, dim=128, heads=6, dropout=0.1, mlp_ratio=4.0, N=40, T=16):
         super().__init__()
+        self.N = N  # 车辆数量
+        self.T = T  # 时间步数
+
+        # 时间注意力分支
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
+        self.attn_temporal = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
+
+        # 第一个 MLP
         self.norm2 = nn.LayerNorm(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp1 = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+
+        # AdaLN 调制参数 (时间 + MLP1 + 空间 + MLP2 = 4 组)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(dim, 6 * dim, bias=True)
+            nn.Linear(dim, 6 * dim, bias=True)  # 12 = 4 组 × 3 参数
         )
-        # self.norm3 = nn.LayerNorm(dim)
-        # self.cross_attn = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
-        self.norm4 = nn.LayerNorm(dim)
+        nn.init.xavier_uniform_(self.adaLN_modulation[-1].weight, gain=0.02)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
+        # 空间注意力分支
+        self.norm3 = nn.LayerNorm(dim)
+        self.attn_spatial = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
+
+        # 第二个 MLP
+        self.norm4 = nn.LayerNorm(dim)
         self.mlp2 = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
 
     def forward(self, x, y, attn_mask, cross_c=None):
-
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(6, dim=1)
+        modulated_x = modulate(self.norm1(x), shift_msa, scale_msa) # size: (B, N*T, D)
 
-        modulated_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulated_x, modulated_x, modulated_x, key_padding_mask=attn_mask)[0]
-
+        # 重新调整形状以适应时间注意力
+        B, NT, D = modulated_x.shape
+        modulated_x_time = modulated_x.view(B * self.N, self.T, D)  # (B*N, T, D)
+        attn_out_time = self.attn_temporal(modulated_x_time, modulated_x_time, modulated_x_time, key_padding_mask=None)[0]
+        attn_out_time = attn_out_time.contiguous().view(B, NT, D)  # (B, N*T, D)
+        x = x + gate_msa.unsqueeze(1) * attn_out_time
         modulated_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = x + gate_mlp.unsqueeze(1) * self.mlp1(modulated_x)
 
-        # x = self.cross_attn(self.norm3(x), cross_c, cross_c)[0]
-        x = self.mlp2(self.norm4(x))
+        # 重新调整形状以适应空间注意力
+        x = self.norm3(x)
+        modulated_x_space = x.view(B * self.T, self.N, D)  # (B*T, N, D)
+        attn_out_space = self.attn_spatial(modulated_x_space, modulated_x_space, modulated_x_space, key_padding_mask=None)[0]
+        attn_out_space = attn_out_space.contiguous().view(B, NT, D)  # (B, N*T, D)
+        x = self.mlp2(self.norm4(attn_out_space))
 
         return x
 
-class FinalLayer(nn.Module):
-    """
-    The final layer of DiT.
-    """
 
-    def __init__(self, hidden_size, output_size):
+class FinalLayer(nn.Module):
+    def __init__(self, hidden_size, N=40, T=16, output_dim=2):
         super().__init__()
+        self.N = N
+        self.T = T
+        self.output_dim = output_dim
         self.norm_final = nn.LayerNorm(hidden_size)
+
         self.proj = nn.Sequential(
             nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_size * 4, bias=True),
             nn.GELU(approximate="tanh"),
             nn.LayerNorm(hidden_size * 4),
-            nn.Linear(hidden_size * 4, output_size, bias=True)
+            nn.Linear(hidden_size * 4, output_dim, bias=True)
         )
 
         self.adaLN_modulation = nn.Sequential(
@@ -125,11 +147,18 @@ class FinalLayer(nn.Module):
         )
 
     def forward(self, x, y):
-        B, P, _ = x.shape
 
         shift, scale = self.adaLN_modulation(y).chunk(2, dim=1)
         x = modulate(self.norm_final(x), shift, scale)
+
         x = self.proj(x)
+
+        B, P, _ = x.shape
+        x = x.view(B, self.N, self.T, self.output_dim)
+
+        # Permute: [B, T, N, 2]
+        x = x.permute(0, 2, 1, 3)
+
         return x
 
 class DiT(nn.Module):
