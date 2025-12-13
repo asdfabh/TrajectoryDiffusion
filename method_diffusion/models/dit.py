@@ -66,6 +66,7 @@ class TimestepEmbedder(nn.Module):
          t_emb =  self.mlp(t_freq)
          return t_emb
 
+
 class DiTBlock(nn.Module):
     """
     时空分离的 DiT block,使用 AdaLN-Zero 调制
@@ -78,7 +79,7 @@ class DiTBlock(nn.Module):
 
         # 时间注意力分支
         self.norm1 = nn.LayerNorm(dim)
-        self.attn_temporal = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
+        self.attn1 = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
 
         # 第一个 MLP
         self.norm2 = nn.LayerNorm(dim)
@@ -96,7 +97,7 @@ class DiTBlock(nn.Module):
 
         # 空间注意力分支
         self.norm3 = nn.LayerNorm(dim)
-        self.attn_spatial = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
+        self.attn2 = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
 
         # 第二个 MLP
         self.norm4 = nn.LayerNorm(dim)
@@ -106,21 +107,14 @@ class DiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(6, dim=1)
         modulated_x = modulate(self.norm1(x), shift_msa, scale_msa) # size: (B, N*T, D)
 
-        # 重新调整形状以适应时间注意力
-        B, NT, D = modulated_x.shape
-        modulated_x_time = modulated_x.view(B * self.N, self.T, D)  # (B*N, T, D)
-        attn_out_time = self.attn_temporal(modulated_x_time, modulated_x_time, modulated_x_time, key_padding_mask=None)[0]
-        attn_out_time = attn_out_time.contiguous().view(B, NT, D)  # (B, N*T, D)
-        x = x + gate_msa.unsqueeze(1) * attn_out_time
+        modulated_x = self.attn1(modulated_x, modulated_x, modulated_x, key_padding_mask=None)[0]
+        x = x + gate_msa.unsqueeze(1) * modulated_x
         modulated_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = x + gate_mlp.unsqueeze(1) * self.mlp1(modulated_x)
 
-        # 重新调整形状以适应空间注意力
         x = self.norm3(x)
-        modulated_x_space = x.view(B * self.T, self.N, D)  # (B*T, N, D)
-        attn_out_space = self.attn_spatial(modulated_x_space, modulated_x_space, modulated_x_space, key_padding_mask=None)[0]
-        attn_out_space = attn_out_space.contiguous().view(B, NT, D)  # (B, N*T, D)
-        x = self.mlp2(self.norm4(attn_out_space))
+        x = self.attn2(x, x, x, key_padding_mask=None)[0]
+        x = self.mlp2(self.norm4(x))
 
         return x
 

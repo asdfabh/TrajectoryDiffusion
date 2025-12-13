@@ -47,3 +47,19 @@ def block_mask_traj(traj, missing_ratio=0.3):
     mask = torch.ones(T, dtype=torch.bool, device=traj.device)
     mask[start:start + block_len] = False
     return mask
+
+def block_mask(B, T, missing_ratio=0.3, device='cuda'):
+    device = torch.device(device)
+    if B == 0:
+        return torch.empty((0, T), dtype=torch.bool, device=device)
+
+    block_len = max(1, min(T, int(round(T * missing_ratio))))
+    # 随机生成每条轨迹的起点，shape: (B,)
+    starts = torch.randint(0, T - block_len + 1, (B,), device=device)
+    # positions shape: (1, T), starts shape: (B, 1) -> 广播比较
+    positions = torch.arange(T, device=device).unsqueeze(0)
+    starts = starts.unsqueeze(1)
+    missing = (positions >= starts) & (positions < starts + block_len)  # True 表示缺失区间
+    masks = ~missing  # True 表示保留
+    return masks.to(dtype=torch.bool)
+

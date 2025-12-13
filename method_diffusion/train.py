@@ -9,64 +9,97 @@ from method_diffusion.models.net import DiffusionPast
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.config import get_args_parser
 from method_diffusion.utils.visualization import plot_traj_with_mask, plot_traj
-from method_diffusion.utils.mask_util import random_mask_traj, block_mask_traj
+from method_diffusion.utils.mask_util import random_mask_traj, block_mask_traj, block_mask
 import numpy as np
 from tqdm import tqdm
 from einops import repeat
 
+# def prepare_input_data(batch, input_dim, mask_type='random', mask_prob=0.7, device='cuda'):
+#
+#     # type is torch
+#     hist = batch['hist']  # [B, T, 2]
+#     nbrs = batch['nbrs']  # [N_total, T, 2]
+#     va = batch['va']  # [B, T, 2]
+#     nbrs_va = batch['nbrs_va']  # [N_total, T, 2]
+#     lane = batch['lane']  # [B, T, 1]
+#     nbrs_lane = batch['nbrs_lane']  # [N_total, T, 1]
+#     cclass = batch['cclass']  # [B, T, 1]
+#     nbrs_class = batch['nbrs_class']  # [N_total, T, 1]
+#     nbrs_num = batch['nbrs_num'].squeeze(-1)  # [B]
+#     mask = batch['mask'].to(device) # [B, 3, 13]
+#
+#     # 根据 input_dim 拼接特征
+#     if input_dim == 6:
+#         src = torch.cat((hist, cclass, va, lane), dim=-1).to(device)  # [B, T, 6]
+#         nbrs_src = torch.cat((nbrs, nbrs_class, nbrs_va, nbrs_lane), dim=-1).to(device)  # [N_total, T, 6]
+#     elif input_dim == 5:
+#         src = torch.cat((hist, cclass, va), dim=-1).to(device)  # [B, T, 5]
+#         nbrs_src = torch.cat((nbrs, nbrs_class, nbrs_va), dim=-1).to(device)  # [N_total, T, 5]
+#     else:  # input_dim == 2
+#         src = hist.to(device)
+#         nbrs_src = nbrs.to(device)
+#
+#     B, T, _ = hist.shape
+#     N_total = nbrs.shape[0]
+#
+#     # 在mask的基础上生成历史轨迹掩码，并应用掩码
+#     mask = mask.view(mask.shape[0], mask.shape[1] * mask.shape[2])  # [B, 39]
+#     mask = mask.unsqueeze(-1).expand(-1, -1, input_dim)  # [B, 39, dim]
+#     mask = repeat(mask, 'b c n -> b t c n', t=T)  # [B, T, 39, 6]
+#     nbrs_grid = torch.zeros_like(mask).float()
+#     nbrs_grid = nbrs_grid.masked_scatter_(mask.bool(), nbrs_src)  # size [B, T, 39, dim]
+#
+#     has_trajectory = mask[:, :, :, 0].bool()  # 提取有轨迹标记
+#     time_mask = torch.rand(B, T, 39, device=device) < mask_prob
+#     time_mask_final = has_trajectory & time_mask
+#     time_mask_expanded = time_mask_final.unsqueeze(-1).expand(-1, -1, -1, input_dim)
+#
+#     nbrs_grid_masked = nbrs_grid * (~time_mask_expanded).float()  # 时间掩码应用 size [B, T, 39, dim]
+#     obs_nbrs = (has_trajectory & ~time_mask).float().unsqueeze(-1)  #
+#     nbrs_grid_masked = torch.cat([nbrs_grid_masked, obs_nbrs], dim=-1)
+#
+#     # 处理自车历史
+#     hist_mask = torch.rand(B, T, device=device) < mask_prob  # [B, T]
+#     hist_masked = src.masked_fill(hist_mask.unsqueeze(-1), 0.0)
+#     obs_hist = (~hist_mask).float().unsqueeze(-1)  # [B, T, 1]
+#     hist_masked = torch.cat([hist_masked, obs_hist], dim=-1).unsqueeze(2)  # [B, T, 1, input_dim+1]
+#     src = src.unsqueeze(2)
+#
+#     return hist_masked, nbrs_grid_masked, nbrs_num, src, nbrs_grid
 
 def prepare_input_data(batch, input_dim, mask_type='random', mask_prob=0.4, device='cuda'):
-
     # type is torch
     hist = batch['hist']  # [B, T, 2]
-    nbrs = batch['nbrs']  # [N_total, T, 2]
     va = batch['va']  # [B, T, 2]
-    nbrs_va = batch['nbrs_va']  # [N_total, T, 2]
     lane = batch['lane']  # [B, T, 1]
-    nbrs_lane = batch['nbrs_lane']  # [N_total, T, 1]
     cclass = batch['cclass']  # [B, T, 1]
-    nbrs_class = batch['nbrs_class']  # [N_total, T, 1]
-    nbrs_num = batch['nbrs_num'].squeeze(-1)  # [B]
-    mask = batch['mask'].to(device) # [B, 3, 13]
+    mask_type = mask_type
 
     # 根据 input_dim 拼接特征
     if input_dim == 6:
-        src = torch.cat((hist, cclass, va, lane), dim=-1).to(device)  # [B, T, 6]
-        nbrs_src = torch.cat((nbrs, nbrs_class, nbrs_va, nbrs_lane), dim=-1).to(device)  # [N_total, T, 6]
+        hist = torch.cat((hist, cclass, va, lane), dim=-1).to(device)  # [B, T, 6]
     elif input_dim == 5:
-        src = torch.cat((hist, cclass, va), dim=-1).to(device)  # [B, T, 5]
-        nbrs_src = torch.cat((nbrs, nbrs_class, nbrs_va), dim=-1).to(device)  # [N_total, T, 5]
+        hist = torch.cat((hist, cclass, va), dim=-1).to(device) # [B, T, 5]
     else:  # input_dim == 2
-        src = hist.to(device)
-        nbrs_src = nbrs.to(device)
+        hist = hist.to(device)
 
-    B, T, _ = hist.shape
-    N_total = nbrs.shape[0]
-
-    # 在mask的基础上生成历史轨迹掩码，并应用掩码
-    mask = mask.view(mask.shape[0], mask.shape[1] * mask.shape[2])  # [B, 39]
-    mask = mask.unsqueeze(-1).expand(-1, -1, input_dim)  # [B, 39, dim]
-    mask = repeat(mask, 'b c n -> b t c n', t=T)  # [B, T, 39, 6]
-    nbrs_grid = torch.zeros_like(mask).float()
-    nbrs_grid = nbrs_grid.masked_scatter_(mask.bool(), nbrs_src)  # size [B, T, 39, dim]
-
-    has_trajectory = mask[:, :, :, 0].bool()  # 提取有轨迹标记
-    time_mask = torch.rand(B, T, 39, device=device) < mask_prob
-    time_mask_final = has_trajectory & time_mask
-    time_mask_expanded = time_mask_final.unsqueeze(-1).expand(-1, -1, -1, input_dim)
-
-    nbrs_grid_masked = nbrs_grid * (~time_mask_expanded).float()  # 时间掩码应用 size [B, T, 39, dim]
-    obs_nbrs = (has_trajectory & ~time_mask).float().unsqueeze(-1)  #
-    nbrs_grid_masked = torch.cat([nbrs_grid_masked, obs_nbrs], dim=-1)
+    B, T, dim = hist.shape
 
     # 处理自车历史
-    hist_mask = torch.rand(B, T, device=device) < mask_prob  # [B, T]
-    hist_masked = src.masked_fill(hist_mask.unsqueeze(-1), 0.0)
-    obs_hist = (~hist_mask).float().unsqueeze(-1)  # [B, T, 1]
-    hist_masked = torch.cat([hist_masked, obs_hist], dim=-1).unsqueeze(2)  # [B, T, 1, input_dim+1]
-    src = src.unsqueeze(2)
+    if mask_type == 'random':
+        hist_mask = torch.rand(B, T, device=device) < mask_prob  # [B, T], True 表示观测位置
+    elif mask_type == 'block':
+        hist_mask = block_mask(B, T, device=device)
+    else:
+        print(f'Unknown mask type: {mask_type}, defaulting to random mask.')
+        hist_mask = torch.rand(B, T, device=device) < mask_prob
 
-    return hist_masked, nbrs_grid_masked, nbrs_num, src, nbrs_grid
+    hist_masked = hist.masked_fill(~hist_mask.unsqueeze(-1), 0.0)  # 被掩码位置置 0
+    obs_hist = hist_mask.float().unsqueeze(-1)  # 观测位置为 1，掩码位置为 0 -> [B, T, 1]
+    hist_masked = torch.cat([hist_masked, obs_hist], dim=-1).unsqueeze(2)  # [B, T, 1, input_dim+1]
+    hist = hist.unsqueeze(2) # [B, T, 1, dim]
+
+    return hist, hist_masked
 
 def train_epoch(model, dataloader, optimizer, device, epoch, input_dim,
                 mask_type='random', mask_prob=0.4):
@@ -79,13 +112,25 @@ def train_epoch(model, dataloader, optimizer, device, epoch, input_dim,
                 desc=f"Epoch {epoch}", ncols=100)
 
     for batch_idx, batch in pbar:
-        # 数据拼接、掩码处理 hist: [B, T, 1, dim], nbrs: [B, T, 39, dim]
-        hist, nbrs, nbrs_num, src, nbrs_src = prepare_input_data(
+        # 数据拼接、掩码处理 hist: [B, T, 1, dim]，不进行归一化
+        hist, hist_masked = prepare_input_data(
             batch, input_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
         )
 
-        # 前向传播，输入为掩码后的轨迹 hist [B, T, 1, dim], nbrs [B, T, 39, dim]
-        loss, pred_ego, pred_nbrs = model.forward_train(hist, nbrs, nbrs_num, src, nbrs_src)
+        # 前向传播，输入为掩码后的轨迹 hist [B, T, 1, dim]
+        loss, pred_ego = model.forward_train(hist, hist_masked, device)
+
+        hist = hist[0, :, 0, :2].detach().cpu().numpy()
+        hist_masked = hist_masked[0, :, 0, :2].detach().cpu().numpy()
+        pred_ego = pred_ego[0, :, 0, :2].detach().cpu().numpy()
+
+        plot_traj_with_mask(
+            hist_original=[hist],
+            hist_masked=[hist_masked],
+            hist_pred=[pred_ego],
+            fig_num1=1,
+            fig_num2=1,
+        )
 
         # 反向传播
         optimizer.zero_grad()
@@ -98,8 +143,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, input_dim,
         num_batches += 1
 
         pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'avg_loss': f'{total_loss/num_batches:.4f}',
+            'loss': f'{loss.item():.8f}',
+            'avg_loss': f'{total_loss/num_batches:.8f}',
             'mask': f'{mask_type}({mask_prob})'
         })
 
@@ -119,6 +164,17 @@ def load_checkpoint_if_needed(args, model, optimizer, scheduler, device):
         best_candidate = Path(args.checkpoint_dir) / 'checkpoint_best.pth'
         if best_candidate.exists():
             ckpt_path = best_candidate
+    elif args.resume.startswith('epoch'):
+        # 支持 epoch3, epoch10 等格式
+        try:
+            epoch_num = int(args.resume.replace('epoch', ''))
+            ckpt_path = Path(args.checkpoint_dir) / f'checkpoint_epoch_{epoch_num}.pth'
+            if not ckpt_path.exists():
+                print(f"Warning: {ckpt_path} not found")
+                ckpt_path = None
+        except ValueError:
+            print(f"Invalid epoch format: {args.resume}")
+            ckpt_path = None
     elif args.resume not in ('none', ''):
         ckpt_path = Path(args.resume)
 
@@ -147,7 +203,10 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=train_dataset.collate_fn
+        collate_fn=train_dataset.collate_fn,
+        pin_memory=True,                # GPU 训练强烈建议打开
+        persistent_workers=True,        # PyTorch>=1.7，epoch 间复用 worker
+        drop_last=True
     )
 
     # 创建模型
@@ -174,8 +233,8 @@ def main():
 
         # 动态切换掩码策略 (可选)
         # mask_type = 'random' if epoch < args.num_epochs // 2 else 'block'
-        mask_type = 'random'
-        mask_prob = 0.4
+        mask_type = 'block'
+        mask_prob = 0.55
 
         avg_loss = train_epoch(
             model, train_loader, optimizer, device, epoch + 1,
