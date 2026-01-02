@@ -1,238 +1,366 @@
-from method_diffusion.models import dit
-from torch import nn
-from diffusers.schedulers import DDIMScheduler
-from method_diffusion.loss import DiffusionLoss
-import numpy as np
 import torch
+import torch.nn as nn
+from diffusers.schedulers import DDIMScheduler
+from method_diffusion.models import dit
 from method_diffusion.utils.position_encoding import SequentialPositionalEncoding
-from pathlib import Path
 
 """
-反向预测历史轨迹的扩散模型
-输入自车，周车的历史轨迹以及掩码，输出自车和周车历史轨迹
-hist:[B, T, dim]  hist_mask:[B, T, 1] 内部生成掩码
-nbrs:[B'=B*N', T, dim]  nbrs_mask:[B'=N（3*13）, T, dim]内部生成掩码
-nbrs每一个批量的数量N堆叠在Batch维度，输入前构建稀疏表达（3*13）
+编码历史轨迹: [B, T, N, 4] -> [B, N, Hidden]
 """
-
-class DiffusionPast(nn.Module):
-
+class AgentEncoder(nn.Module):
     def __init__(self, args):
-        super(DiffusionPast, self).__init__()
-        # Net parameters
-        self.args = args
-        self.feature_dim = 2 * int(args.feature_dim) + 1 # 输入特征维度 default: 6 (x, y, class, v, a, laneID)
-        self.input_dim = int(args.input_dim)   # 输入到Dit的维度 default: 128
-        self.hidden_dim = int(args.hidden_dim)
-        self.output_dim = int(args.output_dim)
-        self.heads = int(args.heads)
-        self.dropout = args.dropout
-        self.depth = int(args.depth)
-        self.mlp_ratio = args.mlp_ratio
-        self.num_train_timesteps = args.num_train_timesteps
-        self.time_embedding_size = args.time_embedding_size
-        self.training = True
+        super().__init__()
         self.T = int(args.T)
-        self.N = int(args.N)
+        self.input_dim = int(args.feature_dim)
+        self.hidden_dim = int(args.hidden_dim_fut)  # 注意这里用 hidden_dim_fut 统一维度
+        self.Encoder_depth = int(args.depth)  # 使用 depth 参数
 
-        # 输入嵌入层和位置编码，相加得到Dit的输入
-        self.input_embedding = nn.Linear(self.feature_dim, self.input_dim)
-        self.pos_embedding = SequentialPositionalEncoding(self.input_dim)
+        self.pre_proj = nn.Linear(self.input_dim, self.hidden_dim)
+        self.mixer_blocks = nn.ModuleList([
+            dit.MixerBlock(tokens_dim=self.T, channels_dim=self.hidden_dim)
+            for _ in range(self.Encoder_depth)
+        ])
 
-        self.timestep_embedder = dit.TimestepEmbedder(self.input_dim, self.time_embedding_size)
+        self.pooling_attn = nn.MultiheadAttention(embed_dim=self.hidden_dim, num_heads=4, batch_first=True)
+        self.fusion_norm = nn.LayerNorm(self.hidden_dim)
+        self.fusion_attn = nn.MultiheadAttention(embed_dim=self.hidden_dim, num_heads=4, batch_first=True)
+
+        self.rel_pos_bias = dit.RelativePositionBias(num_heads=4)
+
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim * 4),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim * 4, self.hidden_dim)
+        )
+
+    def forward(self, x, current_pos, agent_mask=None):
+        """
+        x: [B, T, N, D] (预处理后的相对数据)
+        current_pos: [B, N, 2] (用于计算相对位置矩阵)
+        """
+        B, T, N, D = x.shape
+
+        # [B, T, N, D] -> [B*N, T, D]
+        x = x.permute(0, 2, 1, 3).reshape(B * N, T, D)
+        x = self.pre_proj(x) # [B*N, T, H]
+
+        for block in self.mixer_blocks:
+            x = block(x)  # [B*N, T, H]
+
+        last_frame_feat = x[:, -1, :].unsqueeze(1)  # [B*N, 1, H]
+        x_pooled, _ = self.pooling_attn(last_frame_feat, x, x)
+        x = x_pooled.squeeze(1)  # [B*N, H]
+
+        x = x.view(B, N, -1)  # [B, N, H]
+        resid = x
+        x_norm = self.fusion_norm(x)
+
+        rel_pos_matrix = current_pos.unsqueeze(1) - current_pos.unsqueeze(2)
+        spatial_bias = self.rel_pos_bias(rel_pos_matrix)
+
+        key_padding_mask = None
+        if agent_mask is not None:
+            key_padding_mask = ~agent_mask.bool()
+
+        attn_mask = spatial_bias.reshape(B * 4, N, N)
+        x_interacted, _ = self.fusion_attn(x_norm, x_norm, x_norm,
+                                           key_padding_mask=key_padding_mask,
+                                           attn_mask=attn_mask)  # 注入相对位置信息
+
+        x = resid + x_interacted
+        x = x + self.fusion_mlp(x)
+
+        return x  # [B, N, H]
+
+class TrajectoryProcessor(nn.Module):
+    def __init__(self, pos_scale=4.0, pos_abs_scale=80.0):
+        super().__init__()
+        # 定义 Buffer 避免 device 问题
+        self.register_buffer('pos_scale', torch.tensor(pos_scale))
+        self.register_buffer('pos_abs_scale', torch.tensor(pos_abs_scale))
+
+    def hist_process(self, hist_abs, current_pos):
+        # hist_abs: [B, T, N, 4] (x, y, v, a), current_pos: [B, 1, N, 2] (t=0 时刻的绝对坐标)
+        vel = hist_abs[..., 2:4]  # 假设输入数据里直接有 v (即差分)
+        rel_pos = hist_abs[..., :2] - current_pos
+
+        vel_norm = vel / self.pos_scale
+        rel_pos_norm = rel_pos / self.pos_abs_scale
+
+        return torch.cat([vel_norm, rel_pos_norm], dim=-1)  # [B, T, N, 4]
+
+    def fut_abs2rel(self, future_abs, current_pos):
+        # future_abs: [B, T, N, 2]
+        temp = torch.cat([current_pos, future_abs], dim=1)
+        diff = temp[:, 1:] - temp[:, :-1]
+        return diff / self.pos_scale # 【B, T, N, 2】 (Normalized Deltas)
+
+    def fut_rel2abs(self, pred_rel, current_pos):
+        # pred_rel: [B, T, N, 2] (Normalized Deltas)
+        diff = pred_rel * self.pos_scale
+        cumsum = torch.cumsum(diff, dim=1)
+        return cumsum + current_pos # [B, T, N, 2]
+
+class DiffusionFut(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.hidden_dim = int(args.hidden_dim_fut)
+        self.T_f = int(args.T_f)
+
+        self.processor = TrajectoryProcessor()
+        self.hist_encoder = AgentEncoder(args)
+
+        self.timestep_embedder = dit.TimestepEmbedder(self.hidden_dim)
         self.diffusion_scheduler = DDIMScheduler(
-            num_train_timesteps=args.num_train_timesteps,
+            num_train_timesteps=args.num_train_timesteps_fut,
             beta_schedule="scaled_linear",
             prediction_type="sample",
+            clip_sample=False,
         )
 
-        self.dit_block = dit.DiTBlock(self.input_dim, self.heads, self.dropout, self.mlp_ratio)
-        self.final_layer = dit.FinalLayer(self.hidden_dim, self.N, self.T, self.output_dim)
-        self.dit = dit.DiT(
-            dit_block=self.dit_block,
-            final_layer=self.final_layer,
-            time_embedder=self.timestep_embedder,
-            depth=self.depth,
-            model_type="x_start"
+        self.dit = dit.DiTFut(
+            hidden_dim=self.hidden_dim,
+            heads=int(args.heads_fut),
+            dropout=args.dropout_fut,
+            depth=int(args.depth_fut),
+            mlp_ratio=args.mlp_ratio_fut,
+            N=int(args.N_f),
+            T=self.T_f,
+            time_embedder=self.timestep_embedder
         )
 
-        self.loss = DiffusionLoss(reduction="mean")
-        self.norm_config_path = str(Path(__file__).resolve().parent.parent / 'dataset/ngsim_stats.npz')
-        self.norm_config = np.load(self.norm_config_path)
-        for key, value in self.norm_config.items():
-            self.register_buffer(key, torch.from_numpy(value).float())
+    def get_rel_pos_matrix(self, current_pos):
+        # current_pos: [B, 1, N, 2]
+        pos = current_pos.squeeze(1)  # [B, N, 2]
+        # 计算 P_j - P_i (邻居相对于我)
+        rel_matrix = pos.unsqueeze(1) - pos.unsqueeze(2)
+        return rel_matrix
 
-    def forward_train(self, hist, hist_masked, device):
-        hist_norm = self.norm(hist)
+    def forward_train(self, future, hist, device, agent_mask=None):
+        """
+        future: [B, T_f, N, 2] Ground Truth Absolute
+        hist: [B, T_h, N, 4] Ground Truth Absolute
+        """
+        B, T, N, _ = future.shape
 
-        B, T, N, dim = hist.shape
-        x_start = hist_norm
-        hist_masked = hist_masked.view(B, N * T, -1)
+        current_pos = hist[:, -1:, :, :2]  # [B, 1, N, 2] Anchor
+        current_pos_sq = current_pos.squeeze(1)  # [B, N, 2]
 
-        timesteps = torch.randint(0, self.num_train_timesteps, (B,), device=device)
-        noise = torch.randn_like(x_start)
-        x_noisy = self.diffusion_scheduler.add_noise(x_start, noise, timesteps)
-        x_noisy = self.denorm(x_noisy).view(B, N * T, -1)
+        # 1. Encode History
+        hist_input = self.processor.hist_process(hist, current_pos)
+        hist_feat = self.hist_encoder(hist_input, current_pos_sq, agent_mask)  # [B, N, H]
 
-        # (Input = Noisy_GT + Hist_Masked)
-        model_input = torch.cat([x_noisy, hist_masked], dim=-1)
+        # 2. Prepare Target & Flatten
+        x_start = self.processor.fut_abs2rel(future, current_pos)  # [B, T, N, 2]
+        # Flatten: [B, T, N, 2] -> [B, N, T, 2] -> [B, N, T*2]
+        x_start_flat = x_start.permute(0, 2, 1, 3).reshape(B, N, -1)
 
-        input_embedded = self.input_embedding(model_input) + self.pos_embedding(model_input)
-        pred_x0 = self.dit(x=input_embedded, t=timesteps)
+        # 3. Add Noise
+        timesteps = torch.randint(0, self.diffusion_scheduler.config.num_train_timesteps, (B,), device=device)
+        noise = torch.randn_like(x_start_flat)
+        x_noisy_flat = self.diffusion_scheduler.add_noise(x_start_flat, noise, timesteps)
 
-        loss = self.loss(pred_x0, hist, None)
+        if agent_mask is not None:
+            # agent_mask: [B, N] -> [B, N, 1]
+            mask_exp = agent_mask.unsqueeze(-1).float()
+            x_noisy_flat = x_noisy_flat * mask_exp
 
-        return loss, pred_x0
+        # 4. DiT Forward
+        rel_pos_matrix = self.get_rel_pos_matrix(current_pos)
+        # Input: [B, N, T*2] -> Output: [B, N, T*2]
+        pred_flat = self.dit(x_noisy_flat, timesteps, hist_feat, rel_pos_matrix, agent_mask)
 
-    def forward_eval(self, hist, hist_masked, device):
-        B, T, N, dim = hist.shape
+        # 5. Loss
+        target = x_start_flat
 
-        hist_mask = hist_masked[..., -1:]  # [B, T, N, 1]
-        hist_values = hist_masked[..., :-1]  # [B, T, N, dim]
-        hist_norm = self.norm(hist_values)
-        hist_masked_norm = hist_norm * hist_mask # [B, T, N, dim]
+        loss = torch.nn.functional.mse_loss(pred_flat, target, reduction='none')
 
-        timesteps = torch.full((B,), self.num_train_timesteps - 1, device=device, dtype=torch.long)
-        noise = torch.randn_like(hist_masked_norm)
-        x_t = self.diffusion_scheduler.add_noise(hist_masked_norm, noise, timesteps)
-        x_t = x_t.view(B, T, N, -1)
-        hist_masked = hist_masked.view(B, N * T, -1)
+        if agent_mask is not None:
+            loss = (loss * mask_exp).sum() / (mask_exp.sum() * (T * 2) + 1e-6)
+        else:
+            loss = loss.mean()
 
-        self.diffusion_scheduler.set_timesteps(4)
+        pred_reshaped = pred_flat.view(B, N, T, 2).permute(0, 2, 1, 3)
+        pred_abs = self.processor.fut_rel2abs(pred_reshaped, current_pos)
+
+        diff = torch.norm(pred_abs - future, dim=-1)  # [B, T, N]
+
+        if agent_mask is not None:
+            mask_bool = agent_mask.bool()
+            ade = (diff * mask_bool.unsqueeze(1)).sum() / (mask_bool.sum() * T + 1e-6)
+            fde = (diff[:, -1] * mask_bool).sum() / (mask_bool.sum() + 1e-6)
+        else:
+            ade = diff.mean()
+            fde = diff[:, -1].mean()
+
+        return loss, pred_abs, ade, fde
+
+    @torch.no_grad()
+    def forward_eval(self, hist, device, agent_mask=None):
+        B, T_h, N, _ = hist.shape
+        T_f = self.T_f
+
+        current_pos = hist[:, -1:, :, :2]
+        current_pos_sq = current_pos.squeeze(1)
+
+        hist_input = self.processor.hist_process(hist, current_pos)
+        hist_feat = self.hist_encoder(hist_input, current_pos_sq, agent_mask)
+        rel_pos_matrix = self.get_rel_pos_matrix(current_pos)
+
+        # Init Noise: Flattened [B, N, T*2]
+        x_t_flat = torch.randn(B, N, T_f * 2, device=device)
+
+        self.diffusion_scheduler.set_timesteps(self.args.num_inference_steps)
 
         for t in self.diffusion_scheduler.timesteps:
-            x_input = self.denorm(x_t).view(B, N * T, -1)
-            model_input = torch.cat([x_input, hist_masked], dim=-1)
-
             timesteps = torch.full((B,), t, device=device, dtype=torch.long)
-            input_embedded = self.input_embedding(model_input) + self.pos_embedding(model_input)
-            pred_x0 = self.dit(x=input_embedded, t=timesteps) # [B, T, N, dim]
+            pred_x0_flat = self.dit(x_t_flat, timesteps, hist_feat, rel_pos_matrix, agent_mask)
+            x_t_flat = self.diffusion_scheduler.step(pred_x0_flat, t, x_t_flat).prev_sample
 
-            pred_x0_norm = self.norm(pred_x0)
-            x_t = pred_x0_norm
+        # Unflatten
+        pred_reshaped = x_t_flat.view(B, N, T_f, 2).permute(0, 2, 1, 3)
+        pred_abs = self.processor.fut_rel2abs(pred_reshaped, current_pos)
+        return pred_abs
 
-        final_pred = self.denorm(x_t)
-        loss = self.loss(final_pred, hist, None)
+class TrajectoryModel(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.fut_model = DiffusionFut(args)
 
-        return loss, final_pred
+    def forward(self, hist, hist_masked, future, device, agent_mask=None):
+        loss, pred, ade, fde = self.fut_model.forward_train(future, hist, device, agent_mask)
+        return torch.tensor(0.0), loss, None, pred, 0.0, 0.0, ade, fde
 
-    def forward_test(self, hist_masked, device):
-        mask_indicator = hist_masked[..., -1:]  # [B, T, 1, 1]
-        hist_val_masked = self.norm(hist_masked[..., :-1])  # 归一化值
-        cond_input = hist_val_masked * mask_indicator  # 确保未观测区域绝对为 0
-
-        B, T, N, dim_plus_one = hist_masked.shape
-        x_t = torch.randn((B, N * T, self.output_dim), device=device)
-        dim_gap = dim_plus_one - self.output_dim - 1
-        zeros_padding = torch.zeros((B, N * T, dim_gap), device=device)
-        x_t_expanded = torch.cat([x_t, zeros_padding], dim=-1)
-
-        cond_flat = cond_input.view(B, N * T, -1)
-        mask_flat = mask_indicator.view(B, N * T, 1)
-        model_input = torch.cat([x_t_expanded, cond_flat, mask_flat], dim=-1)
-        timesteps = torch.full((B,), self.num_train_timesteps - 1, device=device, dtype=torch.long)
-
-        input_embedded = self.input_embedding(model_input) + self.pos_embedding(model_input)
-        pred_x0 = self.dit(x=input_embedded, t=timesteps)
-
-        # loss = self.loss(pred_x0, x_start.view(B, T, N, -1)[..., :2], None)
-        pred_denorm = self.denorm(pred_x0.view(B, T, N, -1))
-
-        return self.denorm(pred_denorm)  # self.denorm(pred_x0.view(B, T, N, -1))
-
-    def forward_test1(self, hist, hist_masked, device):
-        B, T, N, dim = hist.shape
-        hist_masked = hist_masked.view(B, N * T, -1)
-
-        x_noisy = torch.randn((B, T, N, dim), device=device)
-        x_noisy = self.denorm(x_noisy).view(B, N * T, -1)
-        timesteps = torch.full((B,), self.num_train_timesteps, device=device, dtype=torch.long)
-
-        # (Input = Noisy_GT + Hist_Masked)
-        model_input = torch.cat([x_noisy, hist_masked], dim=-1)
-
-        input_embedded = self.input_embedding(model_input) + self.pos_embedding(model_input)
-        pred_x0 = self.dit(x=input_embedded, t=timesteps)
-
-        loss = self.loss(pred_x0, hist, None)
-
-        return loss, pred_x0
-
-    def forward_test2(self, hist, hist_masked, device):
-        device = device
-        B, T, N, dim_plus_one = hist_masked.shape
-
-        hist_masked = hist_masked.view(B, N * T, -1)
-
-        x_t = torch.randn((B, N * T, self.output_dim), device=device)
-        x_input = self.denorm_eval(x_t)
-
-        self.diffusion_scheduler.set_timesteps(5)
-
-        dim_gap = dim_plus_one - 1 - self.output_dim
-        zeros_padding = torch.randn((B, N * T, dim_gap), device=device)
-
-        for t in self.diffusion_scheduler.timesteps:
-            x_t_expanded = torch.cat([x_input, zeros_padding], dim=-1)
-            model_input = torch.cat([x_t_expanded, hist_masked], dim=-1)
-            t_batch = torch.full((B,), t, device=device, dtype=torch.long)
-
-            input_embedded = self.input_embedding(model_input) + self.pos_embedding(model_input)
-            pred_x0 = self.dit(x=input_embedded, t=t_batch).view(B, N * T, self.output_dim)
-            pred_x0_norm = self.norm_eval(pred_x0)
-            output = self.diffusion_scheduler.step(pred_x0_norm, t, x_t)
-            x_t_minus_1 = output.prev_sample
-            x_t = x_t_minus_1
-
-            # if t > 0:
-            #     cond_pos = cond_val[..., :self.output_dim]
-            #     t_prev = t - self.diffusion_scheduler.config.num_train_timesteps // self.diffusion_scheduler.num_inference_steps
-            #     noise = torch.randn_like(cond_pos)
-            #     known_part_noisy = self.diffusion_scheduler.add_noise(
-            #         cond_pos, noise, torch.tensor([t], device=device)  # 理论上应为 t_prev
-            #     )
-            #
-            #     x_t = x_t_minus_1 * (1 - mask_indicator) + known_part_noisy * mask_indicator
-            # else:
-            #     x_t = x_t_minus_1
-
-        final_pred = x_t
-        # cond_pos = cond_val[..., :self.output_dim]
-
-        # 强制将已知部分替换为完美的 GT (无噪声)
-        # final_pred = final_pred * (1 - mask_indicator) + cond_pos * mask_indicator
-        final_pred = final_pred.view(B, T, N, self.output_dim)
-        final_pred = self.denorm_eval(final_pred)
-        loss = self.loss(final_pred, hist[..., :2], None)
-
-        return loss, final_pred
-
-    # hist = [B, T, dim], nbrs = [N_total, T, dim]. dim = x, y, v, a, laneID, class
-    def norm(self, x):
-        x_norm = x.clone()
-        x_norm[..., 0:2] = (x[..., 0:2] - self.pos_mean) / self.pos_std  # x, y
-        x_norm[..., 2:4] = (x[..., 2:4] - self.va_mean) / self.va_std  # v, a
-        x_norm[..., 4] = (x[..., 4] - self.lane_mean) / self.lane_std  # laneID
-        x_norm[..., 5] = (x[..., 5] - self.class_mean) / self.class_std  # class
-        x_norm = torch.clamp(x_norm, -5.0, 5.0)
-        return x_norm
-
-    def norm_eval(self, x):
-        x_norm = x.clone()
-        x_norm[..., 0:2] = (x[..., 0:2] - self.pos_mean) / self.pos_std  # x, y
-        x_norm = torch.clamp(x_norm, -5.0, 5.0)
-        return x_norm
-
-    def denorm(self, x):
-        x_denorm = x.clone()
-        x_denorm[..., 0:2] = x[..., 0:2] * self.pos_std + self.pos_mean  # x, y
-        x_denorm[..., 2:4] = x[..., 2:4] * self.va_std + self.va_mean  # v, a
-        x_denorm[..., 4] = x[..., 4] * self.lane_std + self.lane_mean  # laneID
-        x_denorm[..., 5] = x[..., 5] * self.class_std + self.class_mean  # class
-        return x_denorm
+    def inference(self, hist, hist_masked, future, device, agent_mask=None):
+        pred_fut = self.fut_model.forward_eval(hist, device, agent_mask)
+        return None, pred_fut
 
 
-    def denorm_eval(self, x):
-        x_denorm = x.clone()
-        x_denorm[..., 0:2] = x[..., 0:2] * self.pos_std + self.pos_mean  # x, y
-        return x_denorm
+# class DiffusionFut(nn.Module):
+#     def __init__(self, args):
+#         super().__init__()
+#         self.args = args
+#         self.T_f = int(args.T_f)
+#         self.hidden_dim = int(args.hidden_dim_fut)
+#
+#         self.processor = TrajectoryProcessor()
+#         self.hist_encoder = AgentEncoder(args)
+#
+#         self.timestep_embedder = dit.TimestepEmbedder(self.hidden_dim)
+#         self.diffusion_scheduler = DDIMScheduler(
+#             num_train_timesteps=args.num_train_timesteps_fut,
+#             beta_schedule="scaled_linear",
+#             prediction_type="sample",
+#             clip_sample=False,
+#         )
+#
+#         self.dit = dit.DiTFut(
+#             input_dim=2,  # dx, dy
+#             hidden_dim=self.hidden_dim,
+#             output_dim=2,
+#             heads=int(args.heads_fut),
+#             dropout=args.dropout_fut,
+#             depth=int(args.depth_fut),
+#             mlp_ratio=args.mlp_ratio_fut,
+#             N=int(args.N_f),
+#             T=self.T_f,
+#             time_embedder=self.timestep_embedder
+#         )
+#
+#     def get_rel_pos_matrix(self, current_pos):
+#         # current_pos: [B, 1, N, 2]
+#         pos = current_pos.squeeze(1)  # [B, N, 2]
+#         # [B, 1, N, 2] - [B, N, 1, 2] -> [B, N, N, 2] (P_j - P_i)
+#         rel_matrix = pos.unsqueeze(1) - pos.unsqueeze(2)
+#         return rel_matrix
+#
+#     def forward_train(self, future, hist, device, agent_mask=None):
+#         """
+#         future: [B, T_f, N, 2] Ground Truth Absolute
+#         hist: [B, T_h, N, 4] Ground Truth Absolute
+#         """
+#         B, T, N, _ = future.shape
+#
+#         current_pos = hist[:, -1:, :, :2]  # [B, 1, N, 2] Anchor
+#         current_pos_sq = current_pos.squeeze(1)  # [B, N, 2]
+#
+#         hist_input = self.processor.hist_process(hist, current_pos)
+#         hist_feat = self.hist_encoder(hist_input, current_pos_sq, agent_mask)  # [B, N, H]
+#
+#         x_start = self.processor.fut_abs2rel(future, current_pos)  # [B, T, N, 2]
+#
+#         rel_pos_matrix = self.get_rel_pos_matrix(current_pos)  # [B, N, N, 2]
+#
+#         B, T, N, D = x_start.shape
+#         x_start_flat = x_start.permute(0, 2, 1, 3).reshape(B, N, -1)
+#
+#         timesteps = torch.randint(0, self.diffusion_scheduler.config.num_train_timesteps, (B,), device=device)
+#         noise = torch.randn_like(x_start_flat)
+#         x_noisy_flat = self.diffusion_scheduler.add_noise(x_start_flat, noise, timesteps)
+#
+#         if agent_mask is not None:
+#             x_noisy_flat = x_noisy_flat * agent_mask.unsqueeze(-1)
+#
+#         pred_flat = self.dit(x_noisy_flat, timesteps, hist_feat, rel_pos_matrix, current_pos_sq, agent_mask)
+#
+#         loss = torch.nn.functional.mse_loss(pred_flat, x_start_flat, reduction='none')
+#
+#         if agent_mask is not None:
+#             loss = (loss * mask_exp).sum() / (mask_exp.sum() + 1e-6)
+#         else:
+#             loss = loss.mean()
+#
+#         # Metrics (ADE/FDE in Absolute Coords)
+#         pred_abs = self.processor.fut_rel2abs(pred_noise, current_pos)
+#         diff = torch.norm(pred_abs - future, dim=-1)
+#
+#         if agent_mask is not None:
+#             mask_bool = agent_mask.bool()
+#             ade = (diff * mask_bool.unsqueeze(1)).sum() / (mask_bool.sum() * T + 1e-6)
+#             fde = (diff[:, -1] * mask_bool).sum() / (mask_bool.sum() + 1e-6)
+#         else:
+#             ade = diff.mean()
+#             fde = diff[:, -1].mean()
+#
+#         return loss, pred_abs, ade, fde
+#
+#     @torch.no_grad()
+#     def forward_eval(self, hist, device, agent_mask=None):
+#         B, T_h, N, _ = hist.shape
+#         T_f = self.dit.T
+#
+#         current_pos = hist[:, -1:, :, :2]
+#         current_pos_sq = current_pos.squeeze(1)
+#
+#         hist_input = self.processor.hist_process(hist, current_pos)
+#         hist_feat = self.hist_encoder(hist_input, current_pos_sq, agent_mask)
+#         rel_pos_matrix = self.get_rel_pos_matrix(current_pos)
+#
+#         x_t = torch.randn(B, T_f, N, 2, device=device)
+#
+#         self.diffusion_scheduler.set_timesteps(self.args.num_inference_steps)
+#
+#         for t in self.diffusion_scheduler.timesteps:
+#             timesteps = torch.full((B,), t, device=device, dtype=torch.long)
+#             pred_x0 = self.dit(x_t, timesteps, hist_feat, rel_pos_matrix, current_pos.squeeze(1), agent_mask)
+#             x_t = self.diffusion_scheduler.step(pred_x0, t, x_t).prev_sample
+#
+#         pred_abs = self.processor.fut_rel2abs(x_t, current_pos)
+#         return pred_abs
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

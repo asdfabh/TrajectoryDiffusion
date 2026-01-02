@@ -23,7 +23,8 @@ from pathlib import Path
 # Dataset class for the dataset
 class NgsimDataset(Dataset):
 
-    def __init__(self, mat_file, t_h=30, t_f=50, d_s=2, enc_size=64, grid_size=(13, 3)):
+    def __init__(self, mat_file, t_h=30, t_f=50, d_s=2, enc_size=64, grid_size=(13, 3),
+                 max_neighbors=10, neighbor_radius=100.0):
         self.D = scp.loadmat(mat_file)['traj']
         self.T = scp.loadmat(mat_file)['tracks']
         self.t_h = t_h  #
@@ -31,13 +32,14 @@ class NgsimDataset(Dataset):
         self.d_s = d_s  # skip
         self.enc_size = enc_size  # size of the grid cell
         self.grid_size = grid_size  # size of social context grid
-        self.alltime = 0
 
+        self.max_neighbors = max_neighbors  # [修改] 最大邻居数量
+        self.neighbor_radius = neighbor_radius
+
+        self.alltime = 0
         self.normalize = False
         self.norm_method = 'zscore'
         self.fixed_scale = 100.0
-
-
         self.pos_mean = np.array([0.0, 0.0])
         self.pos_std = np.array([1.0, 1.0])
         self.va_mean = np.array([0.0, 0.0])
@@ -90,48 +92,74 @@ class NgsimDataset(Dataset):
     """
 
     def __getitem__(self, idx):
+        dsId = self.D[idx, 0].astype(int)
+        vehId = self.D[idx, 1].astype(int)
+        t = self.D[idx, 2]
 
-        dsId = self.D[idx, 0].astype(int)  # dataset id
-        vehId = self.D[idx, 1].astype(int)  # agent id
-        t = self.D[idx, 2]  # frame
-        grid = self.D[idx, 11:]  # grid id
+        # [修改] 获取所有候选邻居 ID (从原有的 grid 列中获取，去重)
+        grid_candidates = self.D[idx, 11:].astype(int)
+        unique_candidates = np.unique(grid_candidates)
+        unique_candidates = unique_candidates[unique_candidates != 0]  # 去除 0
+
+        # 1. 筛选和计算距离
+        valid_neighbors = []
+        hist = self.getHistory(vehId, t, vehId, dsId)  # 自车历史
+
+        for nbr_id in unique_candidates:
+            # 获取邻居相对于自车的历史轨迹
+            nbr_hist = self.getHistory(nbr_id, t, vehId, dsId)
+
+            if nbr_hist.shape[0] > 0:
+                # 计算当前时刻 t (轨迹的最后一点) 的距离
+                current_pos = nbr_hist[-1]
+                dist = np.linalg.norm(current_pos)
+
+                if dist <= self.neighbor_radius:
+                    valid_neighbors.append({
+                        'id': nbr_id,
+                        'dist': dist,
+                        'hist': nbr_hist
+                    })
+
+        # 2. 按距离排序并截取前 K 个
+        valid_neighbors.sort(key=lambda x: x['dist'])
+        selected_neighbors = valid_neighbors[:self.max_neighbors]
+
+        # 3. 构建输出数据
         neighbors = []
         neighborsva = []
         neighborslane = []
         neighborsclass = []
         neighborsdistance = []
+        neighborsfut = []
 
-        # Get track history 'hist' = ndarray, and future track 'fut' = ndarray
-        hist = self.getHistory(vehId, t, vehId, dsId)  # 获取vehId 在vehID2下的相对历史轨迹，形状为(T,2)
-        refdistance = np.zeros_like(hist[:, 0])
-        refdistance = refdistance.reshape(len(refdistance), 1)
+        refdistance = np.zeros_like(hist[:, 0]).reshape(-1, 1)
         fut = self.getFuture(vehId, t, dsId)
         va = self.getVA(vehId, t, vehId, dsId)
         lane = self.getLane(vehId, t, vehId, dsId)
         cclass = self.getClass(vehId, t, vehId, dsId)
 
-        # Get track histories of all neighbours 'neighbors' = [ndarray,[],ndarray,ndarray]
-        for i in grid:
-            nbrsdis = self.getHistory(i.astype(int), t, vehId, dsId)
-            if nbrsdis.shape != (0, 2):
-                uu = np.power(hist - nbrsdis, 2)
-                distancexxx = np.sqrt(uu[:, 0] + uu[:, 1])
-                distancexxx = distancexxx.reshape(len(distancexxx), 1)
-            else:
-                distancexxx = np.empty([0, 1])
-            neighbors.append(nbrsdis)
-            neighborsva.append(self.getVA(i.astype(int), t, vehId, dsId))
-            neighborslane.append(self.getLane(
-                i.astype(int), t, vehId, dsId).reshape(-1, 1))
-            neighborsclass.append(self.getClass(
-                i.astype(int), t, vehId, dsId).reshape(-1, 1))
+        for item in selected_neighbors:
+            nbr_id = item['id']
+            nbr_hist = item['hist']
+
+            # 计算历史距离序列 (用于特征)
+            uu = np.power(hist - nbr_hist, 2)
+            distancexxx = np.sqrt(uu[:, 0] + uu[:, 1]).reshape(-1, 1)
+
+            neighbors.append(nbr_hist)
             neighborsdistance.append(distancexxx)
-        # 横纵向动作独热编码，int(self.D[idx, 10] - 1 ) 读取的当作对的数字表示，然后转化为独热编码
+            neighborsva.append(self.getVA(nbr_id, t, vehId, dsId))
+            neighborslane.append(self.getLane(nbr_id, t, vehId, dsId).reshape(-1, 1))
+            neighborsclass.append(self.getClass(nbr_id, t, vehId, dsId).reshape(-1, 1))
+            neighborsfut.append(self.getFuture(nbr_id, t, dsId, vehId))
+
+        # 独热编码部分保持不变
         lon_enc = np.zeros([3])
         lon_enc[int(self.D[idx, 10] - 1)] = 1
         lat_enc = np.zeros([3])
         lat_enc[int(self.D[idx, 9] - 1)] = 1
-        nbrs_num = np.array(sum(1 for arr in neighbors if arr.size != 0))
+        nbrs_num = np.array(len(neighbors))
 
         sample = {
             "hist": hist,
@@ -148,6 +176,7 @@ class NgsimDataset(Dataset):
             "cclass": cclass,
             "neighborsclass": neighborsclass,
             "nbrs_num": nbrs_num,
+            "neighborsfut": neighborsfut,
         }
         return sample
 
@@ -277,80 +306,95 @@ class NgsimDataset(Dataset):
             return distance
 
     # Helper function to get track future
-    def getFuture(self, vehId, t, dsId):
+    def getFuture(self, vehId, t, dsId, refVehId=None):
+        if refVehId is None:
+            refVehId = vehId
+
+        if vehId == 0:
+            return np.empty([0, 2])
+
+        if self.T.shape[1] <= vehId - 1:
+            return np.empty([0, 2])
+
+        refTrack = self.T[dsId - 1][refVehId - 1].transpose()
         vehTrack = self.T[dsId - 1][vehId - 1].transpose()
-        refPos = vehTrack[np.where(vehTrack[:, 0] == t)][0, 1:3]
-        stpt = np.argwhere(vehTrack[:, 0] == t).item() + self.d_s
-        enpt = np.minimum(len(vehTrack), np.argwhere(
-            vehTrack[:, 0] == t).item() + self.t_f + 1)
+
+        ref_idx = np.where(refTrack[:, 0] == t)
+        if ref_idx[0].size == 0:
+            return np.empty([0, 2])
+        refPos = refTrack[ref_idx][0, 1:3]
+
+        veh_t_idx = np.argwhere(vehTrack[:, 0] == t)
+        if vehTrack.size == 0 or veh_t_idx.size == 0:
+            return np.empty([0, 2])
+
+        stpt = veh_t_idx.item() + self.d_s
+        enpt = np.minimum(len(vehTrack), veh_t_idx.item() + self.t_f + 1)
+
+        if stpt >= len(vehTrack):
+            return np.empty([0, 2])
+
         fut = vehTrack[stpt:enpt:self.d_s, 1:3] - refPos
         return fut
 
     # Collate function for dataloader
     def collate_fn(self, samples):
-        # ttt = time.time()
-        # Initialize neighbors and neighbors length batches:
         nbr_batch_size = 0
         for sample in samples:
             nbrs = sample["neighbors"]
-            nbr_batch_size += sum(len(nbr) != 0 for nbr in nbrs)
+            nbr_batch_size += len(nbrs)  # 直接统计有效邻居总数
 
-        # Initialize neighbor batches:
         maxlen = self.t_h // self.d_s + 1
+
+        # 初始化 Batch Tensor
         nbrs_batch = torch.zeros(nbr_batch_size, maxlen, 2)
         nbrsva_batch = torch.zeros(nbr_batch_size, maxlen, 2)
         nbrslane_batch = torch.zeros(nbr_batch_size, maxlen, 1)
         nbrsclass_batch = torch.zeros(nbr_batch_size, maxlen, 1)
         nbrsdis_batch = torch.zeros(nbr_batch_size, maxlen, 1)
+        nbrsfut_batch = torch.zeros(nbr_batch_size, self.t_f // self.d_s, 2)
 
+        # Mask 初始化
         hist_valid_mask = torch.zeros(len(samples), maxlen, 1, dtype=torch.bool)
         fut_valid_mask = torch.zeros(len(samples), self.t_f // self.d_s, 1, dtype=torch.bool)
         va_valid_mask = torch.zeros(len(samples), maxlen, 1, dtype=torch.bool)
         nbrs_valid_mask = torch.zeros(nbr_batch_size, maxlen, 1, dtype=torch.bool)
         nbrsva_valid_mask = torch.zeros(nbr_batch_size, maxlen, 1, dtype=torch.bool)
 
-        # Initialize social mask batch:
-        pos = [0, 0]
-        map_position = torch.zeros(0, 2)
-        mask_batch = torch.zeros(len(samples), self.grid_size[1], self.grid_size[0]).bool()
-        # mask_batch = torch.zeros(len(samples), self.grid_size[1], self.grid_size[0], self.enc_size)  # (batch,3,13,h)
-        # temporal_mask_batch = torch.zeros(len(samples), self.grid_size[1], self.grid_size[0], 6)  # (batch,3,13,h)
-        # mask_batch = mask_batch.bool()
-        # temporal_mask_batch = temporal_mask_batch.bool()
+        # [修改] Mask Batch 不再是 Grid 形状，而是 [Batch, Max_Neighbors]
+        # 这里的 mask 表示第 i 个邻居槽位是否有车
+        mask_batch = torch.zeros(len(samples), self.max_neighbors).bool()
+        map_position = torch.zeros(0, 2)  # 仅用于兼容，实际意义变弱
 
-        # Initialize history, history lengths, future, output mask, lateral maneuver and longitudinal maneuver batches:
-        hist_batch = torch.zeros(len(samples), maxlen, 2)  # (len1,batch,2)
+        # Ego 相关 Batch 初始化
+        hist_batch = torch.zeros(len(samples), maxlen, 2)
         distance_batch = torch.zeros(len(samples), maxlen, 1)
-        fut_batch = torch.zeros(len(samples), self.t_f // self.d_s, 2)  # (len2,batch,2)
-        op_mask_batch = torch.zeros(len(samples), self.t_f // self.d_s, 2)  # (len2,batch,2)
-        lat_enc_batch = torch.zeros(len(samples), 3)  # (batch,3)
-        lon_enc_batch = torch.zeros(len(samples), 3)  # (batch,3)
+        fut_batch = torch.zeros(len(samples), self.t_f // self.d_s, 2)
+        op_mask_batch = torch.zeros(len(samples), self.t_f // self.d_s, 2)
+        lat_enc_batch = torch.zeros(len(samples), 3)
+        lon_enc_batch = torch.zeros(len(samples), 3)
         va_batch = torch.zeros(len(samples), maxlen, 2)
         lane_batch = torch.zeros(len(samples), maxlen, 1)
         class_batch = torch.zeros(len(samples), maxlen, 1)
         nbrs_num_batch = torch.zeros(len(samples), 1)
+
         count = 0
         count1 = 0
         count2 = 0
         count3 = 0
         count4 = 0
+
         for sampleId, sample in enumerate(samples):
             hist = sample["hist"]
             fut = sample["fut"]
-            neighbors = sample["neighbors"]
             lat_enc = sample["lat_enc"]
             lon_enc = sample["lon_enc"]
             va = sample["va"]
-            neighborsva = sample["neighborsva"]
             lane = sample["lane"]
-            neighborslane = sample["neighborslane"]
             refdistance = sample["refdistance"]
-            neighborsdistance = sample["neighborsdistance"]
             cclass = sample["cclass"]
-            neighborsclass = sample["neighborsclass"]
             nbrs_num = sample["nbrs_num"]
 
-            # Set up history, future, lateral maneuver and longitudinal maneuver batches:
             hist_batch[sampleId, 0:len(hist), 0] = torch.from_numpy(hist[:, 0])
             hist_batch[sampleId, 0:len(hist), 1] = torch.from_numpy(hist[:, 1])
             distance_batch[sampleId, 0:len(hist), :] = torch.from_numpy(refdistance)
@@ -365,31 +409,40 @@ class NgsimDataset(Dataset):
             class_batch[sampleId, 0:len(cclass), 0] = torch.from_numpy(cclass)
             nbrs_num_batch[sampleId, :] = torch.from_numpy(nbrs_num)
 
-            hist_len = len(hist)
-            fut_len = len(fut)
-            va_len = len(va)
-            if hist_len:
-                hist_valid_mask[sampleId, :hist_len, 0] = True
-            if fut_len:
-                fut_valid_mask[sampleId, :fut_len, 0] = True
-            if va_len:
-                va_valid_mask[sampleId, :va_len, 0] = True
+            neighbors = sample["neighbors"]
+            neighborsva = sample["neighborsva"]
+            neighborslane = sample["neighborslane"]
+            neighborsdistance = sample["neighborsdistance"]
+            neighborsclass = sample["neighborsclass"]
+            neighborsfut = sample["neighborsfut"]
 
-            # Set up neighbor, neighbor sequence length, and mask batches:
-            for id, nbr in enumerate(neighbors):
-                if len(nbr) != 0:
-                    nbr_len = len(nbr)
-                    nbrs_batch[count, 0:nbr_len, 0] = torch.from_numpy(nbr[:, 0])
-                    nbrs_batch[count, 0:nbr_len, 1] = torch.from_numpy(nbr[:, 1])
-                    nbrs_valid_mask[count, :nbr_len, 0] = True
-                    pos[0] = id % self.grid_size[0]
-                    pos[1] = id // self.grid_size[0]
-                    mask_batch[sampleId, pos[1], pos[0]] = True
-                    # mask_batch[sampleId, pos[1], pos[0], :] = torch.ones(self.enc_size).byte()
-                    # temporal_mask_batch[sampleId, pos[1], pos[0], :] = torch.ones(6).byte()
-                    map_position = torch.cat((map_position, torch.tensor([[pos[1], pos[0]]])), 0)
-                    count += 1
-            for id, nbrva in enumerate(neighborsva):
+            # [修改] 邻居填充逻辑：按顺序填充到 0 ~ K-1 的槽位中
+            for i, nbr in enumerate(neighbors):
+                if i >= self.max_neighbors: break  # 理论上 getitem 已截断，双重保险
+
+                # 标记该样本的第 i 个邻居槽位有效
+                mask_batch[sampleId, i] = True
+
+                # 记录位置映射 (Rank, 0) - 仅作兼容
+                map_position = torch.cat((map_position, torch.tensor([[i, 0]])), 0)
+
+                # 填充具体的轨迹数据到扁平化的 batch 中
+                nbr_len = len(nbr)
+                nbrs_batch[count, 0:nbr_len, 0] = torch.from_numpy(nbr[:, 0])
+                nbrs_batch[count, 0:nbr_len, 1] = torch.from_numpy(nbr[:, 1])
+                nbrs_valid_mask[count, :nbr_len, 0] = True
+
+                nbr_fut = neighborsfut[i]
+                if len(nbr_fut) != 0:
+                    nbr_fut_len = len(nbr_fut)
+                    nbrsfut_batch[count, 0:nbr_fut_len, 0] = torch.from_numpy(nbr_fut[:, 0])
+                    nbrsfut_batch[count, 0:nbr_fut_len, 1] = torch.from_numpy(nbr_fut[:, 1])
+
+                count += 1
+
+            # 填充其他属性 (VA, Lane, Distance, Class)
+            # 逻辑同上，只是遍历对应的列表
+            for nbrva in neighborsva:
                 if len(nbrva) != 0:
                     nbrva_len = len(nbrva)
                     nbrsva_batch[count1, 0:nbrva_len, 0] = torch.from_numpy(nbrva[:, 0])
@@ -397,23 +450,17 @@ class NgsimDataset(Dataset):
                     nbrsva_valid_mask[count1, :nbrva_len, 0] = True
                     count1 += 1
 
-            # for id, nbrlane in enumerate(neighborslane):
-            #     if len(nbrlane) != 0:
-            #         for nbrslanet in range(len(nbrlane)):
-            #             nbrslane_batch[nbrslanet, count2, int(nbrlane[nbrslanet] - 1)] = 1
-            #         count2 += 1
-
-            for id, nbrlane in enumerate(neighborslane):
+            for nbrlane in neighborslane:
                 if len(nbrlane) != 0:
                     nbrslane_batch[count2, 0:len(nbrlane), :] = torch.from_numpy(nbrlane)
                     count2 += 1
 
-            for id, nbrdis in enumerate(neighborsdistance):
+            for nbrdis in neighborsdistance:
                 if len(nbrdis) != 0:
                     nbrsdis_batch[count3, 0:len(nbrdis), :] = torch.from_numpy(nbrdis)
                     count3 += 1
 
-            for id, nbrclass in enumerate(neighborsclass):
+            for nbrclass in neighborsclass:
                 if len(nbrclass) != 0:
                     nbrsclass_batch[count4, 0:len(nbrclass), :] = torch.from_numpy(nbrclass)
                     count4 += 1
@@ -421,7 +468,7 @@ class NgsimDataset(Dataset):
         return {
             "hist": hist_batch,
             "nbrs": nbrs_batch,
-            "mask": mask_batch,
+            "mask": mask_batch,  # [B, max_neighbors]
             "lat_enc": lat_enc_batch,
             "lon_enc": lon_enc_batch,
             "fut": fut_batch,
@@ -436,140 +483,128 @@ class NgsimDataset(Dataset):
             "nbrs_class": nbrsclass_batch,
             "map_position": map_position,
             "nbrs_num": nbrs_num_batch,
-            # "temporal_mask": temporal_mask_batch,
+            "nbrs_fut": nbrsfut_batch,
         }
 
     def compute_stats(self, save_path=None, sample_limit=None):
-        print("computing dataset statistics...")
+        """
+        计算数据集的归一化参数 (Mean, Std)。
+        关键修正：统计范围包含了 Ego 和 Neighbors 的【未来轨迹】，确保预测目标的分布也被正确归一化。
+        """
+        print("Computing dataset statistics...")
 
         pos_sum = np.zeros(2, dtype=np.float64)
         pos_sq_sum = np.zeros(2, dtype=np.float64)
         va_sum = np.zeros(2, dtype=np.float64)
         va_sq_sum = np.zeros(2, dtype=np.float64)
-        lane_sum = np.zeros(1, dtype=np.float64)
-        lane_sq_sum = np.zeros(1, dtype=np.float64)
-        class_sum = np.zeros(1, dtype=np.float64)
-        class_sq_sum = np.zeros(1, dtype=np.float64)
-        pos_count = va_count = lane_count = class_count = 0
 
+        # 计数器
+        pos_count = 0
+        va_count = 0
+
+        # 辅助函数：确保是列向量
         def ensure_col(arr):
             if arr.size == 0:
                 return np.empty((0, 1))
             return arr.reshape(-1, 1) if arr.ndim == 1 else arr
 
+        # 限制采样数用于快速调试，正式训练设为 None
         n = len(self.D) if sample_limit is None else min(len(self.D), sample_limit)
 
         for idx in range(n):
-
             dsId = self.D[idx, 0].astype(int)
             vehId = self.D[idx, 1].astype(int)
             t = self.D[idx, 2]
             grid = self.D[idx, 11:]
 
-            # ego hist / fut / va
+            # 1. 获取 Ego 数据
+            # 注意：getHistory 和 getFuture 必须传入 refVehId=vehId 以获取相对坐标
             try:
                 hist = self.getHistory(vehId, t, vehId, dsId)
-            except Exception:
+            except:
                 hist = np.empty((0, 2))
+
             try:
-                fut = self.getFuture(vehId, t, dsId)
-            except Exception:
+                fut = self.getFuture(vehId, t, dsId, refVehId=vehId)
+            except:
                 fut = np.empty((0, 2))
+
             try:
                 va = self.getVA(vehId, t, vehId, dsId)
-            except Exception:
+            except:
                 va = np.empty((0, 2))
-            try:
-                lane = ensure_col(self.getLane(vehId, t, vehId, dsId))
-            except Exception:
-                lane = np.empty((0, 1))
-            try:
-                cclass = ensure_col(self.getClass(vehId, t, vehId, dsId))
-            except Exception:
-                cclass = np.empty((0, 1))
 
+            # 累加 Ego 的位置 (History + Future)
             for arr in (hist, fut):
-                if arr.size != 0:
+                if arr.size > 0:
                     pos_sum += arr.sum(axis=0)
                     pos_sq_sum += (arr ** 2).sum(axis=0)
                     pos_count += arr.shape[0]
-            if va.size != 0:
+
+            # 累加 Ego 的速度/加速度
+            if va.size > 0:
                 va_sum += va.sum(axis=0)
                 va_sq_sum += (va ** 2).sum(axis=0)
                 va_count += va.shape[0]
-            if lane.size != 0:
-                lane_sum += lane.sum(axis=0)
-                lane_sq_sum += (lane ** 2).sum(axis=0)
-                lane_count += lane.shape[0]
-            if cclass.size != 0:
-                class_sum += cclass.sum(axis=0)
-                class_sq_sum += (cclass ** 2).sum(axis=0)
-                class_count += cclass.shape[0]
 
+            # 2. 获取 Neighbors 数据
             for v_id in grid:
                 vid = int(v_id)
                 if vid == 0:
                     continue
+
                 try:
                     n_hist = self.getHistory(vid, t, vehId, dsId)
-                except Exception:
+                except:
                     n_hist = np.empty((0, 2))
+
+                try:
+                    # [重要] 获取 Neighbor 未来轨迹用于统计
+                    n_fut = self.getFuture(vid, t, dsId, refVehId=vehId)
+                except:
+                    n_fut = np.empty((0, 2))
+
                 try:
                     n_va = self.getVA(vid, t, vehId, dsId)
-                except Exception:
+                except:
                     n_va = np.empty((0, 2))
-                try:
-                    n_lane = ensure_col(self.getLane(vid, t, vehId, dsId))
-                except Exception:
-                    n_lane = np.empty((0, 1))
-                try:
-                    n_class = ensure_col(self.getClass(vid, t, vehId, dsId))
-                except Exception:
-                    n_class = np.empty((0, 1))
 
-                if n_hist.size != 0:
-                    pos_sum += n_hist.sum(axis=0)
-                    pos_sq_sum += (n_hist ** 2).sum(axis=0)
-                    pos_count += n_hist.shape[0]
-                if n_va.size != 0:
+                # 累加 Neighbor 的位置 (History + Future)
+                for arr in (n_hist, n_fut):
+                    if arr.size > 0:
+                        pos_sum += arr.sum(axis=0)
+                        pos_sq_sum += (arr ** 2).sum(axis=0)
+                        pos_count += arr.shape[0]
+
+                if n_va.size > 0:
                     va_sum += n_va.sum(axis=0)
                     va_sq_sum += (n_va ** 2).sum(axis=0)
                     va_count += n_va.shape[0]
-                if n_lane.size != 0:
-                    lane_sum += n_lane.sum(axis=0)
-                    lane_sq_sum += (n_lane ** 2).sum(axis=0)
-                    lane_count += n_lane.shape[0]
-                if n_class.size != 0:
-                    class_sum += n_class.sum(axis=0)
-                    class_sq_sum += (n_class ** 2).sum(axis=0)
-                    class_count += n_class.shape[0]
 
+        # 计算 Mean 和 Std
+        # Std = sqrt( E[x^2] - (E[x])^2 )
         if pos_count > 0:
             self.pos_mean = pos_sum / pos_count
             pos_var = (pos_sq_sum / pos_count) - (self.pos_mean ** 2)
-            self.pos_std = np.sqrt(np.maximum(pos_var, 1e-6))
+            self.pos_std = np.sqrt(np.maximum(pos_var, 1e-6))  # 避免除零
+
         if va_count > 0:
             self.va_mean = va_sum / va_count
             va_var = (va_sq_sum / va_count) - (self.va_mean ** 2)
             self.va_std = np.sqrt(np.maximum(va_var, 1e-6))
-        if lane_count > 0:
-            self.lane_mean = lane_sum / lane_count
-            lane_var = (lane_sq_sum / lane_count) - (self.lane_mean ** 2)
-            self.lane_std = np.sqrt(np.maximum(lane_var, 1e-6))
-        if class_count > 0:
-            self.class_mean = class_sum / class_count
-            class_var = (class_sq_sum / class_count) - (self.class_mean ** 2)
-            self.class_std = np.sqrt(np.maximum(class_var, 1e-6))
 
+        # 保存
         save_path = save_path if save_path is not None else self.stats_file
         np.savez(
             save_path,
             pos_mean=self.pos_mean, pos_std=self.pos_std,
             va_mean=self.va_mean, va_std=self.va_std,
+            # Lane 和 Class 通常不需要归一化，或者使用固定值，这里略过更新
             lane_mean=self.lane_mean, lane_std=self.lane_std,
             class_mean=self.class_mean, class_std=self.class_std,
         )
-        print("Computed stats saved to", save_path)
+        print(f"Computed stats saved to {save_path}")
+        print(f"Pos Mean: {self.pos_mean}, Pos Std: {self.pos_std}")
 
     def get_stats(self):
         return {
