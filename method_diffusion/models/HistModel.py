@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from method_diffusion.utils.position_encoding import SequentialPositionalEncoding
 from pathlib import Path
-
+from method_diffusion.utils.visualization import visualize_batch_trajectories, plot_traj_with_mask
 
 class DiffusionPast(nn.Module):
 
@@ -13,7 +13,7 @@ class DiffusionPast(nn.Module):
         super(DiffusionPast, self).__init__()
         # Net parameters
         self.args = args
-        self.feature_dim = int(args.feature_dim) # 输入特征维度 default: 6 (x, y, v, a, laneID, class)
+        self.feature_dim = 2 * int(args.feature_dim) + 1# 输入特征维度 default: 6 (x, y, v, a, laneID, class)
         self.input_dim = int(args.input_dim)   # 输入到Dit的维度 default: 128
         self.hidden_dim = int(args.hidden_dim)
         self.output_dim = int(args.output_dim)
@@ -92,18 +92,21 @@ class DiffusionPast(nn.Module):
     def forward_train(self, hist, hist_masked, device):
         B, T,  _ = hist_masked.shape
 
-        hist_masked_norm = self.norm(hist_masked) # [B, T, dim+1]
-        x_start = hist_masked_norm[..., :self.feature_dim]  # [B, T, dim]
+        hist_mask = hist_masked[..., -1:]  # [B, T, 1]
+        hist_masked_value = hist_masked[..., :-1]  # [B, T, dim]
+        hist_masked_norm = self.norm(hist_masked_value) # [B, T, dim]
+        x_start = hist_masked_norm # [B, T, dim]
         timesteps = torch.randint(0, self.num_train_timesteps, (B,), device=device)
         noise = torch.randn_like(x_start)
         x_noisy = self.diffusion_scheduler.add_noise(x_start, noise, timesteps)
-        model_input = x_noisy
+        model_input = torch.cat([x_noisy, hist_masked], dim=-1)  # [B, T, 2*dim+1]
 
         input_embedded = self.input_embedding(model_input) + self.pos_embedding(model_input)
         pred_x0 = self.dit(x=input_embedded, t=timesteps)
 
-        mask = hist_masked[..., -1].unsqueeze(-1)
+        mask = hist_mask.unsqueeze(-1)
         loss = self.compute_motion_loss(pred_x0, self.norm(hist), mask)
+        # loss = torch.nn.functional.mse_loss(pred_x0, self.norm(hist))
 
         pred = self.denorm(pred_x0)
         diff = pred[..., :2] - hist[..., :2]
@@ -112,23 +115,35 @@ class DiffusionPast(nn.Module):
         ade = dist.mean()
         fde = dist[:, -1].mean()
 
-        return loss, pred_x0, ade, fde
+        # hist = hist[0, :, :2].detach().cpu().numpy()
+        # hist_masked = hist_masked[0, :, :2].detach().cpu().numpy()
+        # pred_ego = pred[0, :, :2].detach().cpu().numpy()
+        #
+        # plot_traj_with_mask(
+        #     hist_original=[hist],
+        #     hist_masked=[hist_masked],
+        #     hist_pred=[pred_ego],
+        #     fig_num1=1,
+        #     fig_num2=1,
+        # )
+
+        return loss, pred, ade, fde
 
     def forward_eval(self, hist, hist_masked, device):
         B, T, _ = hist_masked.shape
 
         hist_masked_norm = self.norm(hist_masked)
-        x_start = hist_masked_norm[..., :self.feature_dim]  # [B, T, dim]
+        hist_mask = hist_masked[..., -1:]
+        x_start = hist_masked_norm[..., :4]  # [B, T, dim]
         timesteps = torch.randint(0, self.num_train_timesteps, (B,), device=device)
         noise = torch.randn_like(x_start)
         x_t = self.diffusion_scheduler.add_noise(x_start, noise, timesteps)
 
         self.diffusion_scheduler.set_timesteps(self.num_inference_steps)
-
         for t in self.diffusion_scheduler.timesteps:
+            model_input = torch.cat((x_t, hist_masked), dim=-1)
             timesteps = torch.full((B,), t, device=device, dtype=torch.long)
-            input_embedded = self.input_embedding(x_t) + self.pos_embedding(x_t)
-            y = self.timestep_embedder(timesteps)
+            input_embedded = self.input_embedding(model_input) + self.pos_embedding(model_input)
             pred_x0_norm = self.dit(x=input_embedded, t=timesteps)
             x_t = self.diffusion_scheduler.step(pred_x0_norm, t, x_t).prev_sample
 
@@ -138,6 +153,18 @@ class DiffusionPast(nn.Module):
         dist = torch.norm(diff, dim=-1)  # [B, T]
         ade = dist.mean()  # Scalar
         fde = dist[:, -1].mean() # Scalar
+
+        # hist = hist[0, :, :2].detach().cpu().numpy()
+        # hist_masked = hist_masked[0, :, :2].detach().cpu().numpy()
+        # pred_ego = final_pred[0, :, :2].detach().cpu().numpy()
+        #
+        # plot_traj_with_mask(
+        #     hist_original=[hist],
+        #     hist_masked=[hist_masked],
+        #     hist_pred=[pred_ego],
+        #     fig_num1=1,
+        #     fig_num2=1,
+        # )
 
         return loss, final_pred, ade, fde
 

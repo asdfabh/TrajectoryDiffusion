@@ -17,13 +17,13 @@ def get_args_parser():
     parser.add_argument('--T', type=int, default=16)
 
     # 训练参数
-    parser.add_argument('--batch_size', type=int, default=1024)
+    parser.add_argument('--batch_size', type=int, default=512)
     parser.add_argument('--num_epochs', type=int, default=50)
-    parser.add_argument('--num_workers', type=int, default=16)
+    parser.add_argument('--num_workers', type=int, default=10)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
-    parser.add_argument('--save_interval', type=int, default=5)
-    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints')
-    parser.add_argument('--resume', default='best', type=str, help="none/latest/best/或直接给定checkpoint路径")
+    parser.add_argument('--save_interval', type=int, default=1)
+    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints') /home/lq/MaDiff/method_diffusion/checkpoints
+    parser.add_argument('--resume', default='epoch6', type=str, help="none/latest/best/或直接给定checkpoint路径")
     parser.add_argument('--mask_prob', type=float, default=0.4, help="历史轨迹随机掩码概率")
     parser.add_argument('--num_inference_steps', type=int, default=10, help="DDIM推理步数")
     parser.add_argument('--num_samples', type=int, default=5, help="evaluate_test 随机抽样的样本数量")

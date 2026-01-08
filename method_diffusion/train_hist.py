@@ -57,7 +57,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim,
     num_batches = 0
 
     pbar = tqdm(enumerate(dataloader), total=len(dataloader),
-                desc=f"Epoch {epoch}", ncols=100)
+                desc=f"Epoch {epoch}", ncols=150)
 
     for batch_idx, batch in pbar:
         hist, hist_masked, hist_mask = prepare_input_data(
@@ -66,6 +66,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim,
 
         # 前向传播，输入为掩码后的轨迹 hist [B, T, dim]
         loss, pred, ade, fde = model.forward_train(hist, hist_masked, device)
+        # _, _, _, _ = model.forward_eval(hist, hist_masked, device)
 
         # hist = hist[0, :, :2].detach().cpu().numpy()
         # hist_masked = hist_masked[0, :, :2].detach().cpu().numpy()
