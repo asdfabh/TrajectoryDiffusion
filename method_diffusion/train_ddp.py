@@ -9,19 +9,18 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from pathlib import Path
-import numpy as np
 from tqdm import tqdm
 import builtins
 
-from method_diffusion.models.net import TrajectoryModel
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.config import get_args_parser
-from method_diffusion.utils.mask_util import block_mask
+from method_diffusion.models.HistModel import DiffusionPast
+from method_diffusion.utils.mask_util import random_mask, continuous_mask
+from method_diffusion.utils.visualization import plot_traj_with_mask
 
-
-# -----------------------------------------------------------------------------
-# Functions for DDP
-# -----------------------------------------------------------------------------
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def setup_ddp():
     """初始化分布式训练环境"""
@@ -57,84 +56,45 @@ def reduce_value(value, average=True):
         return value
 
 
-def prepare_input_data(batch, input_dim, mask_type='random', mask_prob=0.4, device='cuda'):
+def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, device='cuda'):
     """
     准备输入数据，处理 Ego 和 Neighbors，并生成掩码。
     """
 
     hist = batch['hist']  # [B, T, 2]
     va = batch['va']  # [B, T, 2]
-    nbrs = batch['nbrs']  # [Total_Nbrs, T, 2]
-    nbrs_va = batch['nbrs_va']
-    ego_fut = batch['fut']  # [B, T_f, 2]
-    nbrs_fut = batch['nbrs_fut']  # [Total_Nbrs, T_f, 2]
-    nbr_valid_mask = batch['mask'].to(device)  # [B, N] 表示位置是否存在nbrs
+    lane = batch['lane']  # [B, T, 1]
+    cclass = batch['cclass']  # [B, T, 1]
 
-    src = torch.cat((hist, va), dim=-1).to(device)
-    nbrs_src = torch.cat((nbrs, nbrs_va), dim=-1).to(device)
-    ego_fut = ego_fut.to(device).unsqueeze(2)  # [B, T_f, 1, 2]
-    nbrs_fut = nbrs_fut.to(device)  # [Total_Nbrs, T_f, 2]
-
-    B, T, dim = src.shape
-    _, T_f, _, dim_fut = ego_fut.shape
-    N = nbr_valid_mask.shape[1]
-
-    mask_flat = nbr_valid_mask.view(B, -1)
-
-    scatter_mask = nbr_valid_mask.view(B, N, 1, 1).expand(B, N, T, dim)
-    hist_nbrs_temp = torch.zeros(B, N, T, dim, device=device)
-    hist_nbrs_temp = hist_nbrs_temp.masked_scatter_(scatter_mask.bool(), nbrs_src)
-    hist_nbrs = hist_nbrs_temp.permute(0, 2, 1, 3).contiguous()  # [B, T, N, dim]
-
-    scatter_mask_fut = nbr_valid_mask.view(B, N, 1, 1).expand(B, N, T_f, dim_fut)
-    fut_nbrs_temp = torch.zeros(B, N, T_f, dim_fut, device=device)
-    fut_nbrs_temp = fut_nbrs_temp.masked_scatter_(scatter_mask_fut.bool(), nbrs_fut)
-    fut_nbrs = fut_nbrs_temp.permute(0, 2, 1, 3).contiguous()  # [B, T_f, N, dim_fut]
-    future = torch.cat([ego_fut, fut_nbrs], dim=2)
+    if feature_dim == 6:
+        hist = torch.cat((hist, va, lane, cclass), dim=-1).to(device)  # [B, T, 6]
+    elif feature_dim == 5:
+        hist = torch.cat((hist, va, lane), dim=-1).to(device)  # [B, T, 5]
+    elif feature_dim == 4:
+        hist = torch.cat((hist, va), dim=-1).to(device)
+    else:
+        hist = hist.to(device)
 
     if mask_type == 'random':
-        mask = torch.rand(B, T, 1, 1, device=device) < mask_prob
-        mask = mask.float()
-        nbrs_mask_rand = torch.rand(B, T, N, 1, device=device) < mask_prob
-        nbrs_exists = mask_flat.unsqueeze(1).unsqueeze(-1).expand(B, T, N, 1).float()
-        nbrs_mask = nbrs_mask_rand.float() * nbrs_exists
-
+        hist_mask = random_mask(hist, p=mask_prob)
     elif mask_type == 'block':
-        m = block_mask(B, T, device=device).unsqueeze(-1).unsqueeze(-1)  # [B, T, 1, 1]
-        mask = m.float()
-        nbrs_exists = mask_flat.unsqueeze(1).unsqueeze(-1).expand(B, T, N, 1).float()
-        nbrs_mask = mask.expand(-1, -1, N, -1) * nbrs_exists
+        hist_mask = continuous_mask(hist, p=mask_prob)
     else:
-        mask = torch.ones(B, T, 1, 1, device=device)
-        nbrs_exists = mask_flat.unsqueeze(1).unsqueeze(-1).expand(B, T, N, 1).float()
-        nbrs_mask = nbrs_exists
+        hist_mask = random_mask(hist, p=mask_prob)
 
-    # Ego: [B, T, 1, dim] -> [B, T, 1, dim+1]
-    src = src.unsqueeze(2)
-    hist_masked_val = src * mask
-    hist_masked = torch.cat([hist_masked_val, mask], dim=-1)
-    hist_masked[:, -1, :, :] = 1  # 确保最后一个时间步不被mask
+    hist_masked_val = hist_mask * hist
+    hist_masked = torch.cat([hist_masked_val, hist_mask], dim=-1)
 
-    # Nbrs: [B, T, N, dim] -> [B, T, N, dim+1]
-    hist_nbrs_masked_val = hist_nbrs * nbrs_mask
-    hist_nbrs_masked = torch.cat([hist_nbrs_masked_val, nbrs_mask], dim=-1)
-
-    # Construct agent_mask [B, 1+N] (Existence Mask)
-    ego_mask = torch.ones(B, 1, device=device).bool()
-    agent_mask = torch.cat([ego_mask, nbr_valid_mask.bool()], dim=1)  # [B, N]
-
-    return src, hist_nbrs, hist_masked, hist_nbrs_masked, mask, nbrs_mask, future, agent_mask
+    return hist, hist_masked, hist_mask
 
 
 # -----------------------------------------------------------------------------
 # Training Loop
 # -----------------------------------------------------------------------------
 
-def train_epoch(model, dataloader, optimizer, device, epoch, input_dim, rank,
-                mask_type='random', mask_prob=0.4):
+def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, mask_type='random', mask_prob=0.4):
     model.train()
-    total_loss_past = torch.zeros(1).to(device)
-    total_loss_fut = torch.zeros(1).to(device)
+    total_loss = 0.0
     num_batches = 0
 
     # 只有 Rank 0 显示进度条
@@ -144,21 +104,11 @@ def train_epoch(model, dataloader, optimizer, device, epoch, input_dim, rank,
         pbar = enumerate(dataloader)
 
     for batch_idx, batch in pbar:
-        # mask_type = 'random' if torch.rand(1).item() < 0.65 else 'block'
-        hist, hist_nbrs, hist_masked, hist_nbrs_masked, mask, nbrs_mask, future, agent_mask = prepare_input_data(
-            batch, input_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
+        hist, hist_masked, hist_mask = prepare_input_data(
+            batch, feature_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
         )
 
-        # 拼接 Ego 和 Neighbors
-        hist = torch.cat([hist, hist_nbrs], dim=2)  # [B, T, N+1, dim]
-        hist_masked = torch.cat([hist_masked, hist_nbrs_masked], dim=2)  # [B, T, N+1, dim+1]
-
-        # Forward
-        loss_past, loss_fut, pred_hist, pred_fut, hist_ade, hist_fde, fut_ade, fut_fde = model.forward(hist,
-                                                                                                       hist_masked,
-                                                                                                       future, device,
-                                                                                                       agent_mask=agent_mask)
-        loss = loss_fut + loss_past
+        loss, pred, ade, fde = model(hist, hist_masked, device)
 
         # Backward
         optimizer.zero_grad()
@@ -166,56 +116,19 @@ def train_epoch(model, dataloader, optimizer, device, epoch, input_dim, rank,
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        # 统计 (累加 Tensor 以便后续 reduce)
-        total_loss_past += loss_past.detach()
-        total_loss_fut += loss_fut.detach()
+        total_loss += loss.item()
         num_batches += 1
 
         if rank == 0:
             pbar.set_postfix({
-                # 'L_p': f'{loss_past.item():.4f}', # Past loss is dummy 0.0
-                'L_f': f'{loss_fut.item():.4f}',
-                # 'Av_p': f'{total_loss_past.item() / num_batches:.4f}',
-                'Av_f': f'{total_loss_fut.item() / num_batches:.4f}',
-                # 'hADE': f'{hist_ade:.4f}',
-                # 'hFDE': f'{hist_fde:.4f}',
-                'fADE': f'{fut_ade:.4f}',
-                'fFDE': f'{fut_fde:.4f}',
+                'loss': f'{loss.item():.8f}',
+                'avg_loss': f'{total_loss / num_batches:.8f}',
+                'ade': f'{ade.mean().item():.4f}',
+                'fde': f'{fde.mean().item():.4f}',
             })
 
-    # 聚合所有 GPU 的 Loss
-    avg_loss_past = reduce_value(total_loss_past, average=True).item() / num_batches
-    avg_loss_fut = reduce_value(total_loss_fut, average=True).item() / num_batches
-
-    return avg_loss_past, avg_loss_fut
-
-
-def load_pretrained_parts(args, model, device, rank):
-    # 【修改点】移除 past_model 的加载逻辑，因为模型结构已变更
-    # if args.pretrained_past: ... (Deleted)
-
-    if args.pretrained_fut:
-        if rank == 0:
-            print(f"Loading pretrained Fut model from {args.pretrained_fut}")
-        ckpt = torch.load(args.pretrained_fut, map_location=device)
-        state_dict = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
-
-        fut_dict = {}
-        for k, v in state_dict.items():
-            if k.startswith('fut_model.'):
-                fut_dict[k.replace('fut_model.', '')] = v
-            # 兼容旧权重：如果旧权重没有前缀但结构匹配，也可以加载（视情况而定）
-            elif not k.startswith('past_model.'):
-                fut_dict[k] = v
-
-        if fut_dict:
-            msg = model.fut_model.load_state_dict(fut_dict, strict=False)
-            if rank == 0:
-                print(f"Loaded Fut model: {msg}")
-        else:
-            if rank == 0:
-                print("Warning: No fut_model weights found in checkpoint")
-
+    avg_loss = total_loss / num_batches
+    return avg_loss
 
 def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, rank):
     start_epoch = 0
@@ -286,8 +199,8 @@ def main():
     if rank == 0:
         Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
-    data_root = Path(__file__).resolve().parent.parent / 'data/ngsimdata'  # 注意路径修正，根据你的环境可能需要调整
-    # data_root = Path('/mnt/datasets/ngsimdata') # 如果你在服务器上用绝对路径
+    # Use args.data_root
+    data_root = Path(args.data_root)
     train_path = str(data_root / 'TrainSet.mat')
 
     train_dataset = NgsimDataset(train_path, t_h=30, t_f=50, d_s=2)
@@ -305,11 +218,7 @@ def main():
         drop_last=True
     )
 
-    model = TrajectoryModel(args).to(device)
-
-    # 【修改点】移除冻结参数的逻辑，因为只有 fut_model
-    # if args.train_mode == 'past_only': ... (Deleted)
-    # elif args.train_mode == 'fut_only': ... (Deleted)
+    model = DiffusionPast(args).to(device)
 
     # 仅在分布式环境下使用 DDP
     if dist.is_initialized():
@@ -327,9 +236,6 @@ def main():
         T_max=args.num_epochs
     )
 
-    # 加载预训练部分 (如果指定)
-    load_pretrained_parts(args, model, device, rank)
-
     start_epoch, best_loss = load_checkpoint_if_needed(
         args, model, optimizer, scheduler, device, rank
     )
@@ -342,29 +248,25 @@ def main():
             print(f"\n========== Epoch {epoch + 1}/{args.num_epochs} ==========")
 
         mask_type = 'random'
-        mask_prob = 0.55
+        mask_prob = args.mask_prob
 
-        avg_loss_past, avg_loss_fut = train_epoch(
+        avg_loss = train_epoch(
             model, train_loader, optimizer, device, epoch + 1,
             args.feature_dim, rank, mask_type=mask_type, mask_prob=mask_prob
         )
 
-        current_total_loss = avg_loss_past + avg_loss_fut
-
         if rank == 0:
-            print(f"Epoch [{epoch + 1}] Total Loss: {current_total_loss:.4f} "
-                  f"(Past: {avg_loss_past:.4f}, Fut: {avg_loss_fut:.4f})")
+            print(f"Epoch [{epoch + 1}] Average Loss: {avg_loss:.4f}")
 
         scheduler.step()
 
         if rank == 0:
             state = {
                 'epoch': epoch + 1,
-                'model_state_dict': model.module.state_dict(),  # 注意使用 .module
+                'model_state_dict': model.module.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'loss_past': avg_loss_past,
-                'loss_fut': avg_loss_fut,
+                'loss': avg_loss,
                 'best_loss': best_loss,
             }
 
@@ -373,8 +275,8 @@ def main():
                 torch.save(state, save_path)
                 print(f"Saved checkpoint to {save_path}")
 
-            if current_total_loss < best_loss:
-                best_loss = current_total_loss
+            if avg_loss < best_loss:
+                best_loss = avg_loss
                 state['best_loss'] = best_loss
                 save_path = Path(args.checkpoint_dir) / "checkpoint_best.pth"
                 torch.save(state, save_path)
@@ -385,3 +287,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

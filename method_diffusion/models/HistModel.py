@@ -168,6 +168,10 @@ class DiffusionPast(nn.Module):
 
         return loss, final_pred, ade, fde
 
+    def forward(self, hist, hist_masked, device):
+        """Standard forward method for DDP compatibility"""
+        return self.forward_train(hist, hist_masked, device)
+
     # hist = [B, T, dim], nbrs = [N_total, T, dim]. dim = x, y, v, a, laneID, class
     def norm(self, x):
         x_norm = x.clone()
