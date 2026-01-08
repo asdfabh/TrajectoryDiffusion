@@ -1,65 +1,38 @@
 import numpy as np
 import torch
 
-def apply_mask_keep_length(traj, mask, fill_value=0):
-
-    traj = traj.numpy() if isinstance(traj, torch.Tensor) else traj
-    mask = mask.numpy() if isinstance(mask, torch.Tensor) else mask
-
-    mask = mask.astype(bool)
-    masked_traj = traj.copy()
-    masked_traj[~mask] = fill_value
-    return masked_traj
-
-
-def random_mask_traj(traj, p=0.4):
+# 轨迹随机掩码，保留比例 p， True表示保留
+def random_mask(traj, p=0.4):
     if isinstance(traj, np.ndarray):
         traj = torch.from_numpy(traj)
 
-    if traj.dim() == 2:
-        T = traj.shape[0]
-        if T == 0:
-            return torch.empty(0, dtype=torch.bool, device=traj.device)
-        mask = torch.rand(T, device=traj.device) < p
-    else:  # [B, T, 2]
-        B, T, _ = traj.shape
-        mask = torch.rand(B, T, device=traj.device) < p
+    B, T, _ = traj.shape
 
+    mask = torch.rand((B, T, 1), device=traj.device) < p
+    if T > 0:
+        mask[:, -1, :] = True
     return mask
 
-def random_prefix_keep_traj(traj, p=0.6):
-    T = traj.shape[0]
-    if T == 0:
-        return np.array([], dtype=bool)
+# 轨迹连续掩码， 丢弃比例为 p， True表示保留
+def continuous_mask(traj, p=0.4):
+    if isinstance(traj, np.ndarray):
+        traj = torch.from_numpy(traj)
 
-    keep_len = np.random.randint(1, T * p)
-    mask = np.zeros(T, dtype=bool)
-    mask[T - keep_len:] = 1
-    # print(f"keep_len: {keep_len}, mask = {mask}")
-    return mask
+    B, T, _ = traj.shape
+    block_len = max(0, min(T - 1, int(round(T * p))))
 
-def block_mask_traj(traj, missing_ratio=0.3):
-    """支持单条轨迹 [T, 2]"""
-    T = traj.shape[0]
-    block_len = max(1, min(T, int(round(T * missing_ratio))))
-    start = torch.randint(0, T - block_len + 1, (1,), device=traj.device).item()
+    mask = torch.ones((B, T), dtype=torch.bool, device=traj.device)
+    if block_len > 0:
+        max_start = T - 1 - block_len
+        starts = torch.randint(0, max_start + 1, (B,), device=traj.device)
 
-    mask = torch.ones(T, dtype=torch.bool, device=traj.device)
-    mask[start:start + block_len] = False
-    return mask
+        positions = torch.arange(T, device=traj.device).unsqueeze(0)
+        starts = starts.unsqueeze(1)
 
-def block_mask(B, T, missing_ratio=0.3, device='cuda'):
-    device = torch.device(device)
-    if B == 0:
-        return torch.empty((0, T), dtype=torch.bool, device=device)
+        missing = (positions >= starts) & (positions < starts + block_len)
+        mask = ~missing
 
-    block_len = max(1, min(T, int(round(T * missing_ratio))))
-    # 随机生成每条轨迹的起点，shape: (B,)
-    starts = torch.randint(0, T - block_len + 1, (B,), device=device)
-    # positions shape: (1, T), starts shape: (B, 1) -> 广播比较
-    positions = torch.arange(T, device=device).unsqueeze(0)
-    starts = starts.unsqueeze(1)
-    missing = (positions >= starts) & (positions < starts + block_len)  # True 表示缺失区间
-    masks = ~missing  # True 表示保留
-    return masks.to(dtype=torch.bool)
+    return mask.unsqueeze(-1)
 
+# print(continuous_mask(torch.ones(5, 10, 2), p=0.4))
+# print(random_mask(torch.ones(2, 10, 2), p=0.4))

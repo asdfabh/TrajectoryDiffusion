@@ -92,7 +92,7 @@ def plot_traj(hist, fut=None, fut_pred=None, nbrs=None, fig_num1=3, fig_num2=3, 
     plt.show()
 
 
-def plot_traj_with_mask(hist_original, hist_masked=None, hist_pred=None, nbrs_original=None, nbrs_masked=None, nbrs_pred=None,
+def plot_traj_with_mask(hist_original, hist_masked, hist_pred, nbrs_original=None, nbrs_masked=None, nbrs_pred=None,
                         fig_num1=3, fig_num2=3):
     """
     可视化原始、掩码和预测轨迹
@@ -120,13 +120,12 @@ def plot_traj_with_mask(hist_original, hist_masked=None, hist_pred=None, nbrs_or
                 markersize=5, linewidth=1.5, label='Original', zorder=4)
 
         # 2. 提取掩码位置并标记(红色x)
-        if hist_masked is not None:
-            obs_mask = hist_masked[i][:, -1].astype(bool)  # 观测标记
-            masked_indices = ~obs_mask  # 被掩码的位置
-            if masked_indices.any():
-                masked_pos = hist_orig[masked_indices]
-                ax.plot(masked_pos[:, 1], masked_pos[:, 0], 'rx',
-                        markersize=8, markeredgewidth=2, label='Masked', zorder=5)
+        obs_mask = hist_masked[i][:, -1].astype(bool)  # 观测标记
+        masked_indices = ~obs_mask  # 被掩码的位置
+        if masked_indices.any():
+            masked_pos = hist_orig[masked_indices]
+            ax.plot(masked_pos[:, 1], masked_pos[:, 0], 'rx',
+                    markersize=8, markeredgewidth=2, label='Masked', zorder=5)
 
         # 3. 绘制预测轨迹(绿色)
         hist_p = np.asarray(hist_pred[i])
@@ -186,7 +185,6 @@ def plot_traj_with_mask(hist_original, hist_masked=None, hist_pred=None, nbrs_or
 
     plt.tight_layout()
     plt.show()
-
 
 
 def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, path1=None, hist_masked=None, batch_idx=0,
