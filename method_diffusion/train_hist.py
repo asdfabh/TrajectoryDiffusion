@@ -5,7 +5,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 from torch.utils.data import DataLoader
 from pathlib import Path
-from method_diffusion.models.HistModel import DiffusionPast
+from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.config import get_args_parser
 from method_diffusion.utils.visualization import plot_traj_with_mask, plot_traj
@@ -49,8 +49,7 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
     # hist_mask: [B, T, 1] 掩码标记，True表示保留，False表示掩码
     return hist, hist_masked, hist_mask
 
-def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim,
-                mask_type='random', mask_prob=0.4):
+def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, mask_type='random', mask_prob=0.4):
 
     model.train()
     total_loss = 0.0
@@ -100,7 +99,6 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim,
     avg_loss = total_loss / num_batches
     return avg_loss
 
-
 def load_checkpoint_if_needed(args, model, optimizer, scheduler, device):
     start_epoch = 0
     best_loss = float('inf')
@@ -114,7 +112,6 @@ def load_checkpoint_if_needed(args, model, optimizer, scheduler, device):
         if best_candidate.exists():
             ckpt_path = best_candidate
     elif args.resume.startswith('epoch'):
-        # 支持 epoch3, epoch10 等格式
         try:
             epoch_num = int(args.resume.replace('epoch', ''))
             ckpt_path = Path(args.checkpoint_dir) / f'checkpoint_epoch_{epoch_num}.pth'
@@ -139,6 +136,11 @@ def load_checkpoint_if_needed(args, model, optimizer, scheduler, device):
 
 def main():
     args = get_args_parser().parse_args()
+
+    # Set checkpoint directory validation for HistModel
+    args.checkpoint_dir = str(Path(args.checkpoint_dir) / 'hist')
+    Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # 数据集路径

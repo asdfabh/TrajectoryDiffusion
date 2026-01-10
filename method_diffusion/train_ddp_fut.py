@@ -1,7 +1,5 @@
 import sys
 import os
-
-# 添加项目根目录到环境变量
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
@@ -11,16 +9,13 @@ from torch.utils.data import DataLoader, DistributedSampler
 from pathlib import Path
 from tqdm import tqdm
 import builtins
-
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.config import get_args_parser
 from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.utils.mask_util import random_mask, continuous_mask
 from method_diffusion.utils.visualization import plot_traj_with_mask
-
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from method_diffusion.models.fut_model import DiffusionFut
+import numpy as np
 
 def setup_ddp():
     """初始化分布式训练环境"""
@@ -57,40 +52,50 @@ def reduce_value(value, average=True):
 
 
 def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, device='cuda'):
-    """
-    准备输入数据，处理 Ego 和 Neighbors，并生成掩码。
-    """
-
     hist = batch['hist']  # [B, T, 2]
     va = batch['va']  # [B, T, 2]
     lane = batch['lane']  # [B, T, 1]
     cclass = batch['cclass']  # [B, T, 1]
+    fut = batch['fut']  # [B, T, 2]
+    hist_nbrs = batch['nbrs']  # [B, N, T, 2]
+    va_nbrs = batch['nbrs_va']  # [B, N, T, 2]
+    lane_nbrs = batch['nbrs_lane']  # [B, N, T, 1]
+    cclass_nbrs = batch['nbrs_class']
+    mask = batch['mask']  # [B, 3, 13, h]
+    temporal_mask = batch['temporal_mask']  # [B, 3, 13, dim]
 
+
+    # 根据 feature_dim 拼接特征
     if feature_dim == 6:
         hist = torch.cat((hist, va, lane, cclass), dim=-1).to(device)  # [B, T, 6]
+        hist_nbrs = torch.cat((hist_nbrs, va_nbrs, lane_nbrs, cclass_nbrs), dim=-1).to(device)  # [B, N, T, 6]
     elif feature_dim == 5:
-        hist = torch.cat((hist, va, lane), dim=-1).to(device)  # [B, T, 5]
+        hist = torch.cat((hist, va, lane), dim=-1).to(device) # [B, T, 5]
+        hist_nbrs = torch.cat((hist_nbrs, va_nbrs, lane_nbrs), dim=-1).to(device)
     elif feature_dim == 4:
         hist = torch.cat((hist, va), dim=-1).to(device)
-    else:
+        hist_nbrs = torch.cat((hist_nbrs, va_nbrs), dim=-1).to(device)
+    else:  # feature_dim == 2
         hist = hist.to(device)
+        hist_nbrs = hist_nbrs.to(device)
+    fut = fut.to(device)
 
+    # 生成掩码并应用掩码
     if mask_type == 'random':
-        hist_mask = random_mask(hist, p=mask_prob)
+        hist_mask = random_mask(hist, p=mask_prob).to(device)
     elif mask_type == 'block':
-        hist_mask = continuous_mask(hist, p=mask_prob)
+        hist_mask = continuous_mask(hist, p=mask_prob).to(device)
     else:
-        hist_mask = random_mask(hist, p=mask_prob)
+        hist_mask = random_mask(hist, p=mask_prob).to(device)
 
     hist_masked_val = hist_mask * hist
-    hist_masked = torch.cat([hist_masked_val, hist_mask], dim=-1)
+    hist_masked = torch.cat([hist_masked_val, hist_mask], dim=-1) # [B, T, feature_dim+1]
 
-    return hist, hist_masked, hist_mask
+    hist_masked = hist_masked.to(device)
+    mask = mask.to(device)
+    temporal_mask = temporal_mask.to(device)
 
-
-# -----------------------------------------------------------------------------
-# Training Loop
-# -----------------------------------------------------------------------------
+    return hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask
 
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, mask_type='random', mask_prob=0.4):
     model.train()
@@ -104,11 +109,12 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, 
         pbar = enumerate(dataloader)
 
     for batch_idx, batch in pbar:
-        hist, hist_masked, hist_mask = prepare_input_data(
+        hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask = prepare_input_data(
             batch, feature_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
         )
 
-        loss, pred, ade, fde = model(hist, hist_masked, device)
+        # loss, pred, ade, fde = model(hist, hist_masked, device)
+        loss, pred, ade, fde = model(hist, hist_nbrs, mask, temporal_mask, fut, device)
 
         # Backward
         optimizer.zero_grad()
@@ -218,7 +224,7 @@ def main():
         drop_last=True
     )
 
-    model = DiffusionPast(args).to(device)
+    model = DiffusionFut(args).to(device)
 
     # 仅在分布式环境下使用 DDP
     if dist.is_initialized():

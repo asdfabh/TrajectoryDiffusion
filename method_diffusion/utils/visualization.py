@@ -21,6 +21,8 @@ def plot_traj(hist, fut=None, fut_pred=None, nbrs=None, fig_num1=3, fig_num2=3, 
     for i in range(num_plot):
         ax = axes_flat[i]
         sample = hist[i]
+        if isinstance(sample, torch.Tensor):
+            sample = sample.detach().cpu().numpy()
         if type(sample) is not np.ndarray:
             arr = np.asarray(sample)
             print(f"Converted sample to numpy array with shape {arr.shape}.")
@@ -30,6 +32,26 @@ def plot_traj(hist, fut=None, fut_pred=None, nbrs=None, fig_num1=3, fig_num2=3, 
 
         ax.plot(arr[:, 1], arr[:, 0], marker='o',linestyle='None', markersize=2, c='blue', label='History', zorder=4)
         # ax.plot(hist[i, :, 1], hist[i, :, 0], marker='o', markersize=2, c='blue', label='History', zorder=2)
+
+        if fut is not None:
+            fut_sample = fut[i]
+            if isinstance(fut_sample, torch.Tensor):
+                fut_sample = fut_sample.detach().cpu().numpy()
+            if type(fut_sample) is not np.ndarray:
+                fut_arr = np.asarray(fut_sample)
+            else:
+                fut_arr = fut_sample
+            ax.plot(fut_arr[:, 1], fut_arr[:, 0], marker='o', linestyle='None', markersize=2, c='green', label='Future', zorder=4)
+
+        if fut_pred is not None:
+            pred_sample = fut_pred[i]
+            if isinstance(pred_sample, torch.Tensor):
+                pred_sample = pred_sample.detach().cpu().numpy()
+            if type(pred_sample) is not np.ndarray:
+                pred_arr = np.asarray(pred_sample)
+            else:
+                pred_arr = pred_sample
+            ax.plot(pred_arr[:, 1], pred_arr[:, 0], marker='o', linestyle='None', markersize=2, c='red', label='Prediction', zorder=4)
 
         # 设置y轴范围
         ax.set_ylim(-20, 20)
@@ -59,6 +81,9 @@ def plot_traj(hist, fut=None, fut_pred=None, nbrs=None, fig_num1=3, fig_num2=3, 
             continue
 
         nbrs_sample = nbrs[i]
+        if isinstance(nbrs_sample, torch.Tensor):
+            nbrs_sample = nbrs_sample.detach().cpu().numpy()
+
         if isinstance(nbrs_sample, np.ndarray):
             n_nbrs = nbrs_sample.shape[0]
         else:
@@ -66,7 +91,10 @@ def plot_traj(hist, fut=None, fut_pred=None, nbrs=None, fig_num1=3, fig_num2=3, 
 
         for j in range(n_nbrs):
             # 逐个取出邻居并转换为 ndarray
-            nbr = np.asarray(nbrs_sample[j])
+            nbr_val = nbrs_sample[j]
+            if isinstance(nbr_val, torch.Tensor):
+                nbr_val = nbr_val.detach().cpu().numpy()
+            nbr = np.asarray(nbr_val)
             if nbr.size == 0 or nbr.shape[0] == 0:
                 continue
 
@@ -187,7 +215,7 @@ def plot_traj_with_mask(hist_original, hist_masked, hist_pred, nbrs_original=Non
     plt.show()
 
 
-def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, path1=None, hist_masked=None, batch_idx=0,
+def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, pred=None, hist_masked=None, batch_idx=0,
                                  save_path=None):
     """
     可视化单个 Batch 的轨迹 (Ego + Neighbors + Future + Mask)
@@ -195,7 +223,7 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, path1=N
         hist: [B, T, 1, 2] or [B, T, 2] (Ego History)
         hist_nbrs: [B, T, N, 2] (Neighbor History)
         future: [B, T_f, 1+N, 2] or [B, T_f, 2] (Future: Ego + Neighbors)
-        path1: [B, T, N, 2] (Predicted Path)
+        pred: [B, T, N, 2] (Predicted Path)
         hist_masked: [B, T, N, D] (Masked History, last dim is mask)
         batch_idx: Index of the batch element to visualize (default 0)
         save_path: Path to save the figure (Optional)
@@ -216,7 +244,7 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, path1=N
     ego_hist = extract_data(hist, batch_idx)
     nbrs_hist = extract_data(hist_nbrs, batch_idx)
     fut_data = extract_data(future, batch_idx)
-    path1 = extract_data(path1, batch_idx)
+    pred = extract_data(pred, batch_idx)
     mask_data = extract_data(hist_masked, batch_idx)
 
     # Handle dimensions for ego_hist: [T, 1, 2] -> [T, 2]
@@ -240,7 +268,8 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, path1=N
             for i in range(1, num_agents):
                 traj = ego_hist[:, i, :]
                 if np.abs(traj).sum() > 1e-3:
-                    ax.plot(traj[:, 1], traj[:, 0], color='orange', marker='.', linestyle='-', markersize=2, alpha=0.6)
+                    ax.plot(traj[:, 1], traj[:, 0], color='orange', marker='.', linestyle='-', markersize=2,
+                            alpha=0.6)
 
         elif ego_hist.ndim == 2:
             # Only Ego
@@ -256,7 +285,8 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, path1=N
                 traj = nbrs_hist[:, i, :]
                 # Check if neighbor is valid (not all zeros)
                 if np.abs(traj).sum() > 1e-3:
-                    ax.plot(traj[:, 1], traj[:, 0], color='orange', marker='.', linestyle='-', markersize=2, alpha=0.6)
+                    ax.plot(traj[:, 1], traj[:, 0], color='orange', marker='.', linestyle='-', markersize=2,
+                            alpha=0.6)
         elif nbrs_hist.ndim == 2:
             if np.abs(nbrs_hist).sum() > 1e-3:
                 ax.plot(nbrs_hist[:, 1], nbrs_hist[:, 0], color='orange', marker='.', linestyle='-', markersize=2,
@@ -283,19 +313,19 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, path1=N
                 ax.plot(fut_data[:, 1], fut_data[:, 0], color='green', marker='*', linestyle='-', markersize=4,
                         label='Future')
 
-    if path1 is not None:
-        # path1: [T, N, 2]
-        if path1.ndim == 3:
-            num_nbrs = path1.shape[1]
+    if pred is not None:
+        # pred: [T, N, 2]
+        if pred.ndim == 3:
+            num_nbrs = pred.shape[1]
             for i in range(num_nbrs):
-                traj = path1[:, i, :]
+                traj = pred[:, i, :]
                 # Check if neighbor is valid (not all zeros)
                 if np.abs(traj).sum() > 1e-3:
                     ax.plot(traj[:, 1], traj[:, 0], color='cyan', marker='.', linestyle='-', markersize=2,
                             alpha=0.6, label='Pred' if i == 0 else None)
-        elif path1.ndim == 2:
-            if np.abs(path1).sum() > 1e-3:
-                ax.plot(path1[:, 1], path1[:, 0], color='cyan', marker='.', linestyle='-', markersize=2,
+        elif pred.ndim == 2:
+            if np.abs(pred).sum() > 1e-3:
+                ax.plot(pred[:, 1], pred[:, 0], color='cyan', marker='.', linestyle='-', markersize=2,
                         alpha=0.6, label='Pred')
 
     # 5. Mask Visualization (Red X)
@@ -360,3 +390,4 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, path1=N
         plt.show()
 
     plt.close(fig)
+
