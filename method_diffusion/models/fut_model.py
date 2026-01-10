@@ -44,10 +44,10 @@ class DiffusionFut(nn.Module):
             clip_sample=False,
         )
 
-        self.dit_block = dit.DiTBlock(self.input_dim, self.heads, self.dropout, self.mlp_ratio)
+        dit_block = dit.DiTBlock(self.input_dim, self.heads, self.dropout, self.mlp_ratio)
         self.final_layer = dit.FinalLayer(self.hidden_dim, self.T, self.output_dim)
         self.dit = dit.DiT(
-            dit_block=self.dit_block,
+            dit_block=dit_block,
             final_layer=self.final_layer,
             time_embedder=self.timestep_embedder,
             depth=self.depth,
@@ -129,10 +129,12 @@ class DiffusionFut(nn.Module):
 
         return loss, pred, ade, fde
 
+    @torch.no_grad()
     def forward_eval(self, hist, hist_nbrs, mask, temporal_mask, future, device):
         B, T, dim = future.shape
         x_start = torch.randn((B, T, dim), device=device)
         x_t = x_start
+
         context = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)  # [B, T, hidden_dim]
 
         self.diffusion_scheduler.set_timesteps(self.num_inference_steps)

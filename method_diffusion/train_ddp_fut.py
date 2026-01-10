@@ -228,7 +228,7 @@ def main():
 
     # 仅在分布式环境下使用 DDP
     if dist.is_initialized():
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     else:
         print("Running in non-distributed mode (Single GPU/CPU)")
 
