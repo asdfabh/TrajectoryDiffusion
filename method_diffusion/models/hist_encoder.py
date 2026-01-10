@@ -213,4 +213,4 @@ class HistEncoder(nn.Module):
         enc = torch.cat((temporal_spatial_agg, hist_enc), dim=-1) # [T, B, 2D]
         enc = enc.permute(1, 0, 2).contiguous() # [B, T, 2D]
         # 期望维度[B, T, dim=128]
-        return enc
+        return enc, hist_enc

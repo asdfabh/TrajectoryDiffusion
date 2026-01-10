@@ -104,7 +104,7 @@ class FinalLayer(nn.Module):
 
 
 class DiT(nn.Module):
-    def __init__(self, dit_block, final_layer, time_embedder, depth, model_type="x_start"):
+    def __init__(self, dit_block, final_layer, depth, model_type="x_start"):
         super().__init__()
 
         assert model_type in ["score", "x_start"], f"Unknown model type: {model_type}"
@@ -112,14 +112,12 @@ class DiT(nn.Module):
 
         self.blocks = nn.ModuleList([copy.deepcopy(dit_block) for _ in range(depth)])
         self.final_layer = final_layer
-        self.time_embedder = time_embedder
 
     @property
     def model_type(self):
         return self._model_type
 
-    def forward(self, x, t, cross):
-        y = self.time_embedder(t)
+    def forward(self, x, y, cross):
         for block in self.blocks:
             x = block(x, y, cross)
         x = self.final_layer(x, y)
