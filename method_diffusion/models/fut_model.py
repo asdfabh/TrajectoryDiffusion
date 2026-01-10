@@ -56,8 +56,8 @@ class DiffusionFut(nn.Module):
             model_type="x_start"
         )
 
-        self.register_buffer('pos_mean', torch.tensor([0.0, 20.0]).float())
-        self.register_buffer('pos_std', torch.tensor([10.0, 80.0]).float())
+        self.register_buffer('pos_mean', torch.tensor([0.0, 20.0]).float(), persistent=False)
+        self.register_buffer('pos_std', torch.tensor([0.7, 80.0]).float(), persistent=False)
 
     def compute_motion_loss(self, pred, target):
         """
@@ -77,7 +77,7 @@ class DiffusionFut(nn.Module):
         target_acc = target_vel[:, 1:, :] - target_vel[:, :-1, :]
         loss_acc = torch.abs(pred_acc - target_acc).mean()
 
-        total_loss = loss_l1 + 0.7 * loss_vel + 0.2 * loss_acc
+        total_loss = 1.2 * loss_l1 + 0.4 * loss_vel + 0.15 * loss_acc
         return total_loss
 
     # hist: [B, T, dim], hist_masked: [B, T, dim+1]
@@ -88,7 +88,6 @@ class DiffusionFut(nn.Module):
         noise = torch.randn_like(x_start)
         timesteps = torch.randint(0, self.num_train_timesteps, (B,), device=device)
         x_noisy = self.diffusion_scheduler.add_noise(x_start, noise, timesteps)
-        # visualize_batch_trajectories(hist=hist.unsqueeze(2), future=future.unsqueeze(2), pred=self.denorm(x_noisy.unsqueeze(2)), batch_idx=0)
         model_input = x_noisy  # [B, T, 2]
 
         context, hist_enc = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)  # [B, T, hidden_dim]
@@ -99,9 +98,11 @@ class DiffusionFut(nn.Module):
 
         input_embedded = self.input_embedding(model_input) + self.pos_embedding(model_input)
         pred_x0 = self.dit(x=input_embedded, y=y, cross=context)
+        loss = self.compute_motion_loss(pred_x0, future_norm)
+        # loss = torch.nn.functional.mse_loss(pred_x0, future_norm)
+        # visualize_batch_trajectories(hist=self.norm(hist).unsqueeze(2), future=self.norm(future).unsqueeze(2), pred=pred_x0.unsqueeze(2))
 
         pred = self.denorm(pred_x0)
-        loss = self.compute_motion_loss(pred, future)
 
         diff = pred[..., :2] - future[..., :2]
         dist = torch.norm(diff, dim=-1) # [B, T]
@@ -110,14 +111,14 @@ class DiffusionFut(nn.Module):
         fde = dist[:, -1].mean()
 
         # Visualize
-        # hist = hist.unsqueeze(2)  # [B, T, 1, D]
-        # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
-        # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
-        # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
-        # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
-        # hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
-        # hist = torch.cat([hist, hist_nbrs], dim=2)  # [B, T, 1+N, D]
-        # visualize_batch_trajectories(hist=hist, future=future, pred=pred, batch_idx=0)
+        hist = hist.unsqueeze(2)  # [B, T, 1, D]
+        mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
+        mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
+        hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
+        hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
+        hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
+        hist = torch.cat([hist, hist_nbrs], dim=2)  # [B, T, 1+N, D]
+        visualize_batch_trajectories(hist=hist, future=future, pred=pred, batch_idx=0)
 
         return loss, pred, ade, fde
 
@@ -126,7 +127,6 @@ class DiffusionFut(nn.Module):
         B, T, dim = future.shape
         x_start = torch.randn((B, T, dim), device=device)
         x_t = x_start
-        # visualize_batch_trajectories(hist=hist.unsqueeze(2), future=future.unsqueeze(2), pred=self.denorm(x_start.unsqueeze(2)), batch_idx=0)
         context, hist_enc = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)  # [B, T, hidden_dim]
         enc_emb = self.enc_embedding(hist_enc.permute(1, 0, 2)[:, -1, :]) # [B, D]
 
@@ -150,14 +150,14 @@ class DiffusionFut(nn.Module):
         fde = dist[:, -1].mean()
 
         # visualize
-        # hist = hist.unsqueeze(2)  # [B, T, 1, D]
-        # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
-        # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
-        # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
-        # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
-        # hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
-        # hist = torch.cat([hist, hist_nbrs], dim=2)  # [B, T, 1+N, D]
-        # visualize_batch_trajectories(hist=hist, future=future, pred=pred, batch_idx=0)
+        hist = hist.unsqueeze(2)  # [B, T, 1, D]
+        mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
+        mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
+        hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
+        hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
+        hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
+        hist = torch.cat([hist, hist_nbrs], dim=2)  # [B, T, 1+N, D]
+        visualize_batch_trajectories(hist=hist, future=future, pred=pred, batch_idx=0)
         return loss, pred, ade, fde
 
     def forward(self, hist, hist_nbrs, mask, temporal_mask, future, device):
@@ -168,7 +168,7 @@ class DiffusionFut(nn.Module):
     def norm(self, x):
         x_norm = x.clone()
         x_norm[..., 0:2] = (x[..., 0:2] - self.pos_mean) / self.pos_std  # x, y
-        x_norm = torch.clamp(x_norm, -5.0, 5.0)
+        x_norm = torch.clamp(x_norm, -7.0, 7.0)
         return x_norm
 
     def denorm(self, x):

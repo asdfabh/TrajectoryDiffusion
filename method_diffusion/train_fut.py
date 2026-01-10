@@ -75,7 +75,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim,
         )
 
         loss, pred, ade, fde = model.forward_train(hist, hist_nbrs, mask, temporal_mask, fut, device)
-        # _, _, _, _ = model.forward_eval(hist, hist_nbrs, mask, temporal_mask, fut, device)
+        _, _, _, _ = model.forward_eval(hist, hist_nbrs, mask, temporal_mask, fut, device)
 
         optimizer.zero_grad()
         loss.backward()
@@ -123,13 +123,17 @@ def load_checkpoint_if_needed(args, model, optimizer, scheduler, device):
 
     if ckpt_path and ckpt_path.exists():
         state = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(state['model_state_dict'])
+        state_dict = state['model_state_dict']
+        state_dict = {k: v for k, v in state_dict.items() if k not in ['pos_mean', 'pos_std']}
+
+        model.load_state_dict(state_dict, strict=False)
         optimizer.load_state_dict(state['optimizer_state_dict'])
         scheduler.load_state_dict(state['scheduler_state_dict'])
         start_epoch = state.get('epoch', 0)
         best_loss = state.get('best_loss', best_loss)
         print(f"Resumed from {ckpt_path} @ epoch {start_epoch}")
     return start_epoch, best_loss
+
 
 def main():
     args = get_args_parser().parse_args()
