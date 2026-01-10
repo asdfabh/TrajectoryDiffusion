@@ -36,6 +36,8 @@ class DiffusionFut(nn.Module):
         self.pos_embedding = SequentialPositionalEncoding(self.input_dim)
         self.hist_encoder = HistEncoder(args)
         self.enc_embedding = nn.Linear(self.args.encoder_input_dim, self.input_dim)
+        nn.init.constant_(self.enc_embedding.weight, 0)
+        nn.init.constant_(self.enc_embedding.bias, 0)
 
         self.timestep_embedder = dit.TimestepEmbedder(self.input_dim, self.time_embedding_size)
         self.diffusion_scheduler = DDIMScheduler(
@@ -91,8 +93,9 @@ class DiffusionFut(nn.Module):
 
         context, hist_enc = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)  # [B, T, hidden_dim]
         t_emb = self.timestep_embedder(timesteps)
-        enc_emb = self.enc_embedding(hist_enc).permute(1, 0, 2).mean(dim=1)  # [B, D]
+        enc_emb = self.enc_embedding(hist_enc.permute(1, 0, 2)[:, -1, :]) # [B, D]
         y = t_emb + enc_emb
+        # y = t_emb
 
         input_embedded = self.input_embedding(model_input) + self.pos_embedding(model_input)
         pred_x0 = self.dit(x=input_embedded, y=y, cross=context)
@@ -125,7 +128,7 @@ class DiffusionFut(nn.Module):
         x_t = x_start
         # visualize_batch_trajectories(hist=hist.unsqueeze(2), future=future.unsqueeze(2), pred=self.denorm(x_start.unsqueeze(2)), batch_idx=0)
         context, hist_enc = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)  # [B, T, hidden_dim]
-        enc_emb = self.enc_embedding(hist_enc).permute(1, 0, 2).mean(dim=1)  # [B, D]
+        enc_emb = self.enc_embedding(hist_enc.permute(1, 0, 2)[:, -1, :]) # [B, D]
 
         self.diffusion_scheduler.set_timesteps(self.num_inference_steps)
 
