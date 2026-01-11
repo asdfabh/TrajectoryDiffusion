@@ -92,7 +92,7 @@ class DiffusionFut(nn.Module):
 
         context, hist_enc = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)  # [B, T, hidden_dim]
         t_emb = self.timestep_embedder(timesteps)
-        enc_emb = self.enc_embedding(hist_enc.permute(1, 0, 2)[:, -1, :]) # [B, D]
+        enc_emb = self.enc_embedding(hist_enc[:, -1, :]) # [B, D]
         y = t_emb + enc_emb
         # y = t_emb
 
@@ -128,7 +128,7 @@ class DiffusionFut(nn.Module):
         x_start = torch.randn((B, T, dim), device=device)
         x_t = x_start
         context, hist_enc = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)  # [B, T, hidden_dim]
-        enc_emb = self.enc_embedding(hist_enc.permute(1, 0, 2)[:, -1, :]) # [B, D]
+        enc_emb = self.enc_embedding(hist_enc[:, -1, :]) # [B, D]
 
         self.diffusion_scheduler.set_timesteps(self.num_inference_steps)
 
