@@ -321,11 +321,11 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, pred=No
                 traj = pred[:, i, :]
                 # Check if neighbor is valid (not all zeros)
                 if np.abs(traj).sum() > 1e-3:
-                    ax.plot(traj[:, 1], traj[:, 0], color='cyan', marker='.', linestyle='-', markersize=2,
+                    ax.plot(traj[:, 1], traj[:, 0], color='cyan', marker='o', linestyle='-', markersize=3,
                             alpha=0.6, label='Pred' if i == 0 else None)
         elif pred.ndim == 2:
             if np.abs(pred).sum() > 1e-3:
-                ax.plot(pred[:, 1], pred[:, 0], color='cyan', marker='.', linestyle='-', markersize=2,
+                ax.plot(pred[:, 1], pred[:, 0], color='cyan', marker='o', linestyle='-', markersize=3,
                         alpha=0.6, label='Pred')
 
     # 5. Mask Visualization (Red X)
