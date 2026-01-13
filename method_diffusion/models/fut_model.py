@@ -56,15 +56,19 @@ class DiffusionFut(nn.Module):
             model_type="x_start"
         )
 
-        self.register_buffer('pos_mean', torch.tensor([0.0, 40.0]).float(), persistent=False)
-        self.register_buffer('pos_std', torch.tensor([0.7, 100.0]).float(), persistent=False)
+        self.register_buffer('pos_mean', torch.tensor([0.0, 10.0]).float(), persistent=False)
+        self.register_buffer('pos_std', torch.tensor([5, 80.0]).float(), persistent=False)
+        self.register_buffer('va_mean', torch.tensor([17, 0.04]).float(), persistent=False)
+        self.register_buffer('va_std', torch.tensor([12.5, 4.4]).float(), persistent=False)
 
     def compute_motion_loss(self, pred, target):
         """
         pred: [B, T, D]
         target: [B, T, D]
         """
-        loss_l1 = torch.abs(pred - target).mean() # L1 Loss
+        loss_l1_x = torch.abs(pred[..., 0] - target[..., 0]).mean()
+        loss_l1_y = torch.abs(pred[..., 1] - target[..., 1]).mean()
+        loss_l1 = 1.5 * loss_l1_x + loss_l1_y # L1 Loss
 
         pred_pos = pred[..., :2]
         target_pos = target[..., :2]
@@ -90,6 +94,8 @@ class DiffusionFut(nn.Module):
         x_noisy = self.diffusion_scheduler.add_noise(x_start, noise, timesteps)
         model_input = x_noisy  # [B, T, 2]
 
+        hist = self.norm(hist)
+        hist_nbrs = self.norm(hist_nbrs)
         context, hist_enc = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)  # [B, T, hidden_dim]
         t_emb = self.timestep_embedder(timesteps)
         enc_emb = self.enc_embedding(hist_enc[:, -1, :]) # [B, D]
@@ -127,6 +133,8 @@ class DiffusionFut(nn.Module):
         B, T, dim = future.shape
         x_start = torch.randn((B, T, dim), device=device)
         x_t = x_start
+        hist = self.norm(hist)
+        hist_nbrs = self.norm(hist_nbrs)
         context, hist_enc = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)  # [B, T, hidden_dim]
         enc_emb = self.enc_embedding(hist_enc[:, -1, :]) # [B, D]
 
@@ -169,11 +177,17 @@ class DiffusionFut(nn.Module):
     def norm(self, x):
         x_norm = x.clone()
         x_norm[..., 0:2] = (x[..., 0:2] - self.pos_mean) / self.pos_std  # x, y
-        x_norm = torch.clamp(x_norm, -7.0, 7.0)
+        C = x_norm.shape[-1]
+        if C == 3:
+            x_norm[..., 2:4] = (x[..., 2:4] - self.va_mean) / self.va_std  # v, a
+        x_norm = torch.clamp(x_norm, -5.0, 5.0)
         return x_norm
 
     def denorm(self, x):
         x_denorm = x.clone()
         x_denorm[..., 0:2] = x[..., 0:2] * self.pos_std + self.pos_mean  # x, y
+        C = x.shape[-1]
+        if C == 3:
+            x_denorm[..., 2:4] = (x[..., 2:4] * self.va_std) + self.va_mean  # v, a
         return x_denorm
 

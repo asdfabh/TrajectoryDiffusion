@@ -63,66 +63,6 @@ class HistEncoder(nn.Module):
         # Initialize activation and regularization functions.
         self.leaky_relu = nn.LeakyReLU(0.1)
 
-    """
-    src: [B, T, 4]
-    nbrs: [N_t, T, 4]
-    mask: [B, 3, 13, h]
-    temporal_mask: [B, 3, 13, 4]
-    """
-    # def forward(self, src, nbrs, mask, temporal_mask):
-    #
-    #     # Temporal attention mechanism for temporal dependency.
-    #     temporal_mask = temporal_mask.view(temporal_mask.size(0), temporal_mask.size(1) * temporal_mask.size(2), temporal_mask.size(3))
-    #     temporal_mask = repeat(temporal_mask, 'b c n -> t b c n', t=self.args.T)  # [T, B, N, D]
-    #     temporal_grid = torch.zeros_like(temporal_mask).float()
-    #     temporal_grid = temporal_grid.masked_scatter_(temporal_mask.bool(), nbrs) # [T, B, N, D]
-    #
-    #     temporal_query = self.temporal_q(src)  # [B, T, attn_nhead*attn_out]
-    #     # [B, T, 1, attn_out*attn_nhead] -> [B*attn_nhead, T, 1, attn_out] -> [T, B*attn_nhead, 1, attn_out]
-    #     temporal_query = torch.cat(torch.split(torch.unsqueeze(temporal_query, dim=2), int(self.args.attn_out), dim=-1), dim=0).permute(1, 0, 2, 3) # [T, B * H, 1, D]
-    #     temporal_key = self.temporal_k(temporal_grid) # [T, B, N, attn_nhead*attn_out]
-    #     temporal_key = torch.cat(torch.split(temporal_key, int(self.args.attn_out), dim=-1), dim=1).permute(0, 1, 3, 2) # [T, B * H, D, N]
-    #     temporal_value = self.temporal_v(temporal_grid)
-    #     temporal_value = torch.cat(torch.split(temporal_value, int(self.args.attn_out), dim=-1), dim=1) # [T, B * H, N, D]
-    #     temporal_attn_weights = torch.matmul(temporal_query, temporal_key) # [T, B * H, 1, N]
-    #     temporal_attn_weights /= torch.math.sqrt(self.args.attn_out)
-    #     temporal_attn_weights = F.softmax(temporal_attn_weights, dim=-1)
-    #     temporal_value = torch.matmul(temporal_attn_weights, temporal_value) # [T, B * H, 1, D]
-    #     temporal_value = torch.cat(torch.split(temporal_value, int(self.args.batch_size), dim=1), dim=-1).squeeze(2) # [T, B, D*H]
-    #     imbedding_src_T = self.input_embedding(src).permute(1, 0, 2)  # [T, B, D*H]
-    #     temporal_value = self.temporal_residual(imbedding_src_T, temporal_value)
-    #
-    #     hist_enc = self.encoder(self.leaky_relu(self.input_embedding(src)), pos=self.position_encoding(src))
-    #     hist_enc = hist_enc.permute(1, 0, 2) # [T, B, D]
-    #
-    #     # Social attention mechanism for interaction capture.
-    #     nbrs_enc = self.encoder(self.leaky_relu(self.input_embedding(nbrs)), pos=self.position_encoding(nbrs))
-    #     mask = mask.view(mask.size(0), mask.size(1) * mask.size(2), mask.size(3))
-    #     mask = repeat(mask, 'b c n -> t b c n', t=self.args.T)
-    #
-    #     soc_enc = torch.zeros_like(mask).float()
-    #     soc_enc = soc_enc.masked_scatter_(mask.bool(), nbrs_enc)
-    #
-    #     query = self.qf(hist_enc)
-    #     _, _, embed_size = query.shape
-    #     query = torch.cat(torch.split(torch.unsqueeze(query, dim=2), int(embed_size / self.args.attn_nhead), dim=-1),
-    #                       dim=1)  # (batch_size, seq_len*attn_nhead, 1, att_out)
-    #     key = torch.cat(torch.split(self.kf(soc_enc), int(embed_size / self.args.attn_nhead), dim=-1), dim=0).permute(1, 0, 3, 2)  # (batch_size, seq_len*attn_nhead, att_out, 1)
-    #     value = torch.cat(torch.split(self.vf(soc_enc), int(embed_size / self.args.attn_nhead), dim=-1), dim=0).permute(
-    #         1, 0, 2, 3)
-    #     attn_weights = torch.matmul(query, key)
-    #     attn_weights /= torch.math.sqrt(self.args.encoder_input_dim)
-    #     attn_weights = F.softmax(attn_weights, dim=-1)
-    #     value = torch.matmul(attn_weights, value)
-    #     value = torch.cat(torch.split(value, int(src.shape[0]), dim=1), dim=-1).squeeze(2)
-    #
-    #     # Temporal and social aggregation.
-    #     temporal_spatial_agg = self.leaky_relu(temporal_value + value)
-    #
-    #     enc = torch.cat((temporal_spatial_agg, hist_enc), dim=-1).permute(1, 0, 2)
-    #     # 期望维度[B, T, dim=128]
-    #     return enc
-
 
     """
         Inputs:
