@@ -56,10 +56,15 @@ class DiffusionFut(nn.Module):
             model_type="x_start"
         )
 
-        self.register_buffer('pos_mean', torch.tensor([0.0, 10.0]).float(), persistent=False)
-        self.register_buffer('pos_std', torch.tensor([5, 80.0]).float(), persistent=False)
-        self.register_buffer('va_mean', torch.tensor([17, 0.04]).float(), persistent=False)
-        self.register_buffer('va_std', torch.tensor([12.5, 4.4]).float(), persistent=False)
+        # self.register_buffer('pos_mean', torch.tensor([0.0, 10.0]).float(), persistent=False)
+        # self.register_buffer('pos_std', torch.tensor([5, 80.0]).float(), persistent=False)
+        # self.register_buffer('va_mean', torch.tensor([17, 0.04]).float(), persistent=False)
+        # self.register_buffer('va_std', torch.tensor([12.5, 4.4]).float(), persistent=False)
+
+        self.register_buffer('pos_mean', torch.tensor([0.0330, -15.9150]).float(), persistent=False)
+        self.register_buffer('pos_std', torch.tensor([8.8866, 68.8105]).float(), persistent=False)
+        self.register_buffer('va_mean', torch.tensor([21.1503, 0.0060]).float(), persistent=False)
+        self.register_buffer('va_std', torch.tensor([13.5983, 4.5057]).float(), persistent=False)
 
     def compute_motion_loss(self, pred, target):
         """
@@ -94,20 +99,17 @@ class DiffusionFut(nn.Module):
         x_noisy = self.diffusion_scheduler.add_noise(x_start, noise, timesteps)
         model_input = x_noisy  # [B, T, 2]
 
-        hist = self.norm(hist)
-        hist_nbrs = self.norm(hist_nbrs)
-        context, hist_enc = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)  # [B, T, hidden_dim]
+        hist_norm = self.norm(hist)
+        hist_nbrs_norm = self.norm(hist_nbrs)
+
+        context, hist_enc = self.hist_encoder(hist_norm, hist_nbrs_norm, mask, temporal_mask)  # [B, T, hidden_dim]
         t_emb = self.timestep_embedder(timesteps)
         enc_emb = self.enc_embedding(hist_enc[:, -1, :]) # [B, D]
         y = t_emb + enc_emb
-        # y = t_emb
 
         input_embedded = self.input_embedding(model_input) + self.pos_embedding(model_input)
         pred_x0 = self.dit(x=input_embedded, y=y, cross=context)
         loss = self.compute_motion_loss(pred_x0, future_norm)
-        # loss = torch.nn.functional.mse_loss(pred_x0, future_norm)
-        # visualize_batch_trajectories(hist=self.norm(hist).unsqueeze(2), future=future_norm.unsqueeze(2), pred=pred_x0.unsqueeze(2))
-
         pred = self.denorm(pred_x0)
 
         diff = pred[..., :2] - future[..., :2]
@@ -125,7 +127,15 @@ class DiffusionFut(nn.Module):
         # hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
         # hist = torch.cat([hist, hist_nbrs], dim=2)  # [B, T, 1+N, D]
         # visualize_batch_trajectories(hist=hist, future=future, pred=pred, batch_idx=0)
-
+        #
+        # hist_v = hist_norm.unsqueeze(2)  # [B, T, 1, D]
+        # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
+        # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
+        # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
+        # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs_norm)
+        # hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
+        # hist_v = torch.cat([hist_v, hist_nbrs], dim=2)  # [B, T, 1+N, D]
+        # visualize_batch_trajectories(hist=hist_v, future=future_norm, pred=pred_x0, batch_idx=0)
         return loss, pred, ade, fde
 
     @torch.no_grad()
@@ -133,9 +143,9 @@ class DiffusionFut(nn.Module):
         B, T, dim = future.shape
         x_start = torch.randn((B, T, dim), device=device)
         x_t = x_start
-        hist = self.norm(hist)
-        hist_nbrs = self.norm(hist_nbrs)
-        context, hist_enc = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)  # [B, T, hidden_dim]
+        hist_norm = self.norm(hist)
+        hist_nbrs_norm = self.norm(hist_nbrs)
+        context, hist_enc = self.hist_encoder(hist_norm, hist_nbrs_norm, mask, temporal_mask)  # [B, T, hidden_dim]
         enc_emb = self.enc_embedding(hist_enc[:, -1, :]) # [B, D]
 
         self.diffusion_scheduler.set_timesteps(self.num_inference_steps)
