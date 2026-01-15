@@ -75,8 +75,8 @@ class DiTBlock(nn.Module):
         x = x + gate_mlp.unsqueeze(1) * self.mlp1(modulated_x)
 
         x = self.norm3(x)
-        x = self.attn2(x, x, x, key_padding_mask=None)[0]
-        x = self.mlp2(self.norm4(x))
+        x = x + self.attn2(x, x, x, key_padding_mask=None)[0]
+        x = x + self.mlp2(self.norm4(x))
 
         return x
 

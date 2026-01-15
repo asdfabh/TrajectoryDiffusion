@@ -70,8 +70,8 @@ class DiTBlock(nn.Module):
         modulated_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = x + gate_mlp.unsqueeze(1) * self.mlp1(modulated_x)
 
-        x = self.cross_attn(self.norm3(x), cross, cross)[0]
-        x = self.mlp2(self.norm4(x))
+        x = x + self.cross_attn(self.norm3(x), cross, cross)[0]
+        x = x + self.mlp2(self.norm4(x))
 
         return x
 

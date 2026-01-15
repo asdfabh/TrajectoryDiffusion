@@ -93,6 +93,16 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim,
         })
 
     avg_loss = total_loss / num_batches
+
+    model.eval()
+    with torch.no_grad():
+        hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask = prepare_input_data(
+            batch, feature_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
+        )
+        eval_loss, eval_pred, eval_ade, eval_fde = model.forward_eval(hist, hist_nbrs, mask, temporal_mask, fut, device)
+        print(f"EVAL at Epoch {epoch}: ADE: {eval_ade:.4f}, FDE: {eval_fde:.4f}")
+    model.train()
+
     return avg_loss
 
 
