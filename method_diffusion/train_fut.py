@@ -12,6 +12,7 @@ from method_diffusion.utils.visualization import plot_traj_with_mask
 from method_diffusion.utils.mask_util import random_mask, continuous_mask
 import numpy as np
 from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
 def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, device='cuda'):
     hist = batch['hist']  # [B, T, 2]
@@ -68,6 +69,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim,
 
     pbar = tqdm(enumerate(dataloader), total=len(dataloader),
                 desc=f"Epoch {epoch}", ncols=150)
+
 
     for batch_idx, batch in pbar:
         hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask = prepare_input_data(
@@ -152,6 +154,9 @@ def main():
     args.checkpoint_dir = str(Path(args.checkpoint_dir) / 'fut')
     Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
+    log_dir = Path(args.checkpoint_dir) / 'logs'
+    writer = SummaryWriter(log_dir=str(log_dir))
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     data_root = Path(__file__).resolve().parent.parent / '/mnt/datasets/ngsimdata'
@@ -188,7 +193,7 @@ def main():
         args, model, optimizer, scheduler, device
     )
 
-    for epoch in range(args.num_epochs):
+    for epoch in range(start_epoch, args.num_epochs):
         print(f"\n========== Epoch {epoch + 1}/{args.num_epochs} ==========")
 
         mask_type = 'random' # Can be 'block'
@@ -200,6 +205,11 @@ def main():
         )
 
         print(f"Epoch [{epoch + 1}] Average Loss: {avg_loss:.4f}")
+
+        writer.add_scalar('Train/Loss', avg_loss, epoch + 1)
+        current_lr = optimizer.param_groups[0]['lr']
+        writer.add_scalar('Train/LR', current_lr, epoch + 1)
+
         scheduler.step()
 
         state = {
@@ -217,6 +227,8 @@ def main():
             best_loss = avg_loss
             state['best_loss'] = best_loss
             torch.save(state, Path(args.checkpoint_dir) / "checkpoint_best.pth")
+
+    writer.close()
 
 if __name__ == '__main__':
     main()
