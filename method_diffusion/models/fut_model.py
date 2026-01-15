@@ -56,10 +56,10 @@ class DiffusionFut(nn.Module):
             model_type="x_start"
         )
 
-        self.register_buffer('pos_mean', torch.tensor([0.0, -10.0]).float(), persistent=False)
+        self.register_buffer('pos_mean', torch.tensor([0.0, 0.0]).float(), persistent=False)
         self.register_buffer('pos_std', torch.tensor([10, 150]).float(), persistent=False)
-        self.register_buffer('va_mean', torch.tensor([21.1503, 0.0060]).float(), persistent=False)
-        self.register_buffer('va_std', torch.tensor([13.5983, 4.5057]).float(), persistent=False)
+        self.register_buffer('va_mean', torch.tensor([20, 0.01]).float(), persistent=False)
+        self.register_buffer('va_std', torch.tensor([15, 5]).float(), persistent=False)
 
     def compute_motion_loss(self, pred, target):
         """
@@ -114,23 +114,23 @@ class DiffusionFut(nn.Module):
         fde = dist[:, -1].mean()
 
         # Visualize
-        hist = hist.unsqueeze(2)  # [B, T, 1, D]
-        mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
-        mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
-        hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
-        hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
-        hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
-        hist = torch.cat([hist, hist_nbrs], dim=2)  # [B, T, 1+N, D]
-        visualize_batch_trajectories(hist=hist, future=future, pred=pred, batch_idx=0)
+        # hist = hist.unsqueeze(2)  # [B, T, 1, D]
+        # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
+        # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
+        # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
+        # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
+        # hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
+        # hist = torch.cat([hist, hist_nbrs], dim=2)  # [B, T, 1+N, D]
+        # visualize_batch_trajectories(hist=hist, future=future, pred=pred, batch_idx=0)
 
-        hist_v = hist_norm.unsqueeze(2)  # [B, T, 1, D]
-        mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
-        mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
-        hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
-        hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs_norm)
-        hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
-        hist_v = torch.cat([hist_v, hist_nbrs], dim=2)  # [B, T, 1+N, D]
-        visualize_batch_trajectories(hist=hist_v, future=future_norm, pred=pred_x0, batch_idx=0)
+        # hist_v = hist_norm.unsqueeze(2)  # [B, T, 1, D]
+        # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
+        # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
+        # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
+        # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs_norm)
+        # hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
+        # hist_v = torch.cat([hist_v, hist_nbrs], dim=2)  # [B, T, 1+N, D]
+        # visualize_batch_trajectories(hist=hist_v, future=future_norm, pred=pred_x0, batch_idx=0)
         return loss, pred, ade, fde
 
     @torch.no_grad()
@@ -164,23 +164,23 @@ class DiffusionFut(nn.Module):
         fde = dist[:, -1].mean()
 
         # visualize
-        hist = hist.unsqueeze(2)  # [B, T, 1, D]
-        mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
-        mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
-        hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
-        hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
-        hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
-        hist = torch.cat([hist, hist_nbrs], dim=2)  # [B, T, 1+N, D]
-        visualize_batch_trajectories(hist=hist, future=future, pred=pred, batch_idx=0)
-
-        hist_v = hist_norm.unsqueeze(2)  # [B, T, 1, D]
-        mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
-        mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
-        hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
-        hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs_norm)
-        hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
-        hist_v = torch.cat([hist_v, hist_nbrs], dim=2)  # [B, T, 1+N, D]
-        visualize_batch_trajectories(hist=hist_v, future=self.norm(future), pred=x_t, batch_idx=0)
+        # hist = hist.unsqueeze(2)  # [B, T, 1, D]
+        # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
+        # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
+        # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
+        # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
+        # hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
+        # hist = torch.cat([hist, hist_nbrs], dim=2)  # [B, T, 1+N, D]
+        # visualize_batch_trajectories(hist=hist, future=future, pred=pred, batch_idx=0)
+        #
+        # hist_v = hist_norm.unsqueeze(2)  # [B, T, 1, D]
+        # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
+        # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
+        # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
+        # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs_norm)
+        # hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
+        # hist_v = torch.cat([hist_v, hist_nbrs], dim=2)  # [B, T, 1+N, D]
+        # visualize_batch_trajectories(hist=hist_v, future=self.norm(future), pred=x_t, batch_idx=0)
         return loss, pred, ade, fde
 
     def forward(self, hist, hist_nbrs, mask, temporal_mask, future, device):
