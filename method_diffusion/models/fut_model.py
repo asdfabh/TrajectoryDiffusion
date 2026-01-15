@@ -42,7 +42,7 @@ class DiffusionFut(nn.Module):
         self.timestep_embedder = dit.TimestepEmbedder(self.input_dim, self.time_embedding_size)
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=args.num_train_timesteps,
-            beta_schedule="scaled_linear",
+            beta_schedule="squaredcos_cap_v2",
             prediction_type="sample",
             clip_sample=False,
         )
@@ -66,9 +66,11 @@ class DiffusionFut(nn.Module):
         pred: [B, T, D]
         target: [B, T, D]
         """
-        loss_l1_x = torch.abs(pred[..., 0] - target[..., 0]).mean()
-        loss_l1_y = torch.abs(pred[..., 1] - target[..., 1]).mean()
-        loss_l1 = 1.2 * loss_l1_x + loss_l1_y # L1 Loss
+        # loss_l1_x = torch.abs(pred[..., 0] - target[..., 0]).mean()
+        # loss_l1_y = torch.abs(pred[..., 1] - target[..., 1]).mean()
+        # loss_l1 = 1.2 * loss_l1_x + loss_l1_y # L1 Loss
+
+        loss_l1 = torch.abs(pred[..., :2] - target[..., :2]).mean()
 
         pred_pos = pred[..., :2]
         target_pos = target[..., :2]
@@ -81,17 +83,30 @@ class DiffusionFut(nn.Module):
         target_acc = target_vel[:, 1:, :] - target_vel[:, :-1, :]
         loss_acc = torch.abs(pred_acc - target_acc).mean()
 
-        total_loss = 1.2 * loss_l1 + 0.8 * loss_vel + 0.20 * loss_acc
+        total_loss = 1.2 * loss_l1 + 0.5 * loss_vel + 0.15 * loss_acc
         return total_loss
 
     # hist: [B, T, dim], hist_masked: [B, T, dim+1]
     def forward_train(self, hist, hist_nbrs, mask, temporal_mask, future, device):
         B, T, dim = future.shape
-        future_norm = self.norm(future) # [B, T, 2]
+        future_norm = self.norm(future)  # [B, T, 2]
         x_start = future_norm
+
         noise = torch.randn_like(x_start)
-        timesteps = torch.randint(0, self.num_train_timesteps, (B,), device=device)
+
+        weights = torch.ones(self.num_train_timesteps, device=device)
+        p_force = 0.15
+        cutoff = int(self.num_train_timesteps * (1 - p_force))
+        weights[cutoff:] = 10.0
+        timesteps = torch.multinomial(weights, B, replacement=True)
+
         x_noisy = self.diffusion_scheduler.add_noise(x_start, noise, timesteps)
+
+        is_last_step = (timesteps == (self.num_train_timesteps - 1))
+        if is_last_step.any():
+            mask_last = is_last_step.view(-1, 1, 1).expand_as(x_noisy)
+            x_noisy = torch.where(mask_last, noise, x_noisy)
+
         model_input = x_noisy  # [B, T, 2]
 
         hist_norm = self.norm(hist)
@@ -99,7 +114,7 @@ class DiffusionFut(nn.Module):
 
         context, hist_enc = self.hist_encoder(hist_norm, hist_nbrs_norm, mask, temporal_mask)  # [B, T, hidden_dim]
         t_emb = self.timestep_embedder(timesteps)
-        enc_emb = self.enc_embedding(hist_enc[:, -1, :]) # [B, D]
+        enc_emb = self.enc_embedding(hist_enc[:, -1, :])  # [B, D]
         y = t_emb + enc_emb
 
         input_embedded = self.input_embedding(model_input) + self.pos_embedding(model_input)
@@ -108,12 +123,11 @@ class DiffusionFut(nn.Module):
         pred = self.denorm(pred_x0)
 
         diff = pred[..., :2] - future[..., :2]
-        dist = torch.norm(diff, dim=-1) # [B, T]
+        dist = torch.norm(diff, dim=-1)  # [B, T]
 
         ade = dist.mean()
         fde = dist[:, -1].mean()
 
-        # Visualize
         # hist = hist.unsqueeze(2)  # [B, T, 1, D]
         # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
         # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
@@ -132,6 +146,55 @@ class DiffusionFut(nn.Module):
         # hist_v = torch.cat([hist_v, hist_nbrs], dim=2)  # [B, T, 1+N, D]
         # visualize_batch_trajectories(hist=hist_v, future=future_norm, pred=pred_x0, batch_idx=0)
         return loss, pred, ade, fde
+
+    # # hist: [B, T, dim], hist_masked: [B, T, dim+1]
+    # def forward_train(self, hist, hist_nbrs, mask, temporal_mask, future, device):
+    #     B, T, dim = future.shape
+    #     future_norm = self.norm(future) # [B, T, 2]
+    #     x_start = future_norm
+    #     noise = torch.randn_like(x_start)
+    #     timesteps = torch.randint(0, self.num_train_timesteps, (B,), device=device)
+    #     x_noisy = self.diffusion_scheduler.add_noise(x_start, noise, timesteps)
+    #     model_input = x_noisy  # [B, T, 2]
+    #
+    #     hist_norm = self.norm(hist)
+    #     hist_nbrs_norm = self.norm(hist_nbrs)
+    #
+    #     context, hist_enc = self.hist_encoder(hist_norm, hist_nbrs_norm, mask, temporal_mask)  # [B, T, hidden_dim]
+    #     t_emb = self.timestep_embedder(timesteps)
+    #     enc_emb = self.enc_embedding(hist_enc[:, -1, :]) # [B, D]
+    #     y = t_emb + enc_emb
+    #
+    #     input_embedded = self.input_embedding(model_input) + self.pos_embedding(model_input)
+    #     pred_x0 = self.dit(x=input_embedded, y=y, cross=context)
+    #     loss = self.compute_motion_loss(pred_x0, future_norm)
+    #     pred = self.denorm(pred_x0)
+    #
+    #     diff = pred[..., :2] - future[..., :2]
+    #     dist = torch.norm(diff, dim=-1) # [B, T]
+    #
+    #     ade = dist.mean()
+    #     fde = dist[:, -1].mean()
+    #
+    #     # Visualize
+    #     # hist = hist.unsqueeze(2)  # [B, T, 1, D]
+    #     # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
+    #     # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
+    #     # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
+    #     # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
+    #     # hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
+    #     # hist = torch.cat([hist, hist_nbrs], dim=2)  # [B, T, 1+N, D]
+    #     # visualize_batch_trajectories(hist=hist, future=future, pred=pred, batch_idx=0)
+    #
+    #     # hist_v = hist_norm.unsqueeze(2)  # [B, T, 1, D]
+    #     # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
+    #     # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
+    #     # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
+    #     # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs_norm)
+    #     # hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
+    #     # hist_v = torch.cat([hist_v, hist_nbrs], dim=2)  # [B, T, 1+N, D]
+    #     # visualize_batch_trajectories(hist=hist_v, future=future_norm, pred=pred_x0, batch_idx=0)
+    #     return loss, pred, ade, fde
 
     @torch.no_grad()
     def forward_eval(self, hist, hist_nbrs, mask, temporal_mask, future, device):
@@ -155,7 +218,6 @@ class DiffusionFut(nn.Module):
 
         pred = self.denorm(x_t)
         loss = torch.nn.functional.mse_loss(pred, future)
-        # visualize_batch_trajectories(hist=self.norm(hist).unsqueeze(2), future=self.norm(future).unsqueeze(2), pred=x_t.unsqueeze(2))
 
         diff = pred[..., :2] - future[..., :2]
         dist = torch.norm(diff, dim=-1) # [B, T]

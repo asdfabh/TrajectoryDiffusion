@@ -77,7 +77,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim,
         )
 
         loss, pred, ade, fde = model.forward_train(hist, hist_nbrs, mask, temporal_mask, fut, device)
-        _, _, _, _ = model.forward_eval(hist, hist_nbrs, mask, temporal_mask, fut, device)
+        # _, _, _, _ = model.forward_eval(hist, hist_nbrs, mask, temporal_mask, fut, device)
 
         optimizer.zero_grad()
         loss.backward()
