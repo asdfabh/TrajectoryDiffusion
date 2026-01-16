@@ -42,7 +42,8 @@ class DiffusionFut(nn.Module):
         self.timestep_embedder = dit.TimestepEmbedder(self.input_dim, self.time_embedding_size)
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=args.num_train_timesteps,
-            beta_schedule="squaredcos_cap_v2",
+            # beta_schedule="squaredcos_cap_v2",
+            beta_schedule="linear",
             prediction_type="sample",
             clip_sample=False,
         )
@@ -94,11 +95,18 @@ class DiffusionFut(nn.Module):
 
         noise = torch.randn_like(x_start)
 
-        weights = torch.ones(self.num_train_timesteps, device=device)
-        p_force = 0.15
-        cutoff = int(self.num_train_timesteps * (1 - p_force))
-        weights[cutoff:] = 10.0
-        timesteps = torch.multinomial(weights, B, replacement=True)
+        # 幂函数
+        # step_indices = torch.arange(self.num_train_timesteps, device=device, dtype=torch.float32)
+        # weights = (step_indices / self.num_train_timesteps) ** 2 + 0.2
+
+        # 暴力的增加后15%的时间步采样权重
+        # weights = torch.ones(self.num_train_timesteps, device=device)
+        # p_force = 0.15
+        # cutoff = int(self.num_train_timesteps * (1 - p_force))
+        # weights[cutoff:] = 10.0
+
+        # timesteps = torch.multinomial(weights, B, replacement=True)
+        timesteps = torch.randint(0, self.num_train_timesteps, (B,), device=device)
 
         x_noisy = self.diffusion_scheduler.add_noise(x_start, noise, timesteps)
 
