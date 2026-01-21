@@ -46,7 +46,7 @@ def main():
 
     ckpt_dir = Path(args.checkpoint_dir) / 'fut'
     ckpt_path = ckpt_dir / 'checkpoint_best.pth'
-    # ckpt_path = ckpt_dir / 'checkpoint_epoch_5.pth'
+    # ckpt_path = ckpt_dir / 'checkpoint_epoch_50.pth'
 
     if not ckpt_path.exists():
         print(f"Error: Checkpoint not found at {ckpt_path}")

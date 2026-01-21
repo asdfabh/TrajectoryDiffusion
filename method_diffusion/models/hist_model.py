@@ -33,7 +33,7 @@ class DiffusionPast(nn.Module):
         self.timestep_embedder = dit.TimestepEmbedder(self.input_dim, self.time_embedding_size)
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=args.num_train_timesteps,
-            beta_schedule="scaled_linear",
+            beta_schedule="squaredcos_cap_v2",
             prediction_type="sample",
             clip_sample=False,
         )
@@ -115,17 +115,16 @@ class DiffusionPast(nn.Module):
         ade = dist.mean()
         fde = dist[:, -1].mean()
 
-        hist = hist[0, :, :2].detach().cpu().numpy()
-        hist_masked = hist_masked[0, :, :2].detach().cpu().numpy()
-        pred_ego = pred[0, :, :2].detach().cpu().numpy()
-
-        plot_traj_with_mask(
-            hist_original=[hist],
-            hist_masked=[hist_masked],
-            hist_pred=[pred_ego],
-            fig_num1=1,
-            fig_num2=1,
-        )
+        # hist = hist[0, :, :2].detach().cpu().numpy()
+        # hist_masked = hist_masked[0, :, :2].detach().cpu().numpy()
+        # pred_ego = pred[0, :, :2].detach().cpu().numpy()
+        # plot_traj_with_mask(
+        #     hist_original=[hist],
+        #     hist_masked=[hist_masked],
+        #     hist_pred=[pred_ego],
+        #     fig_num1=1,
+        #     fig_num2=1,
+        # )
 
         return loss, pred, ade, fde
 
@@ -154,17 +153,17 @@ class DiffusionPast(nn.Module):
         ade = dist.mean()  # Scalar
         fde = dist[:, -1].mean() # Scalar
 
-        hist = hist[0, :, :2].detach().cpu().numpy()
-        hist_masked = hist_masked[0, :, :2].detach().cpu().numpy()
-        pred_ego = final_pred[0, :, :2].detach().cpu().numpy()
-
-        plot_traj_with_mask(
-            hist_original=[hist],
-            hist_masked=[hist_masked],
-            hist_pred=[pred_ego],
-            fig_num1=1,
-            fig_num2=1,
-        )
+        # hist = hist[0, :, :2].detach().cpu().numpy()
+        # hist_masked = hist_masked[0, :, :2].detach().cpu().numpy()
+        # pred_ego = final_pred[0, :, :2].detach().cpu().numpy()
+        #
+        # plot_traj_with_mask(
+        #     hist_original=[hist],
+        #     hist_masked=[hist_masked],
+        #     hist_pred=[pred_ego],
+        #     fig_num1=1,
+        #     fig_num2=1,
+        # )
 
         return loss, final_pred, ade, fde
 

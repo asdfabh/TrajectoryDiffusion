@@ -103,26 +103,26 @@ def load_checkpoint_if_needed(args, model, optimizer, scheduler, device):
     start_epoch = 0
     best_loss = float('inf')
     ckpt_path = None
-    if args.resume == 'latest':
+    if args.resume_hist == 'latest':
         ckpts = sorted(Path(args.checkpoint_dir).glob('checkpoint_epoch_*.pth'))
         if ckpts:
             ckpt_path = ckpts[-1]
-    elif args.resume == 'best':
+    elif args.resume_hist == 'best':
         best_candidate = Path(args.checkpoint_dir) / 'checkpoint_best.pth'
         if best_candidate.exists():
             ckpt_path = best_candidate
-    elif args.resume.startswith('epoch'):
+    elif args.resume_hist.startswith('epoch'):
         try:
-            epoch_num = int(args.resume.replace('epoch', ''))
+            epoch_num = int(args.resume_hist.replace('epoch', ''))
             ckpt_path = Path(args.checkpoint_dir) / f'checkpoint_epoch_{epoch_num}.pth'
             if not ckpt_path.exists():
                 print(f"Warning: {ckpt_path} not found")
                 ckpt_path = None
         except ValueError:
-            print(f"Invalid epoch format: {args.resume}")
+            print(f"Invalid epoch format: {args.resume_hist}")
             ckpt_path = None
-    elif args.resume not in ('none', ''):
-        ckpt_path = Path(args.resume)
+    elif args.resume_hist not in ('none', ''):
+        ckpt_path = Path(args.resume_hist)
 
     if ckpt_path and ckpt_path.exists():
         state = torch.load(ckpt_path, map_location=device)

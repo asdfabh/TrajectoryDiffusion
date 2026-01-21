@@ -44,9 +44,10 @@ def get_args_parser():
     parser.add_argument('--num_epochs', type=int, default=50)
     parser.add_argument('--num_workers', type=int, default=10)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
-    parser.add_argument('--save_interval', type=int, default=1)
+    parser.add_argument('--save_interval', type=int, default=5)
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints') #/home/lq/MaDiff/method_diffusion/checkpoints
-    parser.add_argument('--resume', default='none', type=str, help="none/latest/best/或直接给定checkpoint路径")
+    parser.add_argument('--resume_fut', default='none', type=str, help="none/latest/best/或直接给定checkpoint路径")
+    parser.add_argument('--resume_hist', default='best', type=str, help="none/latest/best/或直接给定checkpoint路径")
     parser.add_argument('--mask_prob', type=float, default=0.4, help="历史轨迹随机掩码概率")
     parser.add_argument('--data_root', type=str, default='/mnt/datasets/ngsimdata', help="数据集根目录")
     parser.add_argument('--num_inference_steps', type=int, default=10, help="DDIM推理步数")
