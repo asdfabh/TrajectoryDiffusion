@@ -128,6 +128,7 @@ class DiffusionPast(nn.Module):
 
         return loss, pred, ade, fde
 
+    @torch.no_grad()
     def forward_eval(self, hist, hist_masked, device):
         B, T, _ = hist_masked.shape
 

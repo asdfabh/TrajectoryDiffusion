@@ -16,7 +16,6 @@ from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.config import get_args_parser
 from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.utils.mask_util import random_mask, continuous_mask
-from method_diffusion.utils.visualization import plot_traj_with_mask
 
 import sys
 import os
@@ -135,22 +134,22 @@ def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, rank):
     best_loss = float('inf')
     ckpt_path = None
 
-    if args.resume == 'latest':
+    if args.resume_hist == 'latest':
         ckpts = sorted(Path(args.checkpoint_dir).glob('checkpoint_epoch_*.pth'))
         if ckpts:
             ckpt_path = ckpts[-1]
-    elif args.resume == 'best':
+    elif args.resume_hist == 'best':
         best_candidate = Path(args.checkpoint_dir) / 'checkpoint_best.pth'
         if best_candidate.exists():
             ckpt_path = best_candidate
-    elif args.resume.startswith('epoch'):
+    elif args.resume_hist.startswith('epoch'):
         try:
-            epoch_num = int(args.resume.replace('epoch', ''))
+            epoch_num = int(args.resume_hist.replace('epoch', ''))
             ckpt_path = Path(args.checkpoint_dir) / f'checkpoint_epoch_{epoch_num}.pth'
         except ValueError:
             pass
-    elif args.resume not in ('none', ''):
-        ckpt_path = Path(args.resume)
+    elif args.resume_hist not in ('none', ''):
+        ckpt_path = Path(args.resume_hist)
 
     if ckpt_path and ckpt_path.exists():
         state = torch.load(ckpt_path, map_location=device)

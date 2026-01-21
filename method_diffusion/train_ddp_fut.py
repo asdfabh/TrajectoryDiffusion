@@ -11,11 +11,9 @@ from tqdm import tqdm
 import builtins
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.config import get_args_parser
-from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.utils.mask_util import random_mask, continuous_mask
-from method_diffusion.utils.visualization import plot_traj_with_mask
 from method_diffusion.models.fut_model import DiffusionFut
-import numpy as np
+
 
 def setup_ddp():
     """初始化分布式训练环境"""

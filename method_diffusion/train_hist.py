@@ -8,11 +8,9 @@ from pathlib import Path
 from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.config import get_args_parser
-from method_diffusion.utils.visualization import plot_traj_with_mask, plot_traj
 from method_diffusion.utils.mask_util import random_mask, continuous_mask
-import numpy as np
 from tqdm import tqdm
-from einops import repeat
+
 
 def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, device='cuda'):
     # type is torch
