@@ -14,6 +14,7 @@ from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.config import get_args_parser
 from method_diffusion.utils.mask_util import random_mask, continuous_mask
+from method_diffusion.utils.visualization import visualize_batch_trajectories
 
 def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, device='cuda'):
     """数据准备函数，与训练代码保持一致"""
@@ -254,18 +255,30 @@ def run_evaluation(args, device):
 
         for batch_idx, batch in pbar:
             hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask = prepare_input_data(
-                batch, args.feature_dim, mask_type='random', mask_prob=0.0, device=device
+                batch, args.feature_dim, mask_type='random', mask_prob=0.5, device=device
             )
 
             current_hist_input = hist
-
+            pred_hist_traj = None
             if model_hist is not None:
                 _, pred_hist, _, _ = model_hist.forward_eval(hist, hist_masked, device)
                 calc_hist.update(pred_hist[..., :2], hist[..., :2])
+
                 current_hist_input = pred_hist
+                pred_hist_traj = pred_hist  # 保存下来用于可视化
 
             _, pred_fut, _, _ = model_fut.forward_eval(current_hist_input, hist_nbrs, mask, temporal_mask, fut, device)
             calc_fut.update(pred_fut, fut)
+
+            # hist_ego_raw = hist.unsqueeze(2)  # [B, T, 1, D]
+            # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
+            # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist_ego_raw.size(1), -1)
+            # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
+            # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
+            # hist_nbrs_aligned = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
+            # full_gt_hist = torch.cat([hist_ego_raw, hist_nbrs_aligned], dim=2)  # [B, T, 1+N, D]
+            #
+            # visualize_batch_trajectories( hist=pred_hist_traj, hist_nbrs=full_gt_hist, future=fut, pred=pred_fut, hist_masked=hist_mask, batch_idx=0)
 
     if args.eval_mode == 'joint' and calc_hist:
         hist_metrics = calc_hist.get_summary()

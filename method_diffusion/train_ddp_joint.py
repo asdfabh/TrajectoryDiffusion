@@ -197,14 +197,6 @@ def main():
 
     args = get_args_parser().parse_args()
 
-    # base_ckpt_dir = Path(args.checkpoint_dir)
-    # hist_ckpt_dir = base_ckpt_dir / 'hist'
-    # fut_ckpt_dir = base_ckpt_dir / 'fut'
-    #
-    # if rank == 0:
-    #     hist_ckpt_dir.mkdir(parents=True, exist_ok=True)
-    #     fut_ckpt_dir.mkdir(parents=True, exist_ok=True)
-
     current_script_dir = Path(__file__).resolve().parent
     dir_name = Path(args.checkpoint_dir).name
     base_ckpt_dir = current_script_dir / dir_name

@@ -38,10 +38,10 @@ class DiffusionPast(nn.Module):
             clip_sample=False,
         )
 
-        self.dit_block = dit.DiTBlock(self.input_dim, self.heads, self.dropout, self.mlp_ratio)
+        dit_block = dit.DiTBlock(self.input_dim, self.heads, self.dropout, self.mlp_ratio)
         self.final_layer = dit.FinalLayer(self.hidden_dim, self.T, self.output_dim)
         self.dit = dit.DiT(
-            dit_block=self.dit_block,
+            dit_block=dit_block,
             final_layer=self.final_layer,
             time_embedder=self.timestep_embedder,
             depth=self.depth,

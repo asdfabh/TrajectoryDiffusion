@@ -160,14 +160,14 @@ class DiffusionFut(nn.Module):
         ade = dist.mean()
         fde = dist[:, -1].mean()
 
-        # hist = hist.unsqueeze(2)  # [B, T, 1, D]
+        # hist_ego_raw = hist.unsqueeze(2)  # [B, T, 1, D]
         # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
-        # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
+        # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist_ego_raw.size(1), -1)
         # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
         # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
-        # hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
-        # hist = torch.cat([hist, hist_nbrs], dim=2)  # [B, T, 1+N, D]
-        # visualize_batch_trajectories(hist=hist, future=future, pred=pred, batch_idx=0)
+        # hist_nbrs_aligned = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
+        # full_gt_hist = torch.cat([hist_ego_raw, hist_nbrs_aligned], dim=2)  # [B, T, 1+N, D]
+        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=pred, batch_idx=0)
 
         return loss, pred, ade, fde
 
@@ -224,14 +224,14 @@ class DiffusionFut(nn.Module):
         ade = dist.mean()
         fde = dist[:, -1].mean()
 
-        # hist = hist.unsqueeze(2)  # [B, T, 1, D]
+        # hist_ego_raw = hist.unsqueeze(2)  # [B, T, 1, D]
         # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
-        # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
+        # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist_ego_raw.size(1), -1)
         # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
         # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
-        # hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
-        # hist = torch.cat([hist, hist_nbrs], dim=2)  # [B, T, 1+N, D]
-        # visualize_batch_trajectories(hist=hist, future=future, pred=pred, batch_idx=0)
+        # hist_nbrs_aligned = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
+        # full_gt_hist = torch.cat([hist_ego_raw, hist_nbrs_aligned], dim=2)  # [B, T, 1+N, D]
+        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=pred, batch_idx=0)
 
         return loss, pred, ade, fde
 
