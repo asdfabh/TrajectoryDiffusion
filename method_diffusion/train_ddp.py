@@ -87,10 +87,6 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
     return hist, hist_masked, hist_mask
 
 
-# -----------------------------------------------------------------------------
-# Training Loop
-# -----------------------------------------------------------------------------
-
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, mask_type='random', mask_prob=0.4):
     model.train()
     total_loss = 0.0
@@ -103,8 +99,10 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, 
         pbar = enumerate(dataloader)
 
     for batch_idx, batch in pbar:
+        # 动态选择掩码类型：0.3 概率使用 block，0.7 概率使用 random
+        mask_type_batch = 'block' if torch.rand(1).item() < 0.3 else 'random'
         hist, hist_masked, hist_mask = prepare_input_data(
-            batch, feature_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
+            batch, feature_dim, mask_type=mask_type_batch, mask_prob=mask_prob, device=device
         )
 
         loss, pred, ade, fde = model(hist, hist_masked, device)

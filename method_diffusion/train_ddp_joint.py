@@ -279,7 +279,7 @@ def main():
                     hist_state = model_hist.module.state_dict() if isinstance(model_hist,
                                                                               DDP) else model_hist.state_dict()
                     torch.save({'model_state_dict': hist_state},
-                               hist_ckpt_dir / f"joint_checkpoint_epoch_{epoch + 1}.pth")
+                               hist_ckpt_dir / f"checkpoint_epoch_{epoch + 1}.pth")
 
             if avg_loss < best_loss:
                 best_loss = avg_loss

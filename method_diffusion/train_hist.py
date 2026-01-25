@@ -57,8 +57,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, mask_t
                 desc=f"Epoch {epoch}", ncols=150)
 
     for batch_idx, batch in pbar:
+        mask_type_batch = 'block' if torch.rand(1).item() < 0.3 else 'random'
         hist, hist_masked, hist_mask = prepare_input_data(
-            batch, feature_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
+            batch, feature_dim, mask_type=mask_type_batch, mask_prob=mask_prob, device=device
         )
 
         # 前向传播，输入为掩码后的轨迹 hist [B, T, dim]
