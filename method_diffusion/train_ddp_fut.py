@@ -139,22 +139,22 @@ def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, rank):
     best_loss = float('inf')
     ckpt_path = None
 
-    if args.resume == 'latest':
+    if args.resume_fut == 'latest':
         ckpts = sorted(Path(args.checkpoint_dir).glob('checkpoint_epoch_*.pth'))
         if ckpts:
             ckpt_path = ckpts[-1]
-    elif args.resume == 'best':
+    elif args.resume_fut == 'best':
         best_candidate = Path(args.checkpoint_dir) / 'checkpoint_best.pth'
         if best_candidate.exists():
             ckpt_path = best_candidate
-    elif args.resume.startswith('epoch'):
+    elif args.resume_fut.startswith('epoch'):
         try:
-            epoch_num = int(args.resume.replace('epoch', ''))
+            epoch_num = int(args.resume_fut.replace('epoch', ''))
             ckpt_path = Path(args.checkpoint_dir) / f'checkpoint_epoch_{epoch_num}.pth'
         except ValueError:
             pass
-    elif args.resume not in ('none', ''):
-        ckpt_path = Path(args.resume)
+    elif args.resume_fut not in ('none', ''):
+        ckpt_path = Path(args.resume_fut)
 
     if ckpt_path and ckpt_path.exists():
         state = torch.load(ckpt_path, map_location=device)

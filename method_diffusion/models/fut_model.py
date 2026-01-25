@@ -4,9 +4,25 @@ from diffusers.schedulers import DDIMScheduler
 import numpy as np
 import torch
 from method_diffusion.models.hist_encoder import HistEncoder
-from method_diffusion.utils.position_encoding import SequentialPositionalEncoding
+import torch.nn.functional as F
 from pathlib import Path
 from method_diffusion.utils.visualization import visualize_batch_trajectories, plot_traj_with_mask, plot_traj
+import math
+
+def gen_sineembed_for_position(pos_tensor, hidden_dim=128):
+    # Mostly copy-paste from https://github.com/IDEA-opensource/DAB-DETR/
+    half_hidden_dim = hidden_dim // 2
+    scale = 2 * math.pi
+    dim_t = torch.arange(half_hidden_dim, dtype=torch.float32, device=pos_tensor.device)
+    dim_t = 10000 ** (2 * (dim_t // 2) / half_hidden_dim)
+    x_embed = pos_tensor[..., 0] * scale
+    y_embed = pos_tensor[..., 1] * scale
+    pos_x = x_embed[..., None] / dim_t
+    pos_y = y_embed[..., None] / dim_t
+    pos_x = torch.stack((pos_x[..., 0::2].sin(), pos_x[..., 1::2].cos()), dim=-1).flatten(-2)
+    pos_y = torch.stack((pos_y[..., 0::2].sin(), pos_y[..., 1::2].cos()), dim=-1).flatten(-2)
+    pos = torch.cat((pos_y, pos_x), dim=-1)
+    return pos
 
 class DiffusionFut(nn.Module):
 
@@ -25,17 +41,19 @@ class DiffusionFut(nn.Module):
         self.num_train_timesteps = args.num_train_timesteps_fut
         self.time_embedding_size = args.time_embedding_size_fut
         self.num_inference_steps = args.num_inference_steps
+        self.num_modes = args.num_modes  # 聚类数
         self.T = int(args.T_f)
 
         # 输入嵌入层和位置编码，相加得到Dit的输入
-        self.input_embedding = nn.Linear(self.feature_dim, self.input_dim)
-        self.pos_embedding = SequentialPositionalEncoding(self.input_dim)
+        self.query_encoder = nn.Sequential(nn.Linear(self.input_dim, self.input_dim), nn.SiLU(),
+            nn.Linear(self.input_dim, self.input_dim), nn.LayerNorm(self.input_dim))
+        self.timestep_embedder = dit.TimestepEmbedder(self.input_dim, self.time_embedding_size)
+
         self.hist_encoder = HistEncoder(args)
         self.enc_embedding = nn.Linear(self.args.encoder_input_dim, self.input_dim)
         nn.init.xavier_uniform_(self.enc_embedding.weight)
         nn.init.constant_(self.enc_embedding.bias, 0)
 
-        self.timestep_embedder = dit.TimestepEmbedder(self.input_dim, self.time_embedding_size)
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=args.num_train_timesteps,
             beta_schedule="squaredcos_cap_v2",
@@ -52,132 +70,162 @@ class DiffusionFut(nn.Module):
             model_type="x_start"
         )
 
+        self.cls_head = nn.Sequential(
+            nn.Linear(self.input_dim, self.input_dim),
+            nn.SiLU(),
+            nn.Linear(self.input_dim, self.num_modes)
+        )
+
+        self.anchor_path = './method_diffusion/dataset/anchors_ngsim.npy'  # 确保路径正确
+        if Path(self.anchor_path).exists():
+            anchors = np.load(self.anchor_path)  # [K, T, 2]
+            self.register_buffer('anchors', torch.from_numpy(anchors).float())
+        else:
+            print(f"Warning: Anchor file not found at {self.anchor_path}, using zeros.")
+            self.register_buffer('anchors', torch.zeros(self.num_modes, self.T, 2))
+
         self.register_buffer('pos_mean', torch.tensor([0.0, 0.0]).float(), persistent=False)
-        self.register_buffer('pos_std', torch.tensor([10, 150]).float(), persistent=False)
+        self.register_buffer('pos_std', torch.tensor([30, 200]).float(), persistent=False)
         self.register_buffer('va_mean', torch.tensor([20, 0.01]).float(), persistent=False)
-        self.register_buffer('va_std', torch.tensor([15, 5]).float(), persistent=False)
+        self.register_buffer('va_std', torch.tensor([20, 8]).float(), persistent=False)
 
-    def compute_motion_loss(self, pred, target):
+
+    def get_closest_anchor(self, future):
         """
-        pred: [B, T, D]
-        target: [B, T, D]
+        计算 GT 与所有 Anchor 的距离，返回最近 Anchor 的索引
+        future: [B, T, 2]
+        anchors: [K, T, 2]
+        return: [B] (indices)
         """
-        # loss_l1_x = torch.abs(pred[..., 0] - target[..., 0]).mean()
-        # loss_l1_y = torch.abs(pred[..., 1] - target[..., 1]).mean()
-        # loss_l1 = 1.2 * loss_l1_x + loss_l1_y # L1 Loss
+        # [B, 1, T, 2] - [1, K, T, 2] -> [B, K, T, 2]
+        # 使用 denorm 后的距离或者 norm 后的距离都可以，这里用 norm 后的
+        future_norm = self.norm(future)[..., :2]
+        anchors_norm = self.norm(self.anchors)[..., :2]
 
-        loss_l1 = torch.abs(pred[..., :2] - target[..., :2]).mean()
+        diff = future_norm.unsqueeze(1) - anchors_norm.unsqueeze(0)
+        dist = torch.norm(diff, dim=-1).mean(dim=-1)  # [B, K]
+        min_dist, min_idx = torch.min(dist, dim=1)  # [B]
+        return min_idx
 
-        pred_pos = pred[..., :2]
-        target_pos = target[..., :2]
+    def compute_loss(self, pred_x0, target_norm, cls_logits, target_mode_idx):
+        """
+        pred_x0: [B, T, 2] 预测的轨迹
+        target_norm: [B, T, 2] GT
+        cls_logits: [B, K] 分类 logits
+        target_mode_idx: [B] GT 对应的最近 anchor 索引
+        """
+        # Regression Loss (只计算 Best Anchor 对应的 loss，这里 pred_x0 已经是对应 Best Anchor 的预测了)
+        reg_loss = F.l1_loss(pred_x0, target_norm)  # 或者 MSE
+        # Classification Loss
+        cls_loss = F.cross_entropy(cls_logits, target_mode_idx)
 
-        pred_vel = pred_pos[:, 1:, :] - pred_pos[:, :-1, :]
-        target_vel = target_pos[:, 1:, :] - target_pos[:, :-1, :]
-        loss_vel = torch.abs(pred_vel - target_vel).mean() # L1 Loss
+        total_loss = reg_loss + 0.5 * cls_loss
+        return total_loss, reg_loss, cls_loss
 
-        pred_acc = pred_vel[:, 1:, :] - pred_vel[:, :-1, :]
-        target_acc = target_vel[:, 1:, :] - target_vel[:, :-1, :]
-        loss_acc = torch.abs(pred_acc - target_acc).mean()
-
-        total_loss = 1.2 * loss_l1 + 0.5 * loss_vel + 0.15 * loss_acc
-        return total_loss
-
-    # hist: [B, T, dim], hist_masked: [B, T, dim+1]
     def forward_train(self, hist, hist_nbrs, mask, temporal_mask, future, device):
-        B, T, dim = future.shape
-        future_norm = self.norm(future)  # [B, T, 2]
-        x_start = future_norm
-        noise = torch.randn_like(x_start)
-        timesteps = torch.randint(0, self.num_train_timesteps, (B,), device=device)
-        x_noisy = self.diffusion_scheduler.add_noise(x_start, noise, timesteps)
-        model_input = x_noisy  # [B, T, 2]
+        B, T, _ = future.shape
 
         hist_norm = self.norm(hist)
         hist_nbrs_norm = self.norm(hist_nbrs)
+        context, hist_enc = self.hist_encoder(hist_norm, hist_nbrs_norm, mask, temporal_mask)
+        global_context = hist_enc[:, -1, :]  # [B, D]
+        enc_emb = self.enc_embedding(global_context)  # [B, D]
 
-        context, hist_enc = self.hist_encoder(hist_norm, hist_nbrs_norm, mask, temporal_mask)  # [B, T, hidden_dim]
+        target_mode_idx = self.get_closest_anchor(future)  # [B]
+        cls_logits = self.cls_head(enc_emb)  # [B, K]
+
+        # 截断扩散 (Truncated Diffusion): 只在 0 - 50 步之间训练
+        max_train_step = 50
+        timesteps = torch.randint(0, max_train_step, (B,), device=device).long()
+        target_norm = self.norm(future)[..., :2]
+
+        # 加噪: Standard Diffusion 是在 GT 上加噪
+        noise = torch.randn_like(target_norm)
+        x_noisy = self.diffusion_scheduler.add_noise(target_norm, noise, timesteps)
+
+        x_sine = gen_sineembed_for_position(x_noisy, hidden_dim=self.input_dim)
+        x_input = self.query_encoder(x_sine)  # [B, T, input_dim]
         t_emb = self.timestep_embedder(timesteps)
-        enc_emb = self.enc_embedding(hist_enc[:, -1, :])  # [B, D]
         y = t_emb + enc_emb
 
-        input_embedded = self.input_embedding(model_input) + self.pos_embedding(model_input)
-        pred_x0 = self.dit(x=input_embedded, y=y, cross=context)
-        loss = self.compute_motion_loss(pred_x0, future_norm)
+        pred_x0 = self.dit(x=x_input, y=y, cross=context)
+        loss, reg_loss, cls_loss = self.compute_loss(pred_x0, target_norm, cls_logits, target_mode_idx)
+
+        # For logging
         pred = self.denorm(pred_x0)
-
         diff = pred[..., :2] - future[..., :2]
-        dist = torch.norm(diff, dim=-1)  # [B, T]
+        ade = torch.norm(diff, dim=-1).mean()
+        fde = torch.norm(diff, dim=-1)[:, -1].mean()
 
-        ade = dist.mean()
-        fde = dist[:, -1].mean()
-
-        # hist = hist.unsqueeze(2)  # [B, T, 1, D]
-        # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
-        # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
-        # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
-        # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
-        # hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
-        # hist = torch.cat([hist, hist_nbrs], dim=2)  # [B, T, 1+N, D]
-        # visualize_batch_trajectories(hist=hist, future=future, pred=pred, batch_idx=0)
-
-        # hist_v = hist_norm.unsqueeze(2)  # [B, T, 1, D]
-        # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
-        # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
-        # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
-        # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs_norm)
-        # hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
-        # hist_v = torch.cat([hist_v, hist_nbrs], dim=2)  # [B, T, 1+N, D]
-        # visualize_batch_trajectories(hist=hist_v, future=future_norm, pred=pred_x0, batch_idx=0)
         return loss, pred, ade, fde
 
     @torch.no_grad()
     def forward_eval(self, hist, hist_nbrs, mask, temporal_mask, future, device):
-        B, T, dim = future.shape
-        x_start = torch.randn((B, T, dim), device=device)
-        x_t = x_start
+        B, T, _ = future.shape
+        K = self.num_modes
+
         hist_norm = self.norm(hist)
         hist_nbrs_norm = self.norm(hist_nbrs)
-        context, hist_enc = self.hist_encoder(hist_norm, hist_nbrs_norm, mask, temporal_mask)  # [B, T, hidden_dim]
-        enc_emb = self.enc_embedding(hist_enc[:, -1, :]) # [B, D]
+        context, hist_enc = self.hist_encoder(hist_norm, hist_nbrs_norm, mask, temporal_mask)
+        global_context = hist_enc[:, -1, :]
+        enc_emb = self.enc_embedding(global_context)  # [B, D]
 
-        self.diffusion_scheduler.set_timesteps(self.num_inference_steps)
+        cls_logits = self.cls_head(enc_emb)
+        cls_probs = F.softmax(cls_logits, dim=-1)  # [B, K]
 
-        for t in self.diffusion_scheduler.timesteps:
-            timesteps = torch.full((B,), t, device=device, dtype=torch.long)
+        # Context Expand: [B, T, D] -> [B*K, T, D], 并行生成 K 条轨迹
+        context_expanded = context.repeat_interleave(K, dim=0)
+        enc_emb_expanded = enc_emb.repeat_interleave(K, dim=0)
+
+        # Anchors: [K, T, 2] -> [B, K, T, 2] -> [B*K, T, 2]
+        batch_anchors = self.anchors.unsqueeze(0).repeat(B, 1, 1, 1)
+        batch_anchors_norm = self.norm(batch_anchors)[..., :2]
+        x_t = batch_anchors_norm.view(B * K, T, 2)
+
+        start_step = 20  # 例如从第 20 步开始 (总共1000)
+        noise = torch.randn_like(x_t)
+
+        # 给 Anchor 加噪，作为起始点
+        x_t = self.diffusion_scheduler.add_noise(
+            x_t, noise,
+            torch.full((B * K,), start_step, device=device, dtype=torch.long)
+        )
+
+        inference_timesteps = [20, 10, 0]
+
+        for t_val in inference_timesteps:
+            timesteps = torch.full((B * K,), t_val, device=device, dtype=torch.long)
             t_emb = self.timestep_embedder(timesteps)
-            y = t_emb + enc_emb
-            input_embedded = self.input_embedding(x_t) + self.pos_embedding(x_t)
-            pred_x0_norm = self.dit(x=input_embedded, y=y, cross=context)
-            x_t = self.diffusion_scheduler.step(pred_x0_norm, t, x_t).prev_sample
+            y = t_emb + enc_emb_expanded
 
-        pred = self.denorm(x_t)
-        loss = torch.nn.functional.mse_loss(pred, future)
+            x_sine = gen_sineembed_for_position(x_t, hidden_dim=self.input_dim)
+            x_input = self.query_encoder(x_sine)
+            pred_x0 = self.dit(x=x_input, y=y, cross=context_expanded)
 
-        diff = pred[..., :2] - future[..., :2]
-        dist = torch.norm(diff, dim=-1) # [B, T]
+            if t_val > 0:
+                output = self.diffusion_scheduler.step(pred_x0, t_val, x_t)
+                x_t = output.prev_sample
+            else:
+                x_t = pred_x0  # 最后一步直接取预测结果
 
-        ade = dist.mean()
-        fde = dist[:, -1].mean()
+        pred_trajs = self.denorm(x_t).view(B, K, T, 2)  # [B, K, T, 2]
 
-        # visualize
-        # hist = hist.unsqueeze(2)  # [B, T, 1, D]
-        # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
-        # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
-        # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
-        # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
-        # hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
-        # hist = torch.cat([hist, hist_nbrs], dim=2)  # [B, T, 1+N, D]
-        # visualize_batch_trajectories(hist=hist, future=future, pred=pred, batch_idx=0)
-        #
-        # hist_v = hist_norm.unsqueeze(2)  # [B, T, 1, D]
-        # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
-        # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
-        # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
-        # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs_norm)
-        # hist_nbrs = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
-        # hist_v = torch.cat([hist_v, hist_nbrs], dim=2)  # [B, T, 1+N, D]
-        # visualize_batch_trajectories(hist=hist_v, future=self.norm(future), pred=x_t, batch_idx=0)
-        return loss, pred, ade, fde
+        gt = future[..., :2].unsqueeze(1)  # [B, 1, T, 2]
+        diff = pred_trajs - gt
+        dist = torch.norm(diff, dim=-1)  # [B, K, T]
+
+        ade_per_mode = dist.mean(dim=-1)  # [B, K]
+        fde_per_mode = dist[..., -1]  # [B, K]
+
+        min_ade = ade_per_mode.min(dim=1)[0].mean()
+        min_fde = fde_per_mode.min(dim=1)[0].mean()
+
+        # 也可以返回基于分类置信度最高的轨迹作为单模态输出
+        # best_mode_idx = cls_probs.argmax(dim=-1)  # [B]
+
+        loss = torch.tensor(0.0)  # Eval 阶段 loss 仅供参考
+
+        return loss, pred_trajs, min_ade, min_fde
 
     def forward(self, hist, hist_nbrs, mask, temporal_mask, future, device):
         """Standard forward method for DDP compatibility"""

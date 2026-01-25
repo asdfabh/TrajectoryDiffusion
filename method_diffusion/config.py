@@ -54,5 +54,6 @@ def get_args_parser():
     parser.add_argument('--num_samples', type=int, default=5, help="evaluate_test 随机抽样的样本数量")
     parser.add_argument('--sample_ids', type=str, default='', help="逗号分隔的样本索引列表，设置后覆盖 num_samples")
     parser.add_argument('--sample_seed', type=int, default=None, help="随机抽样时使用的随机种子")
+    parser.add_argument('--num_modes', type=int, default=6, help="anchord数量")
 
     return parser

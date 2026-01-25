@@ -41,37 +41,44 @@ class TimestepEmbedder(nn.Module):
 
 
 class DiTBlock(nn.Module):
+    """
+    标准 Transformer Decoder 结构
+    Structure: Self-Attn -> Cross-Attn -> FFN
+    All modulated by adaLN (Time)
+    """
 
     def __init__(self, dim=128, heads=4, dropout=0.1, mlp_ratio=4.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
+
         self.norm2 = nn.LayerNorm(dim)
+        self.cross_attn = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
+
+        self.norm3 = nn.LayerNorm(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp1 = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(dim, 6 * dim, bias=True)
+            nn.Linear(dim, 9 * dim, bias=True)
         )
-        self.norm3 = nn.LayerNorm(dim)
-        self.cross_attn = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
-        self.norm4 = nn.LayerNorm(dim)
-
-        self.mlp2 = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
 
     def forward(self, x, y, cross, attn_mask=None):
+        shift_msa, scale_msa, gate_msa, shift_cross, scale_cross, gate_cross, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(9, dim=1)
 
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(6, dim=1)
-
+        # Self Attention
         modulated_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulated_x, modulated_x, modulated_x, key_padding_mask=attn_mask)[0]
 
-        modulated_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = x + gate_mlp.unsqueeze(1) * self.mlp1(modulated_x)
+        # Cross Attention
+        modulated_x = modulate(self.norm2(x), shift_cross, scale_cross)
+        x = x + gate_cross.unsqueeze(1) * self.cross_attn(modulated_x, cross, cross)[0]
 
-        x = x + self.cross_attn(self.norm3(x), cross, cross)[0]
-        x = x + self.mlp2(self.norm4(x))
+        # FFN
+        modulated_x = modulate(self.norm3(x), shift_mlp, scale_mlp)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulated_x)
 
         return x
 
