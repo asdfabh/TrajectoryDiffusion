@@ -12,7 +12,7 @@ def get_args_parser():
     parser.add_argument('--depth', default='2', type=int, help="Transformer层数")
     parser.add_argument('--dropout', default='0.1', type=float, help="")
     parser.add_argument('--mlp_ratio', default='4', type=int, help="")
-    parser.add_argument('--num_train_timesteps', default='500', type=int, help="")
+    parser.add_argument('--num_train_timesteps', default='1000', type=int, help="")
     parser.add_argument('--time_embedding_size', type=int, default=256)
     parser.add_argument('--T', type=int, default=16)
     parser.add_argument('--feature_dim_fut', default='2', type=int, help="单个轨迹特征维度，例如x,y,v,a")
@@ -25,7 +25,7 @@ def get_args_parser():
     parser.add_argument('--depth_fut', default='3', type=int, help="Transformer层数")
     parser.add_argument('--dropout_fut', default='0.1', type=float, help="前馈网络扩展倍数(即hidden_dim乘以该倍率)")
     parser.add_argument('--mlp_ratio_fut', default='4', type=int, help="前馈网络扩展倍数(即hidden_dim乘以该倍率)")
-    parser.add_argument('--num_train_timesteps_fut', default=500, type=int, help="前馈网络扩展倍数(即hidden_dim乘以该倍率)")
+    parser.add_argument('--num_train_timesteps_fut', default=1000, type=int, help="前馈网络扩展倍数(即hidden_dim乘以该倍率)")
     parser.add_argument('--time_embedding_size_fut', type=int, default=256)
     parser.add_argument('--T_f', type=int, default=25)
 
@@ -40,7 +40,7 @@ def get_args_parser():
     parser.add_argument('--network', default='highwaynet', type=str, help="Activation function in the transformer encoder: relu or None")
 
     # 训练参数
-    parser.add_argument('--batch_size', type=int, default=1024)
+    parser.add_argument('--batch_size', type=int, default=512)
     parser.add_argument('--num_epochs', type=int, default=50)
     parser.add_argument('--num_workers', type=int, default=10)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
@@ -54,6 +54,6 @@ def get_args_parser():
     parser.add_argument('--num_samples', type=int, default=5, help="evaluate_test 随机抽样的样本数量")
     parser.add_argument('--sample_ids', type=str, default='', help="逗号分隔的样本索引列表，设置后覆盖 num_samples")
     parser.add_argument('--sample_seed', type=int, default=None, help="随机抽样时使用的随机种子")
-    parser.add_argument('--num_modes', type=int, default=6, help="anchord数量")
+    parser.add_argument('--num_modes', type=int, default=9, help="anchord数量")
 
     return parser

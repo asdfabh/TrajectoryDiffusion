@@ -218,12 +218,12 @@ def plot_traj_with_mask(hist_original, hist_masked, hist_pred, nbrs_original=Non
 def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, pred=None, hist_masked=None, batch_idx=0,
                                  save_path=None):
     """
-    可视化函数：
+    可视化函数 (支持多模态预测):
     - hist (Blue): Hist Model 输出的 Ego 重构轨迹
     - hist_nbrs (Yellow): 真实的完整历史 (Ego + Neighbors)
     - hist_masked (Red X): 在真实的 Ego 历史(hist_nbrs[0])上标记被掩码的点
     - future (Green): 真实未来轨迹
-    - pred (Blue/Cyan): 预测未来轨迹
+    - pred (Cyan): 预测未来轨迹 (支持多条)
     """
 
     # --- 数据提取辅助函数 ---
@@ -234,51 +234,41 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, pred=No
         return tensor[b_idx]
 
     # 1. 提取数据
-    recon_hist = get_val(hist, batch_idx)  # [T, D] (Hist Model Output)
-    gt_context_hist = get_val(hist_nbrs, batch_idx)  # [T, N, D] (GT: Ego + Nbrs)
+    # 注意：如果 pred 是 [B, K, T, 2]，get_val 后变成 [K, T, 2]
+    recon_hist = get_val(hist, batch_idx)  # [T, D]
+    gt_context_hist = get_val(hist_nbrs, batch_idx)  # [T, N, D]
     gt_fut = get_val(future, batch_idx)  # [T_f, D]
-    pred_fut = get_val(pred, batch_idx)  # [T_f, D]
+    pred_fut = get_val(pred, batch_idx)  # [K, T_f, D] or [T_f, D]
     mask_arr = get_val(hist_masked, batch_idx)  # [T, ...]
 
     fig, ax = plt.subplots(figsize=(10, 10))
 
     # --- A. 绘制 Hist Nbrs (所有真实历史，包括 Ego) - 黄色 ---
-    # 这是背景信息
     gt_ego_traj = None
     if gt_context_hist is not None:
-        # 确保形状是 [T, N, D]
         if gt_context_hist.ndim == 2:
             gt_context_hist = gt_context_hist[:, None, :]  # [T, 1, D]
 
         num_agents = gt_context_hist.shape[1]
-
-        # 记录 GT Ego 以便后续画 Mask
-        gt_ego_traj = gt_context_hist[:, 0, :]
+        gt_ego_traj = gt_context_hist[:, 0, :]  # 记录 Ego 用于后续连线
 
         for i in range(num_agents):
             traj = gt_context_hist[:, i, :]
-            # 过滤无效轨迹
             if np.sum(np.abs(traj)) > 1e-2:
-                # 统一用黄色/橙色表示真实历史背景
                 label = 'GT Hist (Context)' if i == 0 else None
                 ax.plot(traj[:, 1], traj[:, 0], color='orange', alpha=0.6, linewidth=1.5, marker='.', markersize=2,
                         label=label)
 
     # --- B. 绘制 Mask 标记 (红色 X) ---
-    # 逻辑：对 hist_nbrs 的第 0 个 (GT Ego) 进行掩码对比
     if mask_arr is not None and gt_ego_traj is not None:
-        # 处理 Mask 维度
         if mask_arr.ndim > 1 and mask_arr.shape[-1] > 1:
-            m = mask_arr[..., -1]  # 取最后一维作为 mask 标记
+            m = mask_arr[..., -1]
         else:
             m = mask_arr.squeeze()
 
-        # 截取长度对齐
         L = min(len(m), len(gt_ego_traj))
         m = m[:L]
         traj_to_mark = gt_ego_traj[:L]
-
-        # 找出被掩码的点 (假设值 < 0.5 为被 Mask)
         masked_indices = np.where(m < 0.5)[0]
 
         if len(masked_indices) > 0:
@@ -296,34 +286,51 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, pred=No
         if gt_fut.ndim == 3: gt_fut = gt_fut.squeeze(1)
         ax.plot(gt_fut[:, 1], gt_fut[:, 0], 'g-*', label='GT Future', markersize=4, linewidth=2)
 
-        # 画一条连接线 (从 GT Hist 终点到 GT Fut 起点)
+        # 连线
         if gt_ego_traj is not None:
             ax.plot([gt_ego_traj[-1, 1], gt_fut[0, 1]], [gt_ego_traj[-1, 0], gt_fut[0, 0]], 'g--', alpha=0.5)
 
-    # --- E. 绘制 Pred (预测未来) - 蓝色/青色 ---
+    # --- E. 绘制 Pred (预测未来) - 深天蓝 ---
+    # 修改部分：支持多模态 [T, K, 2]
     if pred_fut is not None:
-        if pred_fut.ndim == 3: pred_fut = pred_fut.squeeze(1)
-        # 这里用 Cyan (青色) 或者 DodgerBlue 以区别于 Hist Model 的深蓝，保持蓝色系但有区分
-        ax.plot(pred_fut[:, 1], pred_fut[:, 0], color='deepskyblue', linestyle='--', marker='x',
-                label='Pred Future', markersize=4, linewidth=2)
+        # 情况 1: 单模态 [T, 1, 2] -> [T, 2]
+        if pred_fut.ndim == 3 and pred_fut.shape[1] == 1:
+            pred_fut = pred_fut.squeeze(1)
+            ax.plot(pred_fut[:, 1], pred_fut[:, 0], color='deepskyblue', linestyle='-', marker='o',
+                    label='Pred Future', markersize=4, linewidth=1.5)
+
+        # 情况 2: 多模态 [T, K, 2] (K > 1)
+        elif pred_fut.ndim == 3 and pred_fut.shape[1] > 1:
+            num_modes = pred_fut.shape[1]
+            for k in range(num_modes):
+                label = 'Pred Future (Multi)' if k == 0 else None
+                # 使用稍低的透明度 alpha=0.6 以看清重叠
+                ax.plot(pred_fut[:, k, 1], pred_fut[:, k, 0], color='deepskyblue',
+                        linestyle='-', marker='x', markersize=4, linewidth=1.5,
+                        alpha=0.6, label=label)
+
+        # 情况 3: 已经是扁平的 [T, 2]
+        elif pred_fut.ndim == 2:
+            ax.plot(pred_fut[:, 1], pred_fut[:, 0], color='deepskyblue', linestyle='-', marker='o',
+                    label='Pred Future', markersize=4, linewidth=1.5)
 
     # 设置绘图属性
-    # 车道线 (假设 Y 轴为横向 Lateral)
     for y in [18, 6, -6, -18]:
         ax.axhline(y=y, color='gray', linestyle=':', linewidth=0.5)
 
     ax.set_xlabel('Longitudinal (m)')
     ax.set_ylabel('Lateral (m)')
-    ax.legend(loc='best')
-    ax.grid(True, linestyle=':', alpha=0.5)
+    # 去重图例
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax.legend(by_label.values(), by_label.keys(), loc='best')
 
+    ax.grid(True, linestyle=':', alpha=0.5)
     plt.tight_layout()
 
     if save_path:
         plt.savefig(save_path)
-        # print(f"Saved visualization to {save_path}")
     else:
         plt.show()
 
     plt.close(fig)
-

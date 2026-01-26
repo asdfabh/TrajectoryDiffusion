@@ -83,19 +83,33 @@ class DiTBlock(nn.Module):
         return x
 
 
-class FinalLayer(nn.Module):
+class JointFinalLayer(nn.Module):
+    """
+    DiffusionDrive 风格的输出层:
+    Trajectory (x0): [B, T, output_dim]
+    Score (Confidence): [B, 1]
+    """
+
     def __init__(self, hidden_size, T=16, output_dim=2):
         super().__init__()
         self.T = T
         self.output_dim = output_dim
-        self.norm_final = nn.LayerNorm(hidden_size)
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
 
-        self.proj = nn.Sequential(
+        # 输入: [B, T, D] -> 输出: [B, T, 2]
+        self.traj_head = nn.Sequential(
             nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_size * 4, bias=True),
             nn.GELU(approximate="tanh"),
             nn.LayerNorm(hidden_size * 4),
             nn.Linear(hidden_size * 4, output_dim, bias=True)
+        )
+
+        # 输入: [B, T, D] -> Global Average Pooling -> [B, D] -> MLP -> [B, 1]
+        self.score_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, 1)  # 输出标量 logit
         )
 
         self.adaLN_modulation = nn.Sequential(
@@ -104,34 +118,38 @@ class FinalLayer(nn.Module):
         )
 
     def forward(self, x, y):
+        """
+        x: [B, T, Hidden_Dim]
+        y: [B, Hidden_Dim] (Condition)
+        Returns:
+        pred_traj: [B, T, 2]
+        pred_score: [B, 1]
+        """
         shift, scale = self.adaLN_modulation(y).chunk(2, dim=1)
         x = modulate(self.norm_final(x), shift, scale)
-        x = self.proj(x)
-        return x
+        pred_traj = self.traj_head(x)  # [B, T, 2]
+
+        # 对时间维度 T 进行平均池化，得到全局特征
+        x_global = x.mean(dim=1)  # [B, Hidden_Dim]
+        pred_score = self.score_head(x_global)  # [B, 1]
+
+        return pred_traj, pred_score
 
 
 class DiT(nn.Module):
     def __init__(self, dit_block, final_layer, depth, model_type="x_start"):
         super().__init__()
-
         assert model_type in ["score", "x_start"], f"Unknown model type: {model_type}"
         self._model_type = model_type
-
         self.blocks = nn.ModuleList([copy.deepcopy(dit_block) for _ in range(depth)])
-        self.final_layer = final_layer
-
-    @property
-    def model_type(self):
-        return self._model_type
+        self.final_layer = final_layer  # 现在是 JointFinalLayer
 
     def forward(self, x, y, cross):
         for block in self.blocks:
             x = block(x, y, cross)
-        x = self.final_layer(x, y)
 
-        return x
-
-
+        pred_traj, pred_score = self.final_layer(x, y)
+        return pred_traj, pred_score
 
 
 
