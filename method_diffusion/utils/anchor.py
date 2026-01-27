@@ -1,140 +1,94 @@
-import os
 import numpy as np
 import torch
-import matplotlib
-from sympy.codegen.ast import none
-
 import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
 from tqdm import tqdm
 from pathlib import Path
-
-# 假设 ngsim_dataset 在 method_diffusion.dataset 包下
-# 根据你的实际目录结构调整 import
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
-from method_diffusion.config import get_args_parser
-
-
-def rotate_traj_to_y_axis(traj, hist):
-    """
-    将轨迹旋转，使车头朝向 Y 轴正方向
-    traj: Future trajectory [T, 2]
-    hist: History trajectory [T_h, 2] (用于计算当前朝向)
-    """
-
-    if len(hist) < 2:
-        return traj  # 历史太短，无法计算朝向，保持原样
-
-    direction_vec = -hist[-2]  # 向量 (dx, dy)
-
-    # 计算当前角度
-    yaw = np.arctan2(direction_vec[1], direction_vec[0])
-    alpha = np.pi / 2 - yaw
-
-    c = np.cos(alpha)
-    s = np.sin(alpha)
-    R = np.array([[c, -s], [s, c]])
-
-    traj_rotated = (R @ traj.T).T
-
-    return traj_rotated
 
 
 def visualize_anchors(anchors, save_path):
     K = anchors.shape[0]
-    plt.figure(figsize=(12, 12))
+    plt.figure(figsize=(10, 8))
     colors = plt.cm.jet(np.linspace(0, 1, K))
 
     for i in range(K):
-        traj = anchors[i]
-        plt.plot(traj[:, 1], traj[:, 0], label=f'Mode {i}',
-                 linewidth=2.5, marker='*', markersize=3, color=colors[i], alpha=0.7)
-        plt.plot(traj[0, 1], traj[0, 0], 'ks', markersize=6)
+        traj = anchors[i]  # [T, 2]
+        # 画出轨迹，注意确认 0 是横向，1 是纵向
+        plt.plot(traj[:, 0], traj[:, 1], color=colors[i], alpha=0.8, linewidth=2)
+        plt.scatter(traj[-1, 0], traj[-1, 1], color=colors[i], marker='x', s=30)
 
-    plt.title(f'Generated {K} Anchors (Aligned to Y-Axis)', fontsize=14)
-    plt.xlabel(' Y (ft)', fontsize=12)
-    plt.ylabel(' X (ft)', fontsize=12)
-    plt.grid(True, linestyle='--', alpha=0.6)
-
-    plt.axis('equal')
-    plt.xlim(-20, 20)
-
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"Visualization saved to {save_path}")
+    plt.title(f'K-Means Anchors in Physical Space (K={K})\nNormalized-Space Clustering')
+    plt.xlabel('Lateral Position (ft)')
+    plt.ylabel('Longitudinal Position (ft)')
+    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.axis('equal')  # 保持比例，能一眼看出变道弧度
+    plt.savefig(save_path, dpi=300)
     plt.close()
 
 
-def main():
-    try:
-        args = get_args_parser().parse_args()
-    except:
-        class Args:
-            pass
+def generate_ngsim_anchors(mat_file, num_clusters=64, t_f=50, d_s=2):
+    dataset = NgsimDataset(mat_file, t_f=t_f, d_s=d_s)
 
-    root_path = Path(__file__).resolve().parent.parent / '/mnt/datasets/ngsimdata'
-    mat_file = str(root_path / 'TrainSet.mat')
+    # 与训练逻辑完全一致的归一化参数
+    pos_mean = np.array([0.0, 0.0])
+    pos_std = np.array([8.0, 120.0])
 
-    print(f"Loading dataset from {mat_file}...")
-    dataset = NgsimDataset(mat_file, t_h=30, t_f=50, d_s=2)
+    print(f"正在从 {mat_file} 提取并归一化轨迹数据...")
+    all_futures_norm = []
 
-    all_futures = []
-    print("Collecting and aligning trajectories...")
-
-    stride = 10
-
-    for i in tqdm(range(0, len(dataset), stride)):
-        dsId = int(dataset.D[i, 0])
-        vehId = int(dataset.D[i, 1])
-        t = dataset.D[i, 2]
-
-        hist = dataset.getHistory(vehId, t, vehId, dsId)
+    # 步长设为 5 (每 0.5s 取一帧)，足以覆盖全量特征且速度极快
+    for i in tqdm(range(0, len(dataset), 5)):
+        dsId, vehId, t = int(dataset.D[i, 0]), int(dataset.D[i, 1]), dataset.D[i, 2]
         fut = dataset.getFuture(vehId, t, dsId)
 
-        # 过滤无效数据
-        if len(fut) != args.T_f or len(hist) < 2:
-            continue
+        if len(fut) == (t_f // d_s):
+            # 归一化并 Flatten
+            fut_norm = (fut - pos_mean) / pos_std
+            fut_norm = np.clip(fut_norm, -5.0, 5.0)
+            all_futures_norm.append(fut_norm.flatten())
 
-        fut_aligned = rotate_traj_to_y_axis(fut, hist)
-        all_futures.append(fut_aligned)
+    all_futures_norm = np.array(all_futures_norm)
 
-    if not all_futures:
-        print("No valid trajectories found.")
-        return
+    # 这里的索引 -2 对应最后一个点的 X (横向)
+    lat_displacements = np.abs(all_futures_norm[:, -2])
+    maneuver_idx = np.where(lat_displacements > 0.1)[0]
+    straight_idx = np.where(lat_displacements <= 0.1)[0]
 
-    all_futures = np.stack(all_futures).astype(np.float64)  # [N, T, 2]
-    print(f"Collected {len(all_futures)} trajectories.")
+    # 平衡变道与直行样本
+    np.random.shuffle(straight_idx)
+    num_samples = len(maneuver_idx)
+    selected_idx = np.concatenate([maneuver_idx, straight_idx[:num_samples]])
+    final_train_data = all_futures_norm[selected_idx]
 
-    LATERAL_SCALE = 15.0
+    print(f"聚类平衡完成: 变道 {len(maneuver_idx)} 条, 直行抽样 {num_samples} 条")
 
-    features = all_futures.copy()
-    features[:, :, 0] *= LATERAL_SCALE
+    print(f"正在归一化空间执行 K-Means (K={num_clusters})...")
+    kmeans = KMeans(n_clusters=num_clusters, init='k-means++', n_init=10, random_state=42)
+    kmeans.fit(final_train_data)
 
-    # Flatten [N, T*2]
-    features_flat = features.reshape(features.shape[0], -1)
+    # 将聚类中心还原回物理空间
+    anchors_norm = kmeans.cluster_centers_.reshape(num_clusters, -1, 2)
+    anchors_phys = (anchors_norm * pos_std) + pos_mean
 
-    print(f"Running KMeans (K={args.num_modes}, Scale={LATERAL_SCALE})...")
-    kmeans = KMeans(n_clusters=args.num_modes, init='k-means++', n_init=20, random_state=42)
-    kmeans.fit(features_flat)
-
-    centers = kmeans.cluster_centers_.reshape(args.num_modes, args.T_f, 2)
-    anchors = centers.copy()
-    anchors[:, :, 0] /= LATERAL_SCALE  # 缩放回去
-
-    # 强制起点归零 (消除微小误差)
-    anchors[:, 0, :] = 0.0
-
-    root_path = Path(__file__).resolve().parent.parent
-    save_dir = root_path / 'dataset'
-    save_dir.mkdir(parents=True, exist_ok=True)
-    save_path = str(save_dir / 'anchors_ngsim.npy')
-
-    np.save(save_path, anchors)
-    print(f"Anchors saved to {save_path}. Shape: {anchors.shape}")
-
-    vis_path = str(save_dir / 'anchors_vis_aligned.png')
-    visualize_anchors(anchors, vis_path)
+    return anchors_phys
 
 
 if __name__ == "__main__":
-    main()
+    # 路径确保存在
+    root_path = Path(__file__).resolve().parent.parent / 'dataset'
+    root_path.mkdir(parents=True, exist_ok=True)
 
+    mat_path = '/mnt/datasets/ngsimdata/TrainSet.mat'
+    K = 10  # 建议 64 以覆盖更多变道细节
+
+    anchors = generate_ngsim_anchors(mat_path, num_clusters=K)
+
+    # 保存结果
+    save_npy_path = root_path / f'anchors_ngsim.npy'
+    np.save(save_npy_path, anchors)
+    print(f"成功！Anchor 保存至: {save_npy_path}")
+
+    # 可视化
+    vis_path = root_path / f'anchors_vis_k{K}.png'
+    visualize_anchors(anchors, vis_path)

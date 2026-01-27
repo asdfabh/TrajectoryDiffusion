@@ -91,7 +91,7 @@ class DiffusionFut(nn.Module):
     def _init_anchors(self):
         # 使用 args 中的路径或根据 root 动态推导
         root_path = Path(__file__).resolve().parent.parent
-        self.anchor_path = str(root_path / 'dataset/anchors_ngsim.npy')
+        self.anchor_path = str(root_path / 'dataset/ngsim_anchors_k10.npy')
 
         if Path(self.anchor_path).exists():
             anchors_np = np.load(self.anchor_path)  # [K, T, 2]
@@ -127,28 +127,30 @@ class DiffusionFut(nn.Module):
         cls_logits: [B, K] 分类 logits
         target_mode_idx: [B] GT 对应的最近 anchor 索引
         """
-        # Regression Loss (只计算 Best Anchor 对应的 loss，这里 pred_x0 已经是对应 Best Anchor 的预测了)
         reg_loss = F.l1_loss(pred_x0, target_norm)  # 或者 MSE
-        # Classification Loss
         cls_loss = F.cross_entropy(cls_logits, target_mode_idx)
 
-        total_loss = reg_loss + 0.5 * cls_loss
-        return total_loss, reg_loss, cls_loss
+        pred_pos = pred_x0[..., :2]
+        target_pos = target_norm[..., :2]
+
+        pred_vel = pred_pos[:, 1:, :] - pred_pos[:, :-1, :]
+        target_vel = target_pos[:, 1:, :] - target_pos[:, :-1, :]
+        vel_loss = torch.abs(pred_vel - target_vel).mean() # L1 Loss
+
+        total_loss = 1.2 * reg_loss + 0.6 * vel_loss + 0.5 * cls_loss
+        return total_loss, reg_loss, vel_loss, cls_loss
 
     def forward_train(self, hist, hist_nbrs, mask, temporal_mask, future, device):
         B, T, _ = future.shape
         K = self.num_modes
         self.anchors = self.anchors.to(device)
 
-        # 1. Encode History
         hist_norm = self.norm(hist)
         hist_nbrs_norm = self.norm(hist_nbrs)
         context, hist_enc = self.hist_encoder(hist_norm, hist_nbrs_norm, mask, temporal_mask)
         global_context = hist_enc[:, -1, :]
         enc_emb = self.enc_embedding(global_context)  # [B, D]
 
-        # 2. Prepare Inputs for K Modes (Parallel Processing)
-        # 我们要并行处理 B*K 个轨迹
         # Context/Condition: [B, ...] -> [B*K, ...]
         context_expanded = context.repeat_interleave(K, dim=0)  # [B*K, T_hist, D]
         enc_emb_expanded = enc_emb.repeat_interleave(K, dim=0)  # [B*K, D]
@@ -157,17 +159,11 @@ class DiffusionFut(nn.Module):
         batch_anchors = self.anchors.unsqueeze(0).repeat(B, 1, 1, 1)
         batch_anchors_norm = self.norm(batch_anchors)[..., :2]
 
-        # 3. Add Noise to ALL Anchors (DiffusionDrive Strategy)
-        # 不同于之前只对 Best Anchor 加噪，现在对所有 Anchor 加噪
-        # 这样模型才能学会评估每一条生成的轨迹
-
         # Timesteps: 每个 Batch 采样一个 t，K 个 anchor 共享
         timesteps = torch.randint(0, 50, (B,), device=device).long()
         timesteps_expanded = timesteps.repeat_interleave(K)  # [B*K]
 
         noise = torch.randn_like(batch_anchors_norm)  # [B, K, T, 2]
-        # 注意: scheduler通常处理 [N, C, H, W] 或 [N, L, C]，这里要把 K 展平或者作为 Channel 处理
-        # 简单起见，展平处理:
         x_start_flat = batch_anchors_norm.view(B * K, T, 2)
         noise_flat = noise.view(B * K, T, 2)
 
@@ -177,8 +173,7 @@ class DiffusionFut(nn.Module):
             timesteps_expanded
         )  # [B*K, T, 2]
 
-        # 4. Model Forward
-        # A. Denorm -> Sine Embed
+        # Denorm -> Sine Embed
         x_noisy_phys = self.denorm(x_noisy_flat)
         x_sine = gen_sineembed_for_position_adaptive(
             x_noisy_phys, hidden_dim=self.input_dim,
@@ -186,12 +181,10 @@ class DiffusionFut(nn.Module):
         )
         x_input = self.query_encoder(x_sine)  # [B*K, T, D]
 
-        # B. DiT Forward
         t_emb = self.timestep_embedder(timesteps_expanded)
         y = t_emb + enc_emb_expanded
 
-        # --- 关键: 获取轨迹和分数 ---
-        # pred_x0_flat: [B*K, T, 2]
+        # pred_traj_delta: [B*K, T, 2],表示修正量
         # pred_scores_flat: [B*K, 1]
         pred_traj_delta, pred_scores_flat = self.dit(x=x_input, y=y, cross=context_expanded)
         pred_traj_delta = pred_traj_delta.view(B, K, T, 2)
@@ -199,29 +192,19 @@ class DiffusionFut(nn.Module):
         pred_x0 = input_anchor_coords + pred_traj_delta
         cls_logits = pred_scores_flat.view(B, K)  # [B, K] <- 后验分数
 
-        # 6. Loss Calculation (Winner-Takes-All)
         target_phys = future[..., :2]  # [B, T, 2]
 
-        # A. 找 Label (哪个 Anchor 离 GT 最近)
+        # 找 Label (哪个 Anchor 离 GT 最近)
         batch_anchors_phys = self.anchors.unsqueeze(0).repeat(B, 1, 1, 1)  # [B, K, T, 2]
         dist = torch.norm(batch_anchors_phys - target_phys.unsqueeze(1), dim=-1).mean(dim=-1)  # [B, K]
         target_mode_idx = torch.argmin(dist, dim=1)  # [B]
 
-        # B. Classification Loss (Posterior)
-        # 强迫模型给"生成的轨迹离GT最近的那条"打高分
-        cls_loss = F.cross_entropy(cls_logits, target_mode_idx)
-
-        # C. Regression Loss (WTA)
         # 只计算 Best Anchor 对应生成的轨迹的 L1 Loss
         idx_gather = target_mode_idx.view(B, 1, 1, 1).repeat(1, 1, T, 2)
         best_mode_pred = torch.gather(pred_x0, 1, idx_gather).squeeze(1)  # [B, T, 2]
-
-        # 这里的 target 需要 norm 后的，因为 DiT 输出通常在 norm 空间 (或者你需要 denorm pred_x0)
-        # 假设 DiT 输出的是 normalized x0:
         target_norm = self.norm(target_phys)[..., :2]
-        reg_loss = F.l1_loss(best_mode_pred, target_norm)
 
-        total_loss = reg_loss + 0.5 * cls_loss
+        total_loss = self.compute_loss(best_mode_pred, target_norm, cls_logits, target_mode_idx)[0]
 
         # Metrics
         pred_phys = self.denorm(best_mode_pred)
@@ -235,7 +218,8 @@ class DiffusionFut(nn.Module):
         # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
         # hist_nbrs_aligned = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
         # full_gt_hist = torch.cat([hist.unsqueeze(2), hist_nbrs_aligned], dim=2)  # [B, T, 1+N, D]
-        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=self.anchors.unsqueeze(0).permute(0, 2, 1, 3))
+        # visualize_batch_trajectories(hist=hist_norm, future=self.norm(future), pred=self.norm(self.anchors.unsqueeze(0).permute(0, 2, 1, 3)))
+        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=pred_phys)
 
         return total_loss, pred_phys, ade, fde
 
@@ -317,6 +301,15 @@ class DiffusionFut(nn.Module):
         gt = future[..., :2].unsqueeze(1)
         dist = torch.norm(all_preds_phys - gt, dim=-1).mean(dim=-1)
         min_ade = dist.min(dim=1)[0].mean()
+
+        # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
+        # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
+        # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
+        # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
+        # hist_nbrs_aligned = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
+        # full_gt_hist = torch.cat([hist.unsqueeze(2), hist_nbrs_aligned], dim=2)  # [B, T, 1+N, D]
+        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=final_traj)
+        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=all_preds_phys.permute(0, 2, 1, 3))
 
         return torch.tensor(0.0), final_traj, min_ade, torch.tensor(0.0)
 
