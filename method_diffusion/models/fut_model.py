@@ -91,7 +91,7 @@ class DiffusionFut(nn.Module):
     def _init_anchors(self):
         # 使用 args 中的路径或根据 root 动态推导
         root_path = Path(__file__).resolve().parent.parent
-        self.anchor_path = str(root_path / 'dataset/ngsim_anchors_k10.npy')
+        self.anchor_path = str(root_path / 'dataset/ngsim_anchors.npy')
 
         if Path(self.anchor_path).exists():
             anchors_np = np.load(self.anchor_path)  # [K, T, 2]
@@ -219,7 +219,7 @@ class DiffusionFut(nn.Module):
         # hist_nbrs_aligned = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
         # full_gt_hist = torch.cat([hist.unsqueeze(2), hist_nbrs_aligned], dim=2)  # [B, T, 1+N, D]
         # visualize_batch_trajectories(hist=hist_norm, future=self.norm(future), pred=self.norm(self.anchors.unsqueeze(0).permute(0, 2, 1, 3)))
-        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=pred_phys)
+        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=self.anchors.unsqueeze(0).permute(0, 2, 1, 3))
 
         return total_loss, pred_phys, ade, fde
 
