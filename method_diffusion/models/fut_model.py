@@ -142,7 +142,7 @@ class DiffusionFut(nn.Module):
         total_loss = 2.0 * reg_loss + 1.2 * vel_loss + 1.0 * cls_loss
         return total_loss, reg_loss, vel_loss, cls_loss
 
-    def forward_train(self, hist, hist_nbrs, mask, temporal_mask, future, device):
+    def forward_train(self, hist, hist_nbrs, mask, temporal_mask, future, device, target_mode_idx):
         B, T, _ = future.shape
         T_h = hist.shape[1]
         K = self.num_modes
@@ -193,11 +193,15 @@ class DiffusionFut(nn.Module):
         # Best Label (哪个 Anchor 离 GT 最近)
         target_phys = future[..., :2]  # [B, T, 2]
 
-        """重点，选取最佳轨迹需要仔细调参，选取错误会导致严重的训练问题"""
-        target_norm = self.norm(future)[..., :2]
-        anchors_norm = self.norm(self.anchors)[..., :2]
-        dist = torch.norm(anchors_norm.unsqueeze(0) - target_norm.unsqueeze(1), dim=-1).mean(dim=-1)
-        target_mode_idx = torch.argmin(dist, dim=1)
+        """
+        重点，选取最佳轨迹需要仔细调参，选取错误会导致严重的训练问题
+        采用DTW离线计算得到的最佳轨迹索引作为监督
+        """
+        # target_norm = self.norm(future)[..., :2]
+        # anchors_norm = self.norm(self.anchors)[..., :2]
+        # dist = torch.norm(anchors_norm.unsqueeze(0) - target_norm.unsqueeze(1), dim=-1).mean(dim=-1)
+        # target_mode_idx_norm = torch.argmin(dist, dim=1)
+        target_mode_idx = target_mode_idx
 
         # 只计算 Best Anchor 对应生成的轨迹的 L1 Loss
         batch_idx = torch.arange(B, device=device)
@@ -205,7 +209,6 @@ class DiffusionFut(nn.Module):
 
         target = self.norm(target_phys)[..., :2]
         total_loss = self.compute_loss(pred, target, cls_logits, target_mode_idx)[0]
-
 
         # Metrics
         pred_phys = self.denorm(pred)
@@ -227,6 +230,7 @@ class DiffusionFut(nn.Module):
         # hist_nbrs_aligned = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
         # full_gt_hist = torch.cat([hist.unsqueeze(2), hist_nbrs_aligned], dim=2)  # [B, T, 1+N, D]
         # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=self.anchors.unsqueeze(0).permute(0, 2, 1, 3), best_index=target_mode_idx)
+        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=self.anchors.unsqueeze(0).permute(0, 2, 1, 3), best_index=target_mode_idx_norm)
         # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=self.denorm(pred_x0).permute(0, 2, 1, 3), best_index=target_mode_idx)
         # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=pred_phys)
 
@@ -320,9 +324,9 @@ class DiffusionFut(nn.Module):
 
         return torch.tensor(0.0), final_traj, ade, torch.tensor(0.0)
 
-    def forward(self, hist, hist_nbrs, mask, temporal_mask, future, device):
+    def forward(self, hist, hist_nbrs, mask, temporal_mask, future, device, target_mode_idx=None):
         """Standard forward method for DDP compatibility"""
-        return self.forward_train(hist, hist_nbrs, mask, temporal_mask, future, device)
+        return self.forward_train(hist, hist_nbrs, mask, temporal_mask, future, device, target_mode_idx)
 
     # hist = [B, T, dim], nbrs = [N_total, T, dim]. dim = x, y, v, a, laneID, class
     def norm(self, x):
