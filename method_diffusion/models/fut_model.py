@@ -137,19 +137,21 @@ class DiffusionFut(nn.Module):
         target_vel = target_pos[:, 1:, :] - target_pos[:, :-1, :]
         vel_loss = torch.abs(pred_vel - target_vel).mean() # L1 Loss
 
-        total_loss = 1.2 * reg_loss + 0.6 * vel_loss + 0.5 * cls_loss
+        total_loss = 2.0 * reg_loss + 1.0 * vel_loss #+ 0.6 * cls_loss
         return total_loss, reg_loss, vel_loss, cls_loss
 
     def forward_train(self, hist, hist_nbrs, mask, temporal_mask, future, device):
         B, T, _ = future.shape
         T_h = hist.shape[1]
         K = self.num_modes
+        """重点：anchor的聚类需要仔细调整，加噪后anchor的分布也需要考虑"""
         self.anchors = self.anchors.to(device)
 
         # 1. add truncated noise to the plan anchor
         # Anchors: [K, T, 2] -> [B, K, T, 2]
         anchors_norm = self.norm(self.anchors)[..., :2]  # [K, T, 2]
         timesteps = torch.randint(0, 50, (B,), device=device).long()
+        # timesteps = torch.randint(0, self.num_train_timesteps, (B,), device=device).long()
 
         # 广播视图加噪 [B, K, T, 2]
         noise = torch.randn(B, K, T, 2, device=device)
@@ -158,7 +160,7 @@ class DiffusionFut(nn.Module):
             noise,
             timesteps
         ).float()
-        x_noisy = torch.clamp(x_noisy, -1, 1)
+        x_noisy = torch.clamp(x_noisy, -3, 3)
         x_noisy_denorm = self.denorm(x_noisy)
 
         # 2. proj noisy_traj_points to the query
@@ -190,7 +192,11 @@ class DiffusionFut(nn.Module):
 
         # Best Label (哪个 Anchor 离 GT 最近)
         target_phys = future[..., :2]  # [B, T, 2]
-        dist = torch.norm(self.anchors.unsqueeze(0) - target_phys.unsqueeze(1), dim=-1).mean(dim=-1)
+
+        """重点，选取最佳轨迹需要仔细调参，选取错误会导致严重的训练问题"""
+        target_norm = self.norm(future)[..., :2]
+        anchors_norm = self.norm(self.anchors)[..., :2]
+        dist = torch.norm(anchors_norm.unsqueeze(0) - target_norm.unsqueeze(1), dim=-1).mean(dim=-1)
         target_mode_idx = torch.argmin(dist, dim=1)
 
         # 只计算 Best Anchor 对应生成的轨迹的 L1 Loss
@@ -200,22 +206,30 @@ class DiffusionFut(nn.Module):
         target = self.norm(target_phys)[..., :2]
         total_loss = self.compute_loss(pred, target, cls_logits, target_mode_idx)[0]
 
+
         # Metrics
         pred_phys = self.denorm(pred)
         diff = pred_phys - target_phys
         ade = torch.norm(diff, dim=-1).mean()
         fde = torch.norm(diff, dim=-1)[:, -1].mean()
 
+        """
+        目前存在的问题：
+        best曲线选择的真值不够准，导致回归和分类都出现问题
+        anchor聚类效果不够好，导致生成的轨迹离实际轨迹较远
+        生成的轨迹存在摆烂行为，趋于均值，这是很严重的问题
+        生成的轨迹没有时间关系，导致不连贯
+        """
         # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
         # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
         # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
         # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
         # hist_nbrs_aligned = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
         # full_gt_hist = torch.cat([hist.unsqueeze(2), hist_nbrs_aligned], dim=2)  # [B, T, 1+N, D]
-        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=self.anchors.unsqueeze(0).permute(0, 2, 1, 3))
-        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=x_noisy_denorm.permute(0,2,1,3))
-        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=self.denorm(pred_x0.permute(0,2,1,3)))
-        # visualize_batch_trajectories(hist=hist_norm, future=self.norm(future), pred=pred)
+        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=x_noisy_denorm.squeeze(1))
+        # visualize_batch_trajectories(hist=hist_norm, hist_nbrs=self.norm(full_gt_hist), future=self.norm(future), pred=self.anchors.unsqueeze(0).permute(0, 2, 1, 3), best_index=target_mode_idx)
+        # visualize_batch_trajectories(hist=hist_norm, hist_nbrs=self.norm(full_gt_hist), future=self.norm(future), pred=pred_x0.permute(0, 2, 1, 3), best_index=target_mode_idx)
+        # visualize_batch_trajectories(hist=hist_norm, hist_nbrs=self.norm(full_gt_hist), future=self.norm(future), pred=pred)
 
         return total_loss, pred_phys, ade, fde
 
@@ -233,7 +247,6 @@ class DiffusionFut(nn.Module):
         enc_emb = self.enc_embedding(global_context)  # [B, D]
 
         context_expanded = context.unsqueeze(1).expand(-1, K, -1, -1).reshape(B * K, T_h, -1)
-        enc_emb_expanded = enc_emb.unsqueeze(1).expand(-1, K, -1).reshape(B * K, -1)
 
         start_step = 20
         anchors_norm = self.norm(self.anchors)[..., :2]  # [K, T, 2]
@@ -247,6 +260,7 @@ class DiffusionFut(nn.Module):
 
         inference_steps = [20, 10, 0]
         final_scores = None
+        self.diffusion_scheduler.set_timesteps(self.num_train_timesteps)
 
         for t_val in inference_steps:
             timesteps = torch.full((B,), t_val, device=device, dtype=torch.long)
@@ -292,6 +306,16 @@ class DiffusionFut(nn.Module):
         target_phys = future[..., :2]
         dist = torch.norm(final_traj - target_phys, dim=-1).mean(dim=-1)
         ade = dist.mean()
+
+        mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
+        mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
+        hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
+        hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
+        hist_nbrs_aligned = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
+        full_gt_hist = torch.cat([hist.unsqueeze(2), hist_nbrs_aligned], dim=2)  # [B, T, 1+N, D]
+        visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=self.anchors.unsqueeze(0).permute(0, 2, 1, 3), best_index=best_mode_idx)
+        visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=all_preds_phys.permute(0, 2, 1, 3), best_index=best_mode_idx)
+        visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=final_traj)
 
         return torch.tensor(0.0), final_traj, ade, torch.tensor(0.0)
 
