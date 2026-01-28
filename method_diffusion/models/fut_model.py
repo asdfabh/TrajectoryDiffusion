@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from method_diffusion.models.hist_encoder import HistEncoder
 import torch.nn.functional as F
+from method_diffusion.utils.position_encoding import SequentialPositionalEncoding
 from pathlib import Path
 from method_diffusion.utils.visualization import visualize_batch_trajectories, plot_traj_with_mask, plot_traj
 import math
@@ -55,6 +56,7 @@ class DiffusionFut(nn.Module):
         # 输入嵌入层和位置编码，相加得到Dit的输入
         self.query_encoder = nn.Sequential(nn.Linear(self.input_dim, self.input_dim), nn.SiLU(),
             nn.Linear(self.input_dim, self.input_dim), nn.LayerNorm(self.input_dim))
+        self.pos_embedding = SequentialPositionalEncoding(self.input_dim)
         self.timestep_embedder = dit.TimestepEmbedder(self.input_dim, self.time_embedding_size)
 
         self.hist_encoder = HistEncoder(args)
@@ -137,7 +139,7 @@ class DiffusionFut(nn.Module):
         target_vel = target_pos[:, 1:, :] - target_pos[:, :-1, :]
         vel_loss = torch.abs(pred_vel - target_vel).mean() # L1 Loss
 
-        total_loss = 2.0 * reg_loss + 1.0 * vel_loss #+ 0.6 * cls_loss
+        total_loss = 2.0 * reg_loss + 1.2 * vel_loss + 1.0 * cls_loss
         return total_loss, reg_loss, vel_loss, cls_loss
 
     def forward_train(self, hist, hist_nbrs, mask, temporal_mask, future, device):
@@ -151,7 +153,6 @@ class DiffusionFut(nn.Module):
         # Anchors: [K, T, 2] -> [B, K, T, 2]
         anchors_norm = self.norm(self.anchors)[..., :2]  # [K, T, 2]
         timesteps = torch.randint(0, 50, (B,), device=device).long()
-        # timesteps = torch.randint(0, self.num_train_timesteps, (B,), device=device).long()
 
         # 广播视图加噪 [B, K, T, 2]
         noise = torch.randn(B, K, T, 2, device=device)
@@ -168,7 +169,7 @@ class DiffusionFut(nn.Module):
             x_noisy_denorm, hidden_dim=self.input_dim,
             max_len_x=20.0, max_len_y=300.0
         )  # [B, K, T, input_dim]
-        x_input = self.query_encoder(x_sine.view(B * K, T, -1))
+        x_input = self.query_encoder(x_sine.view(B * K, T, -1)) + self.pos_embedding(x_sine.view(B * K, T, -1))
 
         # 3. embed the timesteps and history context
         t_emb = self.timestep_embedder(timesteps)  # [B, D]
@@ -185,9 +186,8 @@ class DiffusionFut(nn.Module):
         context_expanded = context.unsqueeze(1).expand(-1, K, -1, -1).reshape(B * K, T_h, -1)
 
         # pred_traj_delta: [B*K, T, 2]，直接预测轨迹 pred_scores_flat: [B*K, 1] 表示后验分数
-        pred_delta_flat, pred_scores_flat = self.dit(x=x_input, y=y_expanded, cross=context_expanded)
-        pred_delta = pred_delta_flat.view(B, K, T, 2)
-        pred_x0 = x_noisy + pred_delta  # [B, K, T, 2]
+        pred_flat, pred_scores_flat = self.dit(x=x_input, y=y_expanded, cross=context_expanded)
+        pred_x0 = pred_flat.view(B, K, T, 2)  # [B, K, T, 2]
         cls_logits = pred_scores_flat.view(B, K)  # [B, K] 后验分数
 
         # Best Label (哪个 Anchor 离 GT 最近)
@@ -226,10 +226,9 @@ class DiffusionFut(nn.Module):
         # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
         # hist_nbrs_aligned = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
         # full_gt_hist = torch.cat([hist.unsqueeze(2), hist_nbrs_aligned], dim=2)  # [B, T, 1+N, D]
-        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=x_noisy_denorm.squeeze(1))
-        # visualize_batch_trajectories(hist=hist_norm, hist_nbrs=self.norm(full_gt_hist), future=self.norm(future), pred=self.anchors.unsqueeze(0).permute(0, 2, 1, 3), best_index=target_mode_idx)
-        # visualize_batch_trajectories(hist=hist_norm, hist_nbrs=self.norm(full_gt_hist), future=self.norm(future), pred=pred_x0.permute(0, 2, 1, 3), best_index=target_mode_idx)
-        # visualize_batch_trajectories(hist=hist_norm, hist_nbrs=self.norm(full_gt_hist), future=self.norm(future), pred=pred)
+        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=self.anchors.unsqueeze(0).permute(0, 2, 1, 3), best_index=target_mode_idx)
+        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=self.denorm(pred_x0).permute(0, 2, 1, 3), best_index=target_mode_idx)
+        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=pred_phys)
 
         return total_loss, pred_phys, ade, fde
 
@@ -270,22 +269,19 @@ class DiffusionFut(nn.Module):
                 x_t_denorm, hidden_dim=self.input_dim,
                 max_len_x=20.0, max_len_y=300.0
             )
-            x_input = self.query_encoder(x_sine.view(B * K, T, -1))
+            x_input = self.query_encoder(x_sine.view(B * K, T, -1)) + self.pos_embedding(x_sine.view(B * K, T, -1))
 
             # 时间步嵌入和环境条件融合
             t_emb = self.timestep_embedder(timesteps)  # [B, D]
             y_per_batch = (t_emb.unsqueeze(1) + enc_emb.unsqueeze(1))  # [B, 1, D]
             y_expanded = y_per_batch.expand(-1, K, -1).reshape(B * K, -1)
 
-            pred_delta_flat, pred_scores_flat = self.dit(x=x_input, y=y_expanded, cross=context_expanded)
-            pred_delta = pred_delta_flat.view(B, K, T, 2)
-            pred_x0_norm = x_t_norm + pred_delta
+            pred_flat, pred_scores_flat = self.dit(x=x_input, y=y_expanded, cross=context_expanded)
+            pred_x0_norm = pred_flat.view(B, K, T, 2)
 
             if t_val > 0:
                 x_t_norm_flat = x_t_norm.view(B * K, T, 2)
                 pred_x0_norm_flat = pred_x0_norm.view(B * K, T, 2)
-
-                ts_flat = torch.full((B * K,), t_val, device=device, dtype=torch.long)
 
                 step_out = self.diffusion_scheduler.step(
                     model_output=pred_x0_norm_flat,
@@ -307,15 +303,20 @@ class DiffusionFut(nn.Module):
         dist = torch.norm(final_traj - target_phys, dim=-1).mean(dim=-1)
         ade = dist.mean()
 
-        mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
-        mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
-        hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
-        hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
-        hist_nbrs_aligned = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
-        full_gt_hist = torch.cat([hist.unsqueeze(2), hist_nbrs_aligned], dim=2)  # [B, T, 1+N, D]
-        visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=self.anchors.unsqueeze(0).permute(0, 2, 1, 3), best_index=best_mode_idx)
-        visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=all_preds_phys.permute(0, 2, 1, 3), best_index=best_mode_idx)
-        visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=final_traj)
+        # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
+        # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
+        # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
+        # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
+        # hist_nbrs_aligned = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
+        # full_gt_hist = torch.cat([hist.unsqueeze(2), hist_nbrs_aligned], dim=2)  # [B, T, 1+N, D]
+        # target_norm = self.norm(future)[..., :2]
+        # anchors_norm = self.norm(self.anchors)[..., :2]
+        # dist = torch.norm(anchors_norm.unsqueeze(0) - target_norm.unsqueeze(1), dim=-1).mean(dim=-1)
+        # target_mode_idx = torch.argmin(dist, dim=1)
+        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=self.anchors.unsqueeze(0).permute(0, 2, 1, 3), best_index=target_mode_idx)
+        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=self.anchors.unsqueeze(0).permute(0, 2, 1, 3), best_index=best_mode_idx)
+        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=self.denorm(x_t_norm).permute(0, 2, 1, 3), best_index=best_mode_idx)
+        # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=final_traj)
 
         return torch.tensor(0.0), final_traj, ade, torch.tensor(0.0)
 
@@ -340,81 +341,3 @@ class DiffusionFut(nn.Module):
         if C == 3:
             x_denorm[..., 2:4] = (x[..., 2:4] * self.va_std) + self.va_mean  # v, a
         return x_denorm
-
-    # def forward_train(self, hist, hist_nbrs, mask, temporal_mask, future, device):
-    #     B, T, _ = future.shape
-    #     K = self.num_modes
-    #     self.anchors = self.anchors.to(device)
-    #
-    #     # 1. add truncated noise to the plan anchor
-    #     # Anchors: [K, T, 2] -> [B, K, T, 2]
-    #     batch_anchors = self.anchors.unsqueeze(0).repeat(B, 1, 1, 1)
-    #     batch_anchors_norm = self.norm(batch_anchors)[..., :2]
-    #     timesteps = torch.randint(0, 50, (B,), device=device).long() # [B, None]
-    #     noise = torch.randn_like(batch_anchors_norm)  # [B, K, T, 2]
-    #     x_noisy = self.diffusion_scheduler.add_noise(
-    #         batch_anchors_norm,
-    #         noise,
-    #         timesteps
-    #     ).float()  # [B, K, T, 2]
-    #     x_noisy = torch.clamp(x_noisy, -1, 1)
-    #     x_noisy_denorm = self.denorm(x_noisy)
-    #
-    #     # 2. proj noisy_traj_points to the query
-    #     x_sine = gen_sineembed_for_position_adaptive(
-    #         x_noisy_denorm, hidden_dim=self.input_dim,
-    #         max_len_x=20.0, max_len_y=300.0
-    #     )  # [B, K, T, input_dim]
-    #     x_noisy_flat = x_sine.view(B * K, T, -1) # [B*K, T, input_dim]
-    #     x_input = self.query_encoder(x_noisy_flat) # [B*K, T, input_dim]
-    #
-    #     # 3. embed the timesteps and history context
-    #     timesteps_expanded = timesteps.unsqueeze(1).repeat(1, K).view(B * K)  # [B*K]
-    #     t_emb = self.timestep_embedder(timesteps_expanded)  # [B*K, D]
-    #
-    #     hist_norm = self.norm(hist)
-    #     hist_nbrs_norm = self.norm(hist_nbrs)
-    #     context, hist_enc = self.hist_encoder(hist_norm, hist_nbrs_norm, mask, temporal_mask)
-    #     global_context = hist_enc[:, -1, :]
-    #     enc_emb = self.enc_embedding(global_context)  # [B, D]
-    #
-    #     # Context/Condition: [B, ...] -> [B*K, ...]
-    #     context_expanded = context.repeat_interleave(K, dim=0)  # [B*K, T_hist, D]
-    #     enc_emb_expanded = enc_emb.repeat_interleave(K, dim=0)  # [B*K, D]
-    #
-    #     y = t_emb + enc_emb_expanded
-    #
-    #     # pred_traj_delta: [B*K, T, 2]，直接预测轨迹 pred_scores_flat: [B*K, 1] 表示后验分数
-    #     pred_traj_flat, pred_scores_flat = self.dit(x=x_input, y=y, cross=context_expanded)
-    #     pred_x0 = pred_traj_flat.view(B, K, T, 2) # [B, K, T, 2] 预测轨迹
-    #     cls_logits = pred_scores_flat.view(B, K)  # [B, K] 后验分数
-    #
-    #     # Best Label (哪个 Anchor 离 GT 最近)
-    #     target_phys = future[..., :2]  # [B, T, 2]
-    #     batch_anchors_phys = self.anchors.unsqueeze(0).repeat(B, 1, 1, 1)  # [B, K, T, 2]
-    #     dist = torch.norm(batch_anchors_phys - target_phys.unsqueeze(1), dim=-1).mean(dim=-1)  # [B, K]
-    #     target_mode_idx = torch.argmin(dist, dim=1)  # [B]
-    #
-    #     # 只计算 Best Anchor 对应生成的轨迹的 L1 Loss
-    #     idx_gather = target_mode_idx.view(B, 1, 1, 1).repeat(1, 1, T, 2)
-    #     best_mode_pred = torch.gather(pred_x0, 1, idx_gather).squeeze(1)  # [B, T, 2]
-    #     target_norm = self.norm(target_phys)[..., :2]
-    #
-    #     total_loss = self.compute_loss(best_mode_pred, target_norm, cls_logits, target_mode_idx)[0]
-    #
-    #     # Metrics
-    #     pred_phys = self.denorm(best_mode_pred)
-    #     diff = pred_phys - target_phys
-    #     ade = torch.norm(diff, dim=-1).mean()
-    #     fde = torch.norm(diff, dim=-1)[:, -1].mean()
-    #
-    #     # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
-    #     # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist.size(1), -1)
-    #     # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
-    #     # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
-    #     # hist_nbrs_aligned = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
-    #     # full_gt_hist = torch.cat([hist.unsqueeze(2), hist_nbrs_aligned], dim=2)  # [B, T, 1+N, D]
-    #     # visualize_batch_trajectories(hist=hist_norm, future=self.norm(future), pred=self.norm(self.anchors.unsqueeze(0).permute(0, 2, 1, 3)))
-    #     # visualize_batch_trajectories(hist=hist, hist_nbrs=full_gt_hist, future=future, pred=self.anchors.unsqueeze(0).permute(0, 2, 1, 3))
-    #
-    #     return total_loss, pred_phys, ade, fde

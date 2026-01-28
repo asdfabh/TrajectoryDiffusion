@@ -216,7 +216,7 @@ def plot_traj_with_mask(hist_original, hist_masked, hist_pred, nbrs_original=Non
 
 
 def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, pred=None, hist_masked=None, batch_idx=0,
-                                 save_path=None):
+                                 save_path=None, best_index=None):
     """
     可视化函数 (支持多模态预测):
     - hist (Blue): Hist Model 输出的 Ego 重构轨迹
@@ -224,6 +224,7 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, pred=No
     - hist_masked (Red X): 在真实的 Ego 历史(hist_nbrs[0])上标记被掩码的点
     - future (Green): 真实未来轨迹
     - pred (Cyan): 预测未来轨迹 (支持多条)
+    - best_index: 多模态下指定的最佳轨迹索引，突出显示为红色
     """
 
     # --- 数据提取辅助函数 ---
@@ -242,6 +243,23 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, pred=No
     mask_arr = get_val(hist_masked, batch_idx)  # [T, ...]
 
     fig, ax = plt.subplots(figsize=(10, 10))
+
+    # 将 best_index 规范为当前 batch 样本的 int，避免张量布尔歧义
+    best_idx = None
+    if best_index is not None:
+        if isinstance(best_index, torch.Tensor):
+            idx_tensor = best_index
+            if idx_tensor.numel() == 1:
+                best_idx = int(idx_tensor.item())
+            else:
+                best_idx = int(idx_tensor[batch_idx].item())
+        elif isinstance(best_index, (np.ndarray, list, tuple)):
+            if np.asarray(best_index).ndim == 0:
+                best_idx = int(best_index)
+            else:
+                best_idx = int(best_index[batch_idx])
+        else:
+            best_idx = int(best_index)
 
     # --- A. 绘制 Hist Nbrs (所有真实历史，包括 Ego) - 黄色 ---
     gt_ego_traj = None
@@ -284,14 +302,14 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, pred=No
     # --- D. 绘制 Future (真实) - 绿色 ---
     if gt_fut is not None:
         if gt_fut.ndim == 3: gt_fut = gt_fut.squeeze(1)
-        ax.plot(gt_fut[:, 1], gt_fut[:, 0], 'g-*', label='GT Future', markersize=4, linewidth=2)
+        ax.plot(gt_fut[:, 1], gt_fut[:, 0], 'g-*', label='GT Future', markersize=5, linewidth=2)
 
         # 连线
         if gt_ego_traj is not None:
             ax.plot([gt_ego_traj[-1, 1], gt_fut[0, 1]], [gt_ego_traj[-1, 0], gt_fut[0, 0]], 'g--', alpha=0.5)
 
     # --- E. 绘制 Pred (预测未来) - 深天蓝 ---
-    # 修改部分：支持多模态 [T, K, 2]
+    # 修改部分：支持多模态 [T, K, 2]，并可突出 best_index
     if pred_fut is not None:
         # 情况 1: 单模态 [T, 1, 2] -> [T, 2]
         if pred_fut.ndim == 3 and pred_fut.shape[1] == 1:
@@ -303,11 +321,19 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, pred=No
         elif pred_fut.ndim == 3 and pred_fut.shape[1] > 1:
             num_modes = pred_fut.shape[1]
             for k in range(num_modes):
-                label = 'Pred Future (Multi)' if k == 0 else None
-                # 使用稍低的透明度 alpha=0.6 以看清重叠
-                ax.plot(pred_fut[:, k, 1], pred_fut[:, k, 0], color='deepskyblue',
-                        linestyle='-', marker='x', markersize=4, linewidth=1.5,
-                        alpha=0.6, label=label)
+                is_best = (best_idx is not None and k == best_idx)
+                color = 'red' if is_best else 'deepskyblue'
+                alpha = 0.95 if is_best else 0.6
+                marker = 'o' if is_best else 'x'
+                label = None
+                if is_best:
+                    label = 'Pred Future (Best)'
+                elif k == 0:
+                    label = 'Pred Future (Multi)'
+
+                ax.plot(pred_fut[:, k, 1], pred_fut[:, k, 0], color=color,
+                        linestyle='-', marker=marker, markersize=4, linewidth=1.8 if is_best else 1.2,
+                        alpha=alpha, label=label)
 
         # 情况 3: 已经是扁平的 [T, 2]
         elif pred_fut.ndim == 2:
