@@ -24,6 +24,7 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
     cclass_nbrs = batch['nbrs_class']
     mask = batch['mask']  # [B, 3, 13, h]
     temporal_mask = batch['temporal_mask']  # [B, 3, 13, dim]
+    target_mode_idx = batch['target_mode_idx'].to(device)
 
 
     # 根据 feature_dim 拼接特征
@@ -56,7 +57,7 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
 
-    return hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask
+    return hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask, target_mode_idx
 
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim,
                 mask_type='random', mask_prob=0.4):
@@ -70,11 +71,11 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim,
 
 
     for batch_idx, batch in pbar:
-        hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask = prepare_input_data(
+        hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask, target_mode_idx = prepare_input_data(
             batch, feature_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
         )
 
-        loss, pred, ade, fde = model.forward_train(hist, hist_nbrs, mask, temporal_mask, fut, device)
+        loss, pred, ade, fde = model.forward_train(hist, hist_nbrs, mask, temporal_mask, fut, device, target_mode_idx)
         # _, _, _, _ = model.forward_eval(hist, hist_nbrs, mask, temporal_mask, fut, device)
 
         optimizer.zero_grad()
@@ -159,8 +160,10 @@ def main():
 
     data_root = Path(__file__).resolve().parent.parent / '/mnt/datasets/ngsimdata'
     train_path = str(data_root / 'TrainSet.mat')
+    root_path = Path(__file__).resolve().parent / 'dataset'
+    index_file = root_path / 'best_anchor_indices_ngsim_dtw.npy'
 
-    train_dataset = NgsimDataset(train_path, t_h=30, t_f=50, d_s=2)
+    train_dataset = NgsimDataset(train_path, t_h=30, t_f=50, d_s=2, index_file=index_file)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
