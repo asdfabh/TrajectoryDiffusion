@@ -216,7 +216,7 @@ def plot_traj_with_mask(hist_original, hist_masked, hist_pred, nbrs_original=Non
 
 
 def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, pred=None, hist_masked=None, batch_idx=0,
-                                 save_path=None):
+                                 save_path=None, title=None):
     """
     可视化函数：
     - hist (Blue): Hist Model 输出的 Ego 重构轨迹
@@ -314,6 +314,8 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, pred=No
 
     ax.set_xlabel('Longitudinal (m)')
     ax.set_ylabel('Lateral (m)')
+    if title is not None:
+        ax.set_title(title)
     ax.legend(loc='best')
     ax.grid(True, linestyle=':', alpha=0.5)
 
@@ -326,4 +328,3 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, pred=No
         plt.show()
 
     plt.close(fig)
-

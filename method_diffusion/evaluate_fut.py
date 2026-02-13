@@ -1,7 +1,8 @@
 import sys
 import os
 import torch
-from torch.utils.data import DataLoader
+import csv
+from torch.utils.data import DataLoader, Subset
 from pathlib import Path
 from tqdm import tqdm
 import argparse
@@ -13,19 +14,24 @@ from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.config import get_args_parser
-from method_diffusion.utils.mask_util import random_mask, continuous_mask
-from method_diffusion.utils.visualization import visualize_batch_trajectories
+from method_diffusion.utils.mask_util import random_mask
+from method_diffusion.utils.traj_vis_metrics import visualize_hist_nbrs_fut_pred
+from method_diffusion.utils.traj_metrics import (
+    TrajectoryMetricsAccumulator,
+    compute_batch_metrics,
+)
 
-def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, device='cuda'):
+def prepare_input_data(batch, feature_dim, device='cuda'):
     """数据准备函数，与训练代码保持一致"""
     hist = batch['hist']
     va = batch['va']
     lane = batch['lane']
     cclass = batch['cclass']
     fut = batch['fut']
-    hist_nbrs = batch['nbrs']
-    va_nbrs = batch['nbrs_va']
-    lane_nbrs = batch['nbrs_lane']
+    op_mask = batch['op_mask']
+    hist_nbrs = batch['nbrs']  # [B, T, N, 2] or [B, N, T, 2]
+    va_nbrs = batch['nbrs_va']  # [B, T, N, 2] or [B, N, T, 2]
+    lane_nbrs = batch['nbrs_lane']  # [B, T, N, 1] or [B, N, T, 1]
     cclass_nbrs = batch['nbrs_class']
     mask = batch['mask']
     temporal_mask = batch['temporal_mask']
@@ -43,73 +49,47 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
         hist = hist.to(device)
         hist_nbrs = hist_nbrs.to(device)
     fut = fut.to(device)
-
-    if mask_type == 'random':
-        hist_mask = random_mask(hist, p=mask_prob).to(device)
-    elif mask_type == 'block':
-        hist_mask = continuous_mask(hist, p=mask_prob).to(device)
-    else:
-        hist_mask = random_mask(hist, p=mask_prob).to(device)
-
-    hist_masked_val = hist_mask * hist
-    hist_masked = torch.cat([hist_masked_val, hist_mask], dim=-1)
-
-    hist_masked = hist_masked.to(device)
+    op_mask = op_mask.to(device)
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
 
-    return hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask
+    return hist, fut, op_mask, hist_nbrs, mask, temporal_mask
+
+
+def compute_batch_ade_fde(pred, target, op_mask=None, unit_conversion=0.3048):
+    metrics = compute_batch_metrics(
+        pred=pred,
+        target=target,
+        op_mask=op_mask,
+        unit_conversion=unit_conversion,
+    )
+    return float(metrics["ade"].item()), float(metrics["fde"].item())
 
 
 class MetricsCalculator:
-    """辅助类：用于累积和计算评估指标 (ADE, FDE, RMSE at timesteps)"""
+    """统一指标累积器（TAME evaluate 同口径）"""
 
     def __init__(self, t_max, device, unit_conversion=0.3048):
         self.t_max = t_max
         self.device = device
         self.unit_conversion = unit_conversion
+        self.acc = TrajectoryMetricsAccumulator(
+            t_max=t_max,
+            device=device,
+            unit_conversion=unit_conversion,
+        )
 
-        self.total_se = torch.zeros(t_max).to(device)
-        self.total_de = torch.zeros(t_max).to(device)
-        self.total_counts = torch.zeros(t_max).to(device)
-        self.total_samples = 0
-        self.total_ade_sum = 0.0
-        self.total_fde_sum = 0.0
-
-    def update(self, pred, target):
-        pred = pred[:, :self.t_max, :2]
-        target = target[:, :self.t_max, :2]
-        B, T, _ = pred.shape
-
-        diff = pred - target
-        dist_sq = torch.sum(diff ** 2, dim=-1)
-        dist = torch.sqrt(dist_sq)
-
-        self.total_se[:T] += torch.sum(dist_sq, dim=0)
-        self.total_de[:T] += torch.sum(dist, dim=0)
-        self.total_counts[:T] += B
-
-        self.total_ade_sum += torch.sum(dist).item()
-        self.total_fde_sum += torch.sum(dist[:, -1]).item()
-        self.total_samples += B
+    def update(self, pred, target, op_mask=None):
+        self.acc.update(pred, target, op_mask=op_mask)
 
     def get_summary(self):
-        counts = self.total_counts.clamp(min=1)
-        rmse_per_step = torch.sqrt(self.total_se / counts) * self.unit_conversion
-        de_avg_per_step = (self.total_de / counts) * self.unit_conversion
+        return self.acc.get_summary()
 
-        overall_ade = 0.0
-        overall_fde = 0.0
-        if self.total_samples > 0:
-            overall_ade = (self.total_ade_sum / (self.total_samples * self.t_max)) * self.unit_conversion
-            overall_fde = (self.total_fde_sum / self.total_samples) * self.unit_conversion
+    def running_ade(self) -> float:
+        return self.acc.running_ade()
 
-        return {
-            'rmse_per_step': rmse_per_step,
-            'de_per_step': de_avg_per_step,
-            'overall_ade': overall_ade,
-            'overall_fde': overall_fde
-        }
+    def running_fde(self) -> float:
+        return self.acc.running_fde()
 
 
 def load_checkpoint(model, resume_arg, default_dir, device, model_name="Model"):
@@ -186,16 +166,32 @@ def get_test_loader(args):
 
     print(f"Loading test data from: {test_path}")
 
-    test_dataset = NgsimDataset(test_path, t_h=30, t_f=50, d_s=2)
+    base_dataset = NgsimDataset(test_path, t_h=30, t_f=50, d_s=2, feature_dim=args.feature_dim)
+    eval_dataset = base_dataset
+    total_samples = len(base_dataset)
+
+    if args.test_ratio < 1.0:
+        subset_size = max(1, int(total_samples * args.test_ratio))
+        generator = torch.Generator()
+        generator.manual_seed(int(args.test_ratio_seed))
+        subset_indices = torch.randperm(total_samples, generator=generator)[:subset_size].tolist()
+        eval_dataset = Subset(base_dataset, subset_indices)
+        print(
+            f"Using test subset: {subset_size}/{total_samples} samples "
+            f"({args.test_ratio * 100:.2f}%), seed={args.test_ratio_seed}"
+        )
+    else:
+        print(f"Using full test set: {total_samples} samples (100.00%)")
+
     test_loader = DataLoader(
-        test_dataset,
+        eval_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        collate_fn=test_dataset.collate_fn,
+        collate_fn=base_dataset.collate_fn,
         pin_memory=True
     )
-    return test_loader
+    return test_loader, total_samples, len(eval_dataset)
 
 
 def print_metrics_table(metrics, name="Model", time_indices=[4, 9, 14, 19, 24],
@@ -204,6 +200,8 @@ def print_metrics_table(metrics, name="Model", time_indices=[4, 9, 14, 19, 24],
     rmse = metrics['rmse_per_step']
     de = metrics['de_per_step']
 
+    if 'overall_mse' in metrics:
+        print(f'Overall MSE: {metrics["overall_mse"]:.4f} m^2')
     print(f'Overall ADE: {metrics["overall_ade"]:.4f} m')
     print(f'Overall FDE: {metrics["overall_fde"]:.4f} m')
     print('-' * 74)
@@ -222,8 +220,6 @@ def print_metrics_table(metrics, name="Model", time_indices=[4, 9, 14, 19, 24],
 
 
 def run_evaluation(args, device):
-    test_loader = get_test_loader(args)
-
     model_hist = None
     model_fut = None
 
@@ -235,8 +231,26 @@ def run_evaluation(args, device):
     else:
         base_ckpt_dir = script_dir / arg_ckpt_path.name
 
+    test_loader, total_samples, selected_samples = get_test_loader(args)
+
     hist_ckpt_dir = base_ckpt_dir / 'hist'
     fut_ckpt_dir = base_ckpt_dir / 'fut'
+
+    if args.save_batch_vis:
+        if args.vis_dir:
+            vis_dir = Path(args.vis_dir)
+            if not vis_dir.is_absolute():
+                vis_dir = script_dir / vis_dir
+        else:
+            vis_dir = base_ckpt_dir / "eval_batch_vis"
+        vis_dir.mkdir(parents=True, exist_ok=True)
+        metrics_csv_path = vis_dir / "batch_metrics.csv"
+        print(f"[VIS] Batch visualization dir: {vis_dir}")
+    else:
+        vis_dir = None
+        metrics_csv_path = None
+
+    print(f"[Eval] Sample coverage: {selected_samples}/{total_samples}")
 
     print("\n[Init] Initializing Fut Model...")
     model_fut = DiffusionFut(args).to(device)
@@ -250,35 +264,102 @@ def run_evaluation(args, device):
     calc_fut = MetricsCalculator(args.T_f, device)
     calc_hist = MetricsCalculator(args.T, device) if args.eval_mode == 'joint' else None
 
-    with torch.no_grad():
-        pbar = tqdm(enumerate(test_loader), total=len(test_loader), desc=f"Testing ({args.eval_mode})", ncols=120)
+    metrics_file = None
+    metrics_writer = None
+    if metrics_csv_path is not None:
+        metrics_file = open(metrics_csv_path, "w", newline="")
+        metrics_writer = csv.writer(metrics_file)
+        metrics_writer.writerow([
+            "batch_idx",
+            "batch_size",
+            "batch_ade_m",
+            "batch_fde_m",
+            "running_ade_m",
+            "running_fde_m",
+            "sample_ade_m",
+            "sample_fde_m",
+            "image_path",
+        ])
 
-        for batch_idx, batch in pbar:
-            hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask = prepare_input_data(
-                batch, args.feature_dim, mask_type='random', mask_prob=0.5, device=device
-            )
+    try:
+        with torch.no_grad():
+            pbar = tqdm(enumerate(test_loader), total=len(test_loader), desc=f"Testing ({args.eval_mode})", ncols=120)
 
-            current_hist_input = hist
-            pred_hist_traj = None
-            if model_hist is not None:
-                _, pred_hist, _, _ = model_hist.forward_eval(hist, hist_masked, device)
-                calc_hist.update(pred_hist[..., :2], hist[..., :2])
+            for batch_idx, batch in pbar:
+                hist, fut, op_mask, hist_nbrs, mask, temporal_mask = prepare_input_data(
+                    batch, args.feature_dim, device=device
+                )
 
-                current_hist_input = pred_hist
-                pred_hist_traj = pred_hist  # 保存下来用于可视化
+                current_hist_input = hist
+                pred_hist_traj = None
+                if model_hist is not None:
+                    hist_mask = random_mask(hist, p=0.5).to(device)
+                    hist_masked = torch.cat([hist * hist_mask, hist_mask], dim=-1)
+                    _, pred_hist, _, _ = model_hist.forward_eval(hist, hist_masked, device)
+                    calc_hist.update(pred_hist[..., :2], hist[..., :2])
 
-            _, pred_fut, _, _ = model_fut.forward_eval(current_hist_input, hist_nbrs, mask, temporal_mask, fut, device)
-            calc_fut.update(pred_fut, fut)
+                    current_hist_input = pred_hist
+                    pred_hist_traj = pred_hist  # 保存下来用于可视化
 
-            # hist_ego_raw = hist.unsqueeze(2)  # [B, T, 1, D]
-            # mask_flat = temporal_mask.view(temporal_mask.size(0), -1, temporal_mask.size(-1))
-            # mask_N_first = mask_flat.unsqueeze(2).expand(-1, -1, hist_ego_raw.size(1), -1)
-            # hist_nbrs_grid = torch.zeros_like(mask_N_first, dtype=hist_nbrs.dtype)
-            # hist_nbrs_grid = hist_nbrs_grid.masked_scatter_(mask_N_first.bool(), hist_nbrs)
-            # hist_nbrs_aligned = hist_nbrs_grid.permute(0, 2, 1, 3).contiguous()  # [B, T, N, D]
-            # full_gt_hist = torch.cat([hist_ego_raw, hist_nbrs_aligned], dim=2)  # [B, T, 1+N, D]
-            #
-            # visualize_batch_trajectories( hist=pred_hist_traj, hist_nbrs=full_gt_hist, future=fut, pred=pred_fut, hist_masked=hist_mask, batch_idx=0)
+                _, pred_fut, _, _ = model_fut.forward_eval(
+                    current_hist_input, hist_nbrs, mask, temporal_mask, fut, device, op_mask=op_mask
+                )
+                calc_fut.update(pred_fut, fut, op_mask=op_mask)
+
+                batch_ade_m, batch_fde_m = compute_batch_ade_fde(
+                    pred_fut, fut, op_mask=op_mask, unit_conversion=calc_fut.unit_conversion
+                )
+                running_ade_m = calc_fut.running_ade()
+                running_fde_m = calc_fut.running_fde()
+
+                pbar.set_postfix({
+                    "batch_ADE(m)": f"{batch_ade_m:.4f}",
+                    "batch_FDE(m)": f"{batch_fde_m:.4f}",
+                    "running_ADE(m)": f"{running_ade_m:.4f}",
+                    "running_FDE(m)": f"{running_fde_m:.4f}",
+                })
+
+                if args.save_batch_vis and vis_dir is not None:
+                    vis_sample_idx = int(args.vis_sample_idx)
+                    if vis_sample_idx < 0 or vis_sample_idx >= pred_fut.shape[0]:
+                        vis_sample_idx = 0
+
+                    vis_title = (
+                        f"Batch {batch_idx:05d} | "
+                        f"ADE {batch_ade_m:.4f}m | FDE {batch_fde_m:.4f}m | "
+                        f"Running ADE {running_ade_m:.4f}m | Running FDE {running_fde_m:.4f}m"
+                    )
+                    vis_file = vis_dir / (
+                        f"batch_{batch_idx:05d}_ade_{batch_ade_m:.4f}_fde_{batch_fde_m:.4f}.png"
+                    )
+                    sample_metrics, saved_file = visualize_hist_nbrs_fut_pred(
+                        hist=pred_hist_traj if pred_hist_traj is not None else current_hist_input,
+                        nbrs=hist_nbrs,
+                        fut=fut,
+                        pred=pred_fut,
+                        op_mask=op_mask,
+                        sample_index=vis_sample_idx,
+                        save_path=str(vis_file),
+                        title_prefix=vis_title,
+                        temporal_mask=temporal_mask,
+                    )
+
+                    if metrics_writer is not None:
+                        metrics_writer.writerow([
+                            batch_idx,
+                            int(pred_fut.shape[0]),
+                            f"{batch_ade_m:.8f}",
+                            f"{batch_fde_m:.8f}",
+                            f"{running_ade_m:.8f}",
+                            f"{running_fde_m:.8f}",
+                            f"{sample_metrics['ade_m']:.8f}",
+                            f"{sample_metrics['fde_m']:.8f}",
+                            str(saved_file) if saved_file is not None else str(vis_file),
+                        ])
+                        metrics_file.flush()
+    finally:
+        if metrics_file is not None:
+            metrics_file.close()
 
     if args.eval_mode == 'joint' and calc_hist:
         hist_metrics = calc_hist.get_summary()
@@ -287,15 +368,30 @@ def run_evaluation(args, device):
 
     fut_metrics = calc_fut.get_summary()
     print_metrics_table(fut_metrics, name="Future Prediction")
+    if metrics_csv_path is not None:
+        print(f"[VIS] Batch metrics saved to: {metrics_csv_path}")
 
 
 def main():
     parser = get_args_parser()
-    parser.add_argument('--eval_mode', type=str, default='joint', choices=['fut_only', 'joint'],
+    parser.add_argument('--eval_mode', type=str, default='fut_only', choices=['fut_only', 'joint'],
                         help="评估模式: 'fut_only' (使用GT历史) 或 'joint' (使用Hist模型输出)")
     parser.add_argument('--test_path', type=str, default=None, help="测试集路径 (可选，覆盖默认)")
+    parser.add_argument('--test_ratio', type=float, default=0.01,
+                        help="测试集采样比例，范围 (0, 1]，例如 0.1 表示使用 10% 测试样本")
+    parser.add_argument('--test_ratio_seed', type=int, default=2026,
+                        help="测试集按比例抽样时的随机种子")
+    parser.add_argument('--save_batch_vis', action=argparse.BooleanOptionalAction, default=True,
+                        help="是否为每个 batch 保存可视化图")
+    parser.add_argument('--vis_dir', type=str, default='',
+                        help="可视化输出目录；为空时默认写入 checkpoint_dir/eval_batch_vis")
+    parser.add_argument('--vis_sample_idx', type=int, default=0,
+                        help="每个 batch 可视化的样本索引")
 
     args = parser.parse_args()
+
+    if args.test_ratio <= 0.0 or args.test_ratio > 1.0:
+        raise ValueError(f"--test_ratio must be in (0, 1], got {args.test_ratio}")
 
     args.batch_size = 512
     args.num_workers = 8
@@ -303,6 +399,8 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     print(f"Evaluation Mode: {args.eval_mode}")
+    print(f"Test Ratio: {args.test_ratio * 100:.2f}%")
+    print(f"Save Batch Visualization: {args.save_batch_vis}")
 
     run_evaluation(args, device)
 

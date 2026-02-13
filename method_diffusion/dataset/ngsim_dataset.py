@@ -7,14 +7,14 @@ import scipy.io as scp
 # Dataset class for the dataset
 class NgsimDataset(Dataset):
 
-    def __init__(self, mat_file, t_h=30, t_f=50, d_s=2, enc_size=64, grid_size=(13, 3)):
+    def __init__(self, mat_file, t_h=30, t_f=50, d_s=2, enc_size=64, grid_size=(13, 3), feature_dim=4):
         self.D = scp.loadmat(mat_file)['traj']
         self.T = scp.loadmat(mat_file)['tracks']
         self.t_h = t_h  #
         self.t_f = t_f  #
         self.d_s = d_s  # skip
         self.enc_size = enc_size  # size of the grid cell
-        self.feature_dim = 4
+        self.feature_dim = feature_dim
         self.grid_size = grid_size  # size of social context grid
         self.alltime = 0
         # self.count = 0

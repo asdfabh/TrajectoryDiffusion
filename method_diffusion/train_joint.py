@@ -14,6 +14,8 @@ from method_diffusion.utils.mask_util import random_mask, continuous_mask
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
+UNIT_CONVERSION = 0.3048
+
 
 def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, device='cuda'):
     hist = batch['hist']
@@ -21,6 +23,7 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
     lane = batch['lane']
     cclass = batch['cclass']
     fut = batch['fut']
+    op_mask = batch['op_mask']
     hist_nbrs = batch['nbrs']
     va_nbrs = batch['nbrs_va']
     lane_nbrs = batch['nbrs_lane']
@@ -41,6 +44,7 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
         hist = hist.to(device)
         hist_nbrs = hist_nbrs.to(device)
     fut = fut.to(device)
+    op_mask = op_mask.to(device)
 
     if mask_type == 'random':
         hist_mask = random_mask(hist, p=mask_prob).to(device)
@@ -56,7 +60,7 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
 
-    return hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask
+    return hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask
 
 
 def train_epoch(model_fut, model_hist, dataloader, optimizer, device, epoch, feature_dim,
@@ -77,7 +81,7 @@ def train_epoch(model_fut, model_hist, dataloader, optimizer, device, epoch, fea
                 desc=f"Epoch {epoch}", ncols=160)
 
     for batch_idx, batch in pbar:
-        hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask = prepare_input_data(
+        hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask = prepare_input_data(
             batch, feature_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
         )
 
@@ -88,7 +92,9 @@ def train_epoch(model_fut, model_hist, dataloader, optimizer, device, epoch, fea
         else:
             loss_h, pred_hist, _, _ = model_hist.forward_train(hist, hist_masked, device)
 
-        loss_f, pred, ade, fde = model_fut.forward_train(pred_hist, hist_nbrs, mask, temporal_mask, fut, device)
+        loss_f, pred, ade, fde = model_fut.forward_train(
+            pred_hist, hist_nbrs, mask, temporal_mask, fut, device, op_mask=op_mask
+        )
 
         loss = loss_f + loss_h
 
@@ -112,8 +118,10 @@ def train_epoch(model_fut, model_hist, dataloader, optimizer, device, epoch, fea
             'L_all': f'{total_loss / num_batches:.4f}',
             'L_hist': f'{total_loss_hist / num_batches:.4f}',
             'L_fut': f'{total_loss_fut / num_batches:.4f}',
-            'ade': f'{ade.mean().item():.2f}',
-            'fde': f'{fde.mean().item():.2f}',
+            'ade_ft': f'{ade.mean().item():.2f}',
+            'fde_ft': f'{fde.mean().item():.2f}',
+            'ade_m': f'{(ade.mean().item() * UNIT_CONVERSION):.2f}',
+            'fde_m': f'{(fde.mean().item() * UNIT_CONVERSION):.2f}',
         })
 
     return total_loss / num_batches
@@ -169,7 +177,7 @@ def main():
 
     data_root = Path(__file__).resolve().parent.parent / '/mnt/datasets/ngsimdata'
     train_path = str(data_root / 'TrainSet.mat')
-    train_dataset = NgsimDataset(train_path, t_h=30, t_f=50, d_s=2)
+    train_dataset = NgsimDataset(train_path, t_h=30, t_f=50, d_s=2, feature_dim=args.feature_dim)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,

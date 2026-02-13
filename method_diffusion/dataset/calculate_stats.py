@@ -34,6 +34,14 @@ def calculate_fast_stats(mat_file_path, num_workers=8, batch_size=1024):
     va_sq_sum = torch.zeros(2, dtype=torch.float64)
     va_count = 0
 
+    # Lane and Class
+    lane_sum = torch.zeros(1, dtype=torch.float64)
+    lane_sq_sum = torch.zeros(1, dtype=torch.float64)
+    lane_count = 0
+    class_sum = torch.zeros(1, dtype=torch.float64)
+    class_sq_sum = torch.zeros(1, dtype=torch.float64)
+    class_count = 0
+
     print("Iterating through batches...")
 
     # 使用 tqdm 显示进度
@@ -47,6 +55,10 @@ def calculate_fast_stats(mat_file_path, num_workers=8, batch_size=1024):
 
         va = batch['va']
         nbrs_va = batch['nbrs_va']
+        lane = batch['lane']
+        nbrs_lane = batch['nbrs_lane']
+        cclass = batch['cclass']
+        nbrs_class = batch['nbrs_class']
 
         current_pos = torch.cat([
             hist.reshape(-1, 2),
@@ -67,6 +79,22 @@ def calculate_fast_stats(mat_file_path, num_workers=8, batch_size=1024):
         va_sq_sum += (current_va ** 2).sum(dim=0)
         va_count += current_va.shape[0]
 
+        current_lane = torch.cat([
+            lane.reshape(-1, 1),
+            nbrs_lane.reshape(-1, 1)
+        ], dim=0).double()
+        lane_sum += current_lane.sum(dim=0)
+        lane_sq_sum += (current_lane ** 2).sum(dim=0)
+        lane_count += current_lane.shape[0]
+
+        current_class = torch.cat([
+            cclass.reshape(-1, 1),
+            nbrs_class.reshape(-1, 1)
+        ], dim=0).double()
+        class_sum += current_class.sum(dim=0)
+        class_sq_sum += (current_class ** 2).sum(dim=0)
+        class_count += current_class.shape[0]
+
     # E[X]
     pos_mean = pos_sum / pos_count
     va_mean = va_sum / va_count
@@ -74,6 +102,10 @@ def calculate_fast_stats(mat_file_path, num_workers=8, batch_size=1024):
     # Std = sqrt( E[X^2] - (E[X])^2 )
     pos_std = torch.sqrt(pos_sq_sum / pos_count - pos_mean ** 2)
     va_std = torch.sqrt(va_sq_sum / va_count - va_mean ** 2)
+    lane_mean = lane_sum / lane_count
+    lane_std = torch.sqrt(lane_sq_sum / lane_count - lane_mean ** 2)
+    class_mean = class_sum / class_count
+    class_std = torch.sqrt(class_sq_sum / class_count - class_mean ** 2)
 
     # 5. 打印结果
     print("\n" + "=" * 50)
@@ -86,16 +118,26 @@ def calculate_fast_stats(mat_file_path, num_workers=8, batch_size=1024):
     print("-" * 30)
     print(f"VA Mean:       {va_mean.tolist()}")
     print(f"VA Std:        {va_std.tolist()}")
+    print("-" * 30)
+    print(f"Lane Mean:     {lane_mean.tolist()}")
+    print(f"Lane Std:      {lane_std.tolist()}")
+    print(f"Class Mean:    {class_mean.tolist()}")
+    print(f"Class Std:     {class_std.tolist()}")
     print("=" * 50)
 
-    print("\n[Copy & Paste] Replace these lines in `fut_model.py` -> `__init__`:")
-    print(
-        f"self.register_buffer('pos_mean', torch.tensor([{pos_mean[0]:.4f}, {pos_mean[1]:.4f}]).float(), persistent=False)")
-    print(
-        f"self.register_buffer('pos_std', torch.tensor([{pos_std[0]:.4f}, {pos_std[1]:.4f}]).float(), persistent=False)")
-    print(
-        f"self.register_buffer('va_mean', torch.tensor([{va_mean[0]:.4f}, {va_mean[1]:.4f}]).float(), persistent=False)")
-    print(f"self.register_buffer('va_std', torch.tensor([{va_std[0]:.4f}, {va_std[1]:.4f}]).float(), persistent=False)")
+    save_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ngsim_stats.npz")
+    np.savez(
+        save_path,
+        pos_mean=pos_mean.cpu().numpy().astype(np.float32),
+        pos_std=pos_std.cpu().numpy().astype(np.float32),
+        va_mean=va_mean.cpu().numpy().astype(np.float32),
+        va_std=va_std.cpu().numpy().astype(np.float32),
+        lane_mean=lane_mean.cpu().numpy().astype(np.float32),
+        lane_std=lane_std.cpu().numpy().astype(np.float32),
+        class_mean=class_mean.cpu().numpy().astype(np.float32),
+        class_std=class_std.cpu().numpy().astype(np.float32),
+    )
+    print(f"\nSaved stats to: {save_path}")
 
 
 if __name__ == "__main__":

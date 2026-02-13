@@ -13,6 +13,7 @@ from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.config import get_args_parser
 from method_diffusion.utils.mask_util import random_mask, continuous_mask
+from method_diffusion.utils.traj_metrics import TrajectoryMetricsAccumulator
 
 
 def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.5, device='cuda'):
@@ -141,11 +142,9 @@ def main():
     obs_count = 0
     masked_mse_sum = 0.0
     masked_count = 0
-    total_ade = 0.0
-    total_fde = 0.0
-    total_traj_count = 0
 
     UNIT_CONVERSION = 0.3048
+    traj_acc = TrajectoryMetricsAccumulator(args.T, device=device, unit_conversion=UNIT_CONVERSION)
 
     with torch.no_grad():
         pbar = tqdm(enumerate(test_loader), total=len(test_loader), desc="Eval Hist", ncols=120)
@@ -155,10 +154,11 @@ def main():
                 batch, args.feature_dim, mask_type='random', mask_prob=EVAL_MASK_PROB, device=device
             )
 
-            _, pred, ade, fde = model.forward_eval(hist, hist_masked, device)
+            _, pred, _, _ = model.forward_eval(hist, hist_masked, device)
 
             pred_pos = pred[..., :2]
             target_pos = hist[..., :2]
+            traj_acc.update(pred_pos, target_pos, op_mask=None)
 
             diff_sq = (pred_pos - target_pos) ** 2
 
@@ -179,11 +179,6 @@ def main():
             masked_mse_sum += masked_diff_sq.sum().item()
             masked_count += inv_mask.sum().item()
 
-            current_bs = hist.shape[0]
-            total_ade += ade.item() * current_bs
-            total_fde += fde.item() * current_bs
-            total_traj_count += current_bs
-
     def safe_div(a, b):
         return a / b if b > 0 else 0.0
 
@@ -200,8 +195,9 @@ def main():
     rmse_m_obs = np.sqrt(mse_m_obs)
     rmse_m_masked = np.sqrt(mse_m_masked)
 
-    ade_m = (total_ade / total_traj_count) * UNIT_CONVERSION
-    fde_m = (total_fde / total_traj_count) * UNIT_CONVERSION
+    traj_summary = traj_acc.get_summary()
+    ade_m = traj_summary["overall_ade"]
+    fde_m = traj_summary["overall_fde"]
 
     print('\n' + '=' * 30 + ' Hist Reconstruction Results ' + '=' * 30)
     print(f"Mask Probability (Keep Ratio): {EVAL_MASK_PROB}")
