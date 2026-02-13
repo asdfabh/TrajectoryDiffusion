@@ -40,13 +40,13 @@ def get_args_parser():
     parser.add_argument('--network', default='highwaynet', type=str, help="Activation function in the transformer encoder: relu or None")
 
     # 训练参数
-    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--batch_size', type=int, default=512)
     parser.add_argument('--num_epochs', type=int, default=50)
     parser.add_argument('--num_workers', type=int, default=10)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--save_interval', type=int, default=5)
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints') #/home/lq/MaDiff/method_diffusion/checkpoints
-    parser.add_argument('--resume_fut', default='epoch15', type=str, help="none/latest/best/或直接给定checkpoint路径")
+    parser.add_argument('--resume_fut', default='none', type=str, help="none/latest/best/或直接给定checkpoint路径")
     parser.add_argument('--resume_hist', default='best', type=str, help="none/latest/best/或直接给定checkpoint路径")
     parser.add_argument('--mask_prob', type=float, default=0.4, help="历史轨迹随机掩码概率")
     parser.add_argument('--data_root', type=str, default='/mnt/datasets/ngsimdata', help="数据集根目录")

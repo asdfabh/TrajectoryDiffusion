@@ -177,17 +177,17 @@ class DiffusionFut(nn.Module):
 
         ade, fde = self._compute_ade_fde(pred, future, op_mask=op_mask)
 
-        visualize_hist_nbrs_fut_pred(
-            hist=hist,
-            nbrs=hist_nbrs,
-            fut=future,
-            pred=pred,
-            op_mask=op_mask,
-            sample_index=0,
-            save_path=None,  # always show
-            title_prefix="fut_model.forward_train",
-            temporal_mask=temporal_mask,
-        )
+        # visualize_hist_nbrs_fut_pred(
+        #     hist=hist,
+        #     nbrs=hist_nbrs,
+        #     fut=future,
+        #     pred=pred,
+        #     op_mask=op_mask,
+        #     sample_index=0,
+        #     save_path=None,  # always show
+        #     title_prefix="fut_model.forward_train",
+        #     temporal_mask=temporal_mask,
+        # )
         return loss, pred, ade, fde
 
     @torch.no_grad()
@@ -219,17 +219,17 @@ class DiffusionFut(nn.Module):
         loss = self.compute_motion_loss(x_t, future_norm, op_mask=op_mask)
         ade, fde = self._compute_ade_fde(pred, future, op_mask=op_mask)
 
-        visualize_hist_nbrs_fut_pred(
-            hist=hist,
-            nbrs=hist_nbrs,
-            fut=future,
-            pred=pred,
-            op_mask=op_mask,
-            sample_index=0,
-            save_path=None,  # always show
-            title_prefix="fut_model.forward_eval",
-            temporal_mask=temporal_mask,
-        )
+        # visualize_hist_nbrs_fut_pred(
+        #     hist=hist,
+        #     nbrs=hist_nbrs,
+        #     fut=future,
+        #     pred=pred,
+        #     op_mask=op_mask,
+        #     sample_index=0,
+        #     save_path=None,  # always show
+        #     title_prefix="fut_model.forward_eval",
+        #     temporal_mask=temporal_mask,
+        # )
         return loss, pred, ade, fde
 
     def forward(self, hist, hist_nbrs, mask, temporal_mask, future, device, op_mask=None):
