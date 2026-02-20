@@ -77,8 +77,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim,
             batch, feature_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
         )
 
-        loss, pred, ade, fde = model.forward_train(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
-        # _, _, _, _ = model.forward_eval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+        loss, pred, ade, fde = model.forwardTrain(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
 
         optimizer.zero_grad()
         loss.backward()
@@ -131,7 +130,7 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim,
         hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask = prepare_input_data(
             batch, feature_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
         )
-        eval_loss, _, eval_ade, eval_fde = model.forward_eval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+        eval_loss, _, eval_ade, eval_fde = model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
 
         total_loss += eval_loss.item()
         total_ade += eval_ade.item()
@@ -207,7 +206,15 @@ def main():
     )
     print(
         f"[FutModel] Train consistency: unroll_weight={args.train_unroll_weight}, "
-        f"t_align_ratio={args.train_timestep_align_ratio}"
+        f"t_align_ratio={args.train_timestep_align_ratio}, "
+        f"unroll_detach_x0={args.train_unroll_detach_x0}, "
+        f"self_condition_prob={args.self_condition_prob}"
+    )
+    print(
+        f"[FutModel] Loss config: mode={args.fut_loss_mode}, "
+        f"time_weight=({args.fut_time_weight_min},{args.fut_time_weight_max}), "
+        f"w_pos={args.fut_loss_pos_weight}, w_vel={args.fut_loss_vel_weight}, "
+        f"legacy_pos={args.fut_pos_loss_type}(delta={args.fut_huber_delta})"
     )
     print(
         f"[FutModel] TestSet eval sampling: eval_ratio={args.eval_ratio}, "

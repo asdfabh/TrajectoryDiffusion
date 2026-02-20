@@ -90,7 +90,7 @@ def train_epoch(model_fut, model_hist, dataloader, optimizer, device, epoch, fea
         else:
             loss_h, pred_hist, _, _ = model_hist.forward_train(hist, hist_masked, device)
 
-        loss_f, pred, ade, fde = model_fut.forward_train(pred_hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+        loss_f, pred, ade, fde = model_fut.forwardTrain(pred_hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
 
         loss = loss_f + loss_h
 

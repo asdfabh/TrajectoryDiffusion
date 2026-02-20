@@ -205,6 +205,17 @@ def main():
 
     if rank == 0:
         Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        print(
+            f"[FutModel] Consistency train: unroll_weight={args.train_unroll_weight}, "
+            f"t_align_ratio={args.train_timestep_align_ratio}, "
+            f"unroll_detach_x0={args.train_unroll_detach_x0}, "
+            f"self_condition_prob={args.self_condition_prob}"
+        )
+        print(
+            f"[FutModel] Loss config: pos={args.fut_pos_loss_type}(delta={args.fut_huber_delta}), "
+            f"mode={args.fut_loss_mode}, time_weight=({args.fut_time_weight_min},{args.fut_time_weight_max}), "
+            f"w_pos={args.fut_loss_pos_weight}, w_vel={args.fut_loss_vel_weight}"
+        )
 
     # Use args.data_root
     data_root = Path(args.data_root)
@@ -275,9 +286,10 @@ def main():
         scheduler.step()
 
         if rank == 0:
+            model_state = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
             state = {
                 'epoch': epoch + 1,
-                'model_state_dict': model.module.state_dict(),
+                'model_state_dict': model_state,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': avg_loss,

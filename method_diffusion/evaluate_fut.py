@@ -281,6 +281,42 @@ def compute_batch_metrics(pred, target, op_mask, meter_per_unit=0.3048):
     }
 
 
+def compute_single_vis_metrics(pred, target, op_mask, batch_idx=0, meter_per_unit=0.3048):
+    """
+    针对单条可视化轨迹计算 ADE/FDE，并输出 GT/Pred End Point（坐标+index）。
+    """
+    b = max(0, min(int(batch_idx), pred.size(0) - 1))
+    pred_xy = pred[b, :, :2]
+    target_xy = target[b, :, :2]
+
+    valid_mask = op_mask[b]
+    if valid_mask.dim() == 2:
+        valid_mask = valid_mask[:, 0]
+    valid_mask = (valid_mask > 0.5).float().to(pred_xy.device)
+
+    dist = torch.norm(pred_xy - target_xy, dim=-1)
+    ade_ft = (dist * valid_mask).sum() / (valid_mask.sum() + 1e-6)
+
+    valid_ids = torch.where(valid_mask > 0.5)[0]
+    last_idx = int(valid_ids[-1].item()) if valid_ids.numel() > 0 else int(pred_xy.shape[0] - 1)
+    fde_ft = dist[last_idx]
+
+    gt_end = target_xy[last_idx]
+    pred_end = pred_xy[last_idx]
+
+    return {
+        "ade_ft": float(ade_ft.item()),
+        "fde_ft": float(fde_ft.item()),
+        "ade_m": float(ade_ft.item() * meter_per_unit),
+        "fde_m": float(fde_ft.item() * meter_per_unit),
+        "end_index": last_idx,
+        "gt_end_ft": (float(gt_end[1].item()), float(gt_end[0].item())),
+        "pred_end_ft": (float(pred_end[1].item()), float(pred_end[0].item())),
+        "gt_end_m": (float(gt_end[1].item() * meter_per_unit), float(gt_end[0].item() * meter_per_unit)),
+        "pred_end_m": (float(pred_end[1].item() * meter_per_unit), float(pred_end[0].item() * meter_per_unit)),
+    }
+
+
 def run_evaluation(args, device):
     test_loader = get_test_loader(args)
     total_test_batches = len(test_loader)
@@ -350,22 +386,27 @@ def run_evaluation(args, device):
                 calc_hist.update(pred_hist[..., :2], hist[..., :2], valid_mask=torch.ones_like(hist[..., 0]))
                 current_hist_input = pred_hist
 
-            _, pred_fut, _, _ = model_fut.forward_eval(current_hist_input, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+            _, pred_fut, _, _ = model_fut.forwardEval(current_hist_input, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
             calc_fut.update(pred_fut, fut, valid_mask=op_mask)
 
             if visualized_count < args.visualize_samples:
                 batch_metrics = compute_batch_metrics(pred_fut, fut, op_mask)
+                vis_metrics = compute_single_vis_metrics(pred_fut, fut, op_mask, batch_idx=0)
                 running_summary = calc_fut.get_summary()
                 running_metrics = {
                     "ADE (running)": {"m": running_summary["overall_ade_m"], "ft": running_summary["overall_ade_ft"]},
                     "FDE (running)": {"m": running_summary["overall_fde_m"], "ft": running_summary["overall_fde_ft"]},
                 }
-                metrics_for_plot = {**batch_metrics, **running_metrics}
+                traj_metrics = {
+                    "ADE (vis traj)": {"m": vis_metrics["ade_m"], "ft": vis_metrics["ade_ft"]},
+                    "FDE (vis traj)": {"m": vis_metrics["fde_m"], "ft": vis_metrics["fde_ft"]},
+                }
+                metrics_for_plot = {**traj_metrics, **batch_metrics, **running_metrics}
                 save_path = None
                 if visualize_dir is not None:
                     save_path = visualize_dir / f"eval_{args.eval_mode}_batch{batch_idx}_sample0.png"
 
-                visualize_batch_trajectories(
+                vis_info = visualize_batch_trajectories(
                     hist=current_hist_input,
                     hist_nbrs=None,
                     future=fut,
@@ -377,6 +418,21 @@ def run_evaluation(args, device):
                     input_unit='ft',
                     show_plot=args.show_plots
                 )
+                fut_end = vis_info.get("fut_last") if isinstance(vis_info, dict) else None
+                pred_end = vis_info.get("pred_last") if isinstance(vis_info, dict) else None
+
+                print(
+                    f"[Vis][batch={batch_idx}, sample=0] "
+                    f"ADE={vis_metrics['ade_ft']:.4f} ft ({vis_metrics['ade_m']:.4f} m), "
+                    f"FDE={vis_metrics['fde_ft']:.4f} ft ({vis_metrics['fde_m']:.4f} m)"
+                )
+                if fut_end and pred_end:
+                    print(
+                        f"[Vis][EndPoint idx={vis_metrics['end_index']}] "
+                        f"GT(ft)={fut_end['coord']} | Pred(ft)={pred_end['coord']} | "
+                        f"GT(m)=({vis_metrics['gt_end_m'][0]:.3f}, {vis_metrics['gt_end_m'][1]:.3f}) | "
+                        f"Pred(m)=({vis_metrics['pred_end_m'][0]:.3f}, {vis_metrics['pred_end_m'][1]:.3f})"
+                    )
                 visualized_count += 1
 
     if args.eval_mode == 'joint' and calc_hist:
