@@ -40,17 +40,30 @@ def get_args_parser():
     parser.add_argument('--network', default='highwaynet', type=str, help="Activation function in the transformer encoder: relu or None")
 
     # 训练参数
-    parser.add_argument('--batch_size', type=int, default=1024)
+    parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--num_epochs', type=int, default=50)
     parser.add_argument('--num_workers', type=int, default=10)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--save_interval', type=int, default=5)
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints') #/home/lq/MaDiff/method_diffusion/checkpoints
-    parser.add_argument('--resume_fut', default='none', type=str, help="none/latest/best/或直接给定checkpoint路径")
+    parser.add_argument('--resume_fut', default='epoch10', type=str, help="none/latest/best/或直接给定checkpoint路径")
     parser.add_argument('--resume_hist', default='best', type=str, help="none/latest/best/或直接给定checkpoint路径")
     parser.add_argument('--mask_prob', type=float, default=0.4, help="历史轨迹随机掩码概率")
     parser.add_argument('--data_root', type=str, default='/mnt/datasets/ngsimdata', help="数据集根目录")
-    parser.add_argument('--num_inference_steps', type=int, default=30, help="DDIM推理步数")
+    parser.add_argument('--num_inference_steps', type=int, default=20, help="DDIM推理步数")
+    parser.add_argument('--inference_timestep_spacing', type=str, default='trailing',
+                        choices=['leading', 'trailing'], help="DDIM推理时间步采样策略")
+    parser.add_argument('--ddim_eta', type=float, default=0.0, help="DDIM采样随机性参数eta")
+    parser.add_argument('--x0_clip', type=float, default=5.0,
+                        help="推理时对归一化pred_x0进行裁剪，<=0表示不裁剪")
+    parser.add_argument('--train_unroll_weight', type=float, default=0.4,
+                        help="2-step一致性训练损失权重，<=0表示关闭")
+    parser.add_argument('--train_timestep_align_ratio', type=float, default=0.7,
+                        help="训练t采样对齐推理步点的比例，0~1")
+    parser.add_argument('--eval_ratio', type=float, default=0.1,
+                        help="训练过程中的推理评估比例，默认0.1表示评估10% TestSet")
+    parser.add_argument('--eval_max_batches', type=int, default=0,
+                        help="训练过程中的推理评估最多使用的batch数，0表示不额外限制")
     parser.add_argument('--num_samples', type=int, default=5, help="evaluate_test 随机抽样的样本数量")
     parser.add_argument('--sample_ids', type=str, default='', help="逗号分隔的样本索引列表，设置后覆盖 num_samples")
     parser.add_argument('--sample_seed', type=int, default=None, help="随机抽样时使用的随机种子")

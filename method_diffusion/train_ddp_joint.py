@@ -32,7 +32,8 @@ def setup_ddp():
 
 
 def cleanup_ddp():
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def reduce_value(value, average=True):
@@ -51,6 +52,7 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
     lane = batch['lane']
     cclass = batch['cclass']
     fut = batch['fut']
+    op_mask = batch['op_mask']
     hist_nbrs = batch['nbrs']
     va_nbrs = batch['nbrs_va']
     lane_nbrs = batch['nbrs_lane']
@@ -71,6 +73,7 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
         hist = hist.to(device)
         hist_nbrs = hist_nbrs.to(device)
     fut = fut.to(device)
+    op_mask = op_mask.to(device)
 
     if mask_type == 'random':
         hist_mask = random_mask(hist, p=mask_prob).to(device)
@@ -85,7 +88,7 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
     hist_masked = hist_masked.to(device)
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
-    return hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask
+    return hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask
 
 
 def train_epoch(model_fut, model_hist, dataloader, optimizer, device, epoch, feature_dim, rank,
@@ -105,7 +108,7 @@ def train_epoch(model_fut, model_hist, dataloader, optimizer, device, epoch, fea
         pbar = enumerate(dataloader)
 
     for batch_idx, batch in pbar:
-        hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask = prepare_input_data(
+        hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask = prepare_input_data(
             batch, feature_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
         )
 
@@ -117,7 +120,7 @@ def train_epoch(model_fut, model_hist, dataloader, optimizer, device, epoch, fea
         else:
             loss_h, pred_hist_clean, _, _ = model_hist(hist, hist_masked, device)
 
-        loss_f, pred, ade, fde = model_fut(pred_hist_clean, hist_nbrs, mask, temporal_mask, fut, device)
+        loss_f, pred, ade, fde = model_fut(pred_hist_clean, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
 
         loss = loss_f + loss_h
 
@@ -132,8 +135,11 @@ def train_epoch(model_fut, model_hist, dataloader, optimizer, device, epoch, fea
 
         with torch.no_grad():
             curr_loss = torch.tensor(loss.item(), device=device)
-            dist.all_reduce(curr_loss)
-            total_loss += curr_loss.item() / dist.get_world_size()
+            if dist.is_initialized():
+                dist.all_reduce(curr_loss)
+                total_loss += curr_loss.item() / dist.get_world_size()
+            else:
+                total_loss += curr_loss.item()
 
         num_batches += 1
 
@@ -211,9 +217,16 @@ def main():
         hist_ckpt_dir.mkdir(parents=True, exist_ok=True)
         fut_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    data_root = Path(__file__).resolve().parent.parent / '/mnt/datasets/ngsimdata'
+    data_root = Path(args.data_root)
     train_path = str(data_root / 'TrainSet.mat')
-    train_dataset = NgsimDataset(train_path, t_h=30, t_f=50, d_s=2)
+    train_dataset = NgsimDataset(
+        train_path,
+        t_h=30,
+        t_f=50,
+        d_s=2,
+        enc_size=args.encoder_input_dim,
+        feature_dim=args.feature_dim
+    )
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     train_loader = DataLoader(
@@ -259,7 +272,7 @@ def main():
 
         avg_loss = train_epoch(
             model_fut, model_hist, train_loader, optimizer, device, epoch + 1,
-            args.feature_dim, rank, freeze_hist=freeze_hist
+            args.feature_dim, rank, mask_type='random', mask_prob=args.mask_prob, freeze_hist=freeze_hist
         )
 
         if rank == 0:

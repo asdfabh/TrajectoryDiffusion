@@ -32,7 +32,8 @@ def setup_ddp():
 
 
 def cleanup_ddp():
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def reduce_value(value, average=True):
@@ -55,6 +56,7 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
     lane = batch['lane']  # [B, T, 1]
     cclass = batch['cclass']  # [B, T, 1]
     fut = batch['fut']  # [B, T, 2]
+    op_mask = batch['op_mask']  # [B, T, 2]
     hist_nbrs = batch['nbrs']  # [B, N, T, 2]
     va_nbrs = batch['nbrs_va']  # [B, N, T, 2]
     lane_nbrs = batch['nbrs_lane']  # [B, N, T, 1]
@@ -77,6 +79,7 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
         hist = hist.to(device)
         hist_nbrs = hist_nbrs.to(device)
     fut = fut.to(device)
+    op_mask = op_mask.to(device)
 
     # 生成掩码并应用掩码
     if mask_type == 'random':
@@ -93,7 +96,7 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
 
-    return hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask
+    return hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask
 
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, mask_type='random', mask_prob=0.4):
     model.train()
@@ -107,12 +110,12 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, 
         pbar = enumerate(dataloader)
 
     for batch_idx, batch in pbar:
-        hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask = prepare_input_data(
+        hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask = prepare_input_data(
             batch, feature_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
         )
 
         # loss, pred, ade, fde = model(hist, hist_masked, device)
-        loss, pred, ade, fde = model(hist, hist_nbrs, mask, temporal_mask, fut, device)
+        loss, pred, ade, fde = model(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
 
         # Backward
         optimizer.zero_grad()
@@ -139,22 +142,22 @@ def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, rank):
     best_loss = float('inf')
     ckpt_path = None
 
-    if args.resume == 'latest':
+    if args.resume_fut == 'latest':
         ckpts = sorted(Path(args.checkpoint_dir).glob('checkpoint_epoch_*.pth'))
         if ckpts:
             ckpt_path = ckpts[-1]
-    elif args.resume == 'best':
+    elif args.resume_fut == 'best':
         best_candidate = Path(args.checkpoint_dir) / 'checkpoint_best.pth'
         if best_candidate.exists():
             ckpt_path = best_candidate
-    elif args.resume.startswith('epoch'):
+    elif args.resume_fut.startswith('epoch'):
         try:
-            epoch_num = int(args.resume.replace('epoch', ''))
+            epoch_num = int(args.resume_fut.replace('epoch', ''))
             ckpt_path = Path(args.checkpoint_dir) / f'checkpoint_epoch_{epoch_num}.pth'
         except ValueError:
             pass
-    elif args.resume not in ('none', ''):
-        ckpt_path = Path(args.resume)
+    elif args.resume_fut not in ('none', ''):
+        ckpt_path = Path(args.resume_fut)
 
     if ckpt_path and ckpt_path.exists():
         state = torch.load(ckpt_path, map_location=device)
@@ -207,7 +210,14 @@ def main():
     data_root = Path(args.data_root)
     train_path = str(data_root / 'TrainSet.mat')
 
-    train_dataset = NgsimDataset(train_path, t_h=30, t_f=50, d_s=2)
+    train_dataset = NgsimDataset(
+        train_path,
+        t_h=30,
+        t_f=50,
+        d_s=2,
+        enc_size=args.encoder_input_dim,
+        feature_dim=args.feature_dim
+    )
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
 
@@ -291,4 +301,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

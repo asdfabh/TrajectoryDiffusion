@@ -6,6 +6,16 @@
   <component name="ChangeListManager">
     <list default="true" id="33e7b0c1-d9c2-4783-9b67-1ac6f3badff6" name="更改" comment="&quot;fix a bug&quot;">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/method_diffusion/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/method_diffusion/config.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/method_diffusion/dataset/ngsim_dataset.py" beforeDir="false" afterPath="$PROJECT_DIR$/method_diffusion/dataset/ngsim_dataset.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/method_diffusion/evaluate_fut.py" beforeDir="false" afterPath="$PROJECT_DIR$/method_diffusion/evaluate_fut.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/method_diffusion/models/fut_model.py" beforeDir="false" afterPath="$PROJECT_DIR$/method_diffusion/models/fut_model.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/method_diffusion/models/hist_encoder.py" beforeDir="false" afterPath="$PROJECT_DIR$/method_diffusion/models/hist_encoder.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/method_diffusion/train_ddp_fut.py" beforeDir="false" afterPath="$PROJECT_DIR$/method_diffusion/train_ddp_fut.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/method_diffusion/train_ddp_joint.py" beforeDir="false" afterPath="$PROJECT_DIR$/method_diffusion/train_ddp_joint.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/method_diffusion/train_fut.py" beforeDir="false" afterPath="$PROJECT_DIR$/method_diffusion/train_fut.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/method_diffusion/train_joint.py" beforeDir="false" afterPath="$PROJECT_DIR$/method_diffusion/train_joint.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/method_diffusion/utils/visualization.py" beforeDir="false" afterPath="$PROJECT_DIR$/method_diffusion/utils/visualization.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -35,20 +45,95 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;ASKED_SHARE_PROJECT_CONFIGURATION_FILES&quot;: &quot;true&quot;,
-    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
-    &quot;Python.train.executor&quot;: &quot;Run&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
-    &quot;last_opened_file_path&quot;: &quot;/home/ye/Project/Predict/TrajectoryDiffusion&quot;,
-    &quot;settings.editor.selected.configurable&quot;: &quot;preferences.lookFeel&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "ASKED_SHARE_PROJECT_CONFIGURATION_FILES": "true",
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "Python.evaluate_fut.executor": "Run",
+    "Python.fut_model.executor": "Run",
+    "Python.test_fut_diffusion_diagnostics.executor": "Run",
+    "Python.train.executor": "Run",
+    "Python.train_fut.executor": "Run",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "git-widget-placeholder": "single-module",
+    "last_opened_file_path": "/home/ye/Project/WorkSpace/TrajectoryDiffusion",
+    "settings.editor.selected.configurable": "preferences.lookFeel"
   }
-}</component>
-  <component name="RunManager">
+}]]></component>
+  <component name="RecentsManager">
+    <key name="MoveFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$/scripts" />
+    </key>
+  </component>
+  <component name="RunManager" selected="Python.evaluate_fut">
+    <configuration name="evaluate_fut" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+      <module name="TrajectoryDiffusion" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/method_diffusion" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/method_diffusion/evaluate_fut.py" />
+      <option name="PARAMETERS" value="" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="fut_model" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+      <module name="TrajectoryDiffusion" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/method_diffusion/models" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/method_diffusion/models/fut_model.py" />
+      <option name="PARAMETERS" value="" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="test_fut_diffusion_diagnostics" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+      <module name="TrajectoryDiffusion" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/method_diffusion" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/scripts/test_fut_diffusion_diagnostics.py" />
+      <option name="PARAMETERS" value="" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
     <configuration name="train" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
       <module name="TrajectoryDiffusion" />
       <option name="ENV_FILES" value="" />
@@ -71,9 +156,35 @@
       <option name="INPUT_FILE" value="" />
       <method v="2" />
     </configuration>
+    <configuration name="train_fut" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+      <module name="TrajectoryDiffusion" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/method_diffusion" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/method_diffusion/train_fut.py" />
+      <option name="PARAMETERS" value="" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
     <recent_temporary>
       <list>
+        <item itemvalue="Python.evaluate_fut" />
+        <item itemvalue="Python.train_fut" />
+        <item itemvalue="Python.test_fut_diffusion_diagnostics" />
         <item itemvalue="Python.train" />
+        <item itemvalue="Python.fut_model" />
       </list>
     </recent_temporary>
   </component>

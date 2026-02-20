@@ -1,5 +1,6 @@
 import sys
 import os
+import math
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
@@ -18,6 +19,7 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
     lane = batch['lane']  # [B, T, 1]
     cclass = batch['cclass']  # [B, T, 1]
     fut = batch['fut']  # [B, T, 2]
+    op_mask = batch['op_mask']  # [B, T, 2]
     hist_nbrs = batch['nbrs']  # [B, N, T, 2]
     va_nbrs = batch['nbrs_va']  # [B, N, T, 2]
     lane_nbrs = batch['nbrs_lane']  # [B, N, T, 1]
@@ -40,6 +42,7 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
         hist = hist.to(device)
         hist_nbrs = hist_nbrs.to(device)
     fut = fut.to(device)
+    op_mask = op_mask.to(device)
 
     # 生成掩码并应用掩码
     if mask_type == 'random':
@@ -56,7 +59,7 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
 
-    return hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask
+    return hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask
 
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim,
                 mask_type='random', mask_prob=0.4):
@@ -70,12 +73,12 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim,
 
 
     for batch_idx, batch in pbar:
-        hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask = prepare_input_data(
+        hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask = prepare_input_data(
             batch, feature_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
         )
 
-        loss, pred, ade, fde = model.forward_train(hist, hist_nbrs, mask, temporal_mask, fut, device)
-        # _, _, _, _ = model.forward_eval(hist, hist_nbrs, mask, temporal_mask, fut, device)
+        loss, pred, ade, fde = model.forward_train(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+        # _, _, _, _ = model.forward_eval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
 
         optimizer.zero_grad()
         loss.backward()
@@ -92,18 +95,60 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim,
             'fde': f'{fde.mean().item():.4f}',
         })
 
-    avg_loss = total_loss / num_batches
+    return total_loss / num_batches
 
+
+@torch.no_grad()
+def evaluate_on_testset(model, dataloader, device, epoch, feature_dim,
+                        mask_type='random', mask_prob=0.4, eval_ratio=0.1, max_batches=0):
     model.eval()
-    with torch.no_grad():
-        hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask = prepare_input_data(
+    total_loss = 0.0
+    total_ade = 0.0
+    total_fde = 0.0
+    num_batches = 0
+
+    total_batches = len(dataloader)
+    if total_batches == 0:
+        model.train()
+        return 0.0, 0.0, 0.0
+
+    target_batches = total_batches
+    if eval_ratio > 0:
+        target_batches = max(1, int(math.ceil(total_batches * float(eval_ratio))))
+    if max_batches > 0:
+        target_batches = min(target_batches, int(max_batches))
+
+    pbar = tqdm(
+        enumerate(dataloader),
+        total=target_batches,
+        desc=f"Eval(TestSet) Ep{epoch}",
+        ncols=150
+    )
+    for batch_idx, batch in pbar:
+        if batch_idx >= target_batches:
+            break
+
+        hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask = prepare_input_data(
             batch, feature_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
         )
-        eval_loss, eval_pred, eval_ade, eval_fde = model.forward_eval(hist, hist_nbrs, mask, temporal_mask, fut, device)
-        print(f"EVAL at Epoch {epoch}: ADE: {eval_ade:.4f}, FDE: {eval_fde:.4f}")
+        eval_loss, _, eval_ade, eval_fde = model.forward_eval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+
+        total_loss += eval_loss.item()
+        total_ade += eval_ade.item()
+        total_fde += eval_fde.item()
+        num_batches += 1
+
+        pbar.set_postfix({
+            'eval_loss': f'{eval_loss.item():.8f}',
+            'avg_ade': f'{(total_ade/num_batches):.4f}',
+            'avg_fde': f'{(total_fde/num_batches):.4f}',
+        })
+
     model.train()
 
-    return avg_loss
+    if num_batches == 0:
+        return 0.0, 0.0, 0.0
+    return total_loss / num_batches, total_ade / num_batches, total_fde / num_batches
 
 
 def load_checkpoint_if_needed(args, model, optimizer, scheduler, device):
@@ -156,11 +201,30 @@ def main():
     writer = SummaryWriter(log_dir=str(log_dir))
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(
+        f"[FutModel] Inference sampler for eval: steps={args.num_inference_steps}, "
+        f"spacing={args.inference_timestep_spacing}, eta={args.ddim_eta}, x0_clip={args.x0_clip}"
+    )
+    print(
+        f"[FutModel] Train consistency: unroll_weight={args.train_unroll_weight}, "
+        f"t_align_ratio={args.train_timestep_align_ratio}"
+    )
+    print(
+        f"[FutModel] TestSet eval sampling: eval_ratio={args.eval_ratio}, "
+        f"eval_max_batches={args.eval_max_batches}"
+    )
 
-    data_root = Path(__file__).resolve().parent.parent / '/mnt/datasets/ngsimdata'
+    data_root = Path(args.data_root)
     train_path = str(data_root / 'TrainSet.mat')
 
-    train_dataset = NgsimDataset(train_path, t_h=30, t_f=50, d_s=2)
+    train_dataset = NgsimDataset(
+        train_path,
+        t_h=30,
+        t_f=50,
+        d_s=2,
+        enc_size=args.encoder_input_dim,
+        feature_dim=args.feature_dim
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -168,8 +232,28 @@ def main():
         num_workers=args.num_workers,
         collate_fn=train_dataset.collate_fn,
         pin_memory=True,
-        persistent_workers=True,
+        persistent_workers=args.num_workers > 0,
         drop_last=True
+    )
+
+    test_path = str(data_root / 'TestSet.mat')
+    test_dataset = NgsimDataset(
+        test_path,
+        t_h=30,
+        t_f=50,
+        d_s=2,
+        enc_size=args.encoder_input_dim,
+        feature_dim=args.feature_dim
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=test_dataset.collate_fn,
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+        drop_last=False
     )
 
     model = DiffusionFut(args).to(device)
@@ -192,16 +276,25 @@ def main():
         print(f"\n========== Epoch {epoch + 1}/{args.num_epochs} ==========")
 
         mask_type = 'random' # Can be 'block'
-        mask_prob = 0.5
+        mask_prob = args.mask_prob
 
         avg_loss = train_epoch(
             model, train_loader, optimizer, device, epoch + 1,
             args.feature_dim, mask_type=mask_type, mask_prob=mask_prob
         )
+        eval_loss, eval_ade, eval_fde = evaluate_on_testset(
+            model, test_loader, device, epoch + 1, args.feature_dim,
+            mask_type=mask_type, mask_prob=mask_prob,
+            eval_ratio=args.eval_ratio, max_batches=args.eval_max_batches
+        )
 
         print(f"Epoch [{epoch + 1}] Average Loss: {avg_loss:.4f}")
+        print(f"TestSet Eval [{epoch + 1}] Loss: {eval_loss:.4f}, ADE: {eval_ade:.4f}, FDE: {eval_fde:.4f}")
 
         writer.add_scalar('Train/Loss', avg_loss, epoch + 1)
+        writer.add_scalar('Eval/Loss', eval_loss, epoch + 1)
+        writer.add_scalar('Eval/ADE', eval_ade, epoch + 1)
+        writer.add_scalar('Eval/FDE', eval_fde, epoch + 1)
         current_lr = optimizer.param_groups[0]['lr']
         writer.add_scalar('Train/LR', current_lr, epoch + 1)
 

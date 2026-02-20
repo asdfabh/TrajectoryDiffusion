@@ -215,115 +215,204 @@ def plot_traj_with_mask(hist_original, hist_masked, hist_pred, nbrs_original=Non
     plt.show()
 
 
-def visualize_batch_trajectories(hist=None, hist_nbrs=None, future=None, pred=None, hist_masked=None, batch_idx=0,
-                                 save_path=None):
+def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, future=None, pred=None,
+                                 hist_masked=None, future_mask=None, batch_idx=None, save_path=None,
+                                 metrics=None, input_unit=None, show_plot=None):
     """
-    可视化函数：
-    - hist (Blue): Hist Model 输出的 Ego 重构轨迹
-    - hist_nbrs (Yellow): 真实的完整历史 (Ego + Neighbors)
-    - hist_masked (Red X): 在真实的 Ego 历史(hist_nbrs[0])上标记被掩码的点
-    - future (Green): 真实未来轨迹
-    - pred (Blue/Cyan): 预测未来轨迹
+    统一可视化函数（所有参数都允许 None）：
+    1) 可视化 Ego 历史、邻车历史、真实 future、预测 future
+    2) 输出并标记 FUT/PRED 最后一个点的坐标与 index
     """
 
-    # --- 数据提取辅助函数 ---
-    def get_val(tensor, b_idx):
-        if tensor is None: return None
-        if isinstance(tensor, torch.Tensor):
-            return tensor[b_idx].detach().cpu().numpy()
-        return tensor[b_idx]
+    def to_numpy(data):
+        if data is None:
+            return None
+        if isinstance(data, torch.Tensor):
+            return data.detach().cpu().numpy()
+        return np.asarray(data)
 
-    # 1. 提取数据
-    recon_hist = get_val(hist, batch_idx)  # [T, D] (Hist Model Output)
-    gt_context_hist = get_val(hist_nbrs, batch_idx)  # [T, N, D] (GT: Ego + Nbrs)
-    gt_fut = get_val(future, batch_idx)  # [T_f, D]
-    pred_fut = get_val(pred, batch_idx)  # [T_f, D]
-    mask_arr = get_val(hist_masked, batch_idx)  # [T, ...]
+    def safe_get_batch(data, b_idx):
+        arr = to_numpy(data)
+        if arr is None:
+            return None
+        if arr.ndim >= 3 and arr.shape[0] > b_idx:
+            return arr[b_idx]
+        return arr
+
+    def prepare_nbrs(nbrs_data, tmask_data, b_idx):
+        nbrs_arr = to_numpy(nbrs_data)
+        if nbrs_arr is None:
+            return None
+
+        # Case 1: already [B, T, N, D]
+        if nbrs_arr.ndim == 4:
+            return nbrs_arr[b_idx] if nbrs_arr.shape[0] > b_idx else None
+
+        # Case 2: compact neighbors [N_total, T, D] + temporal_mask [B, H, W, D]
+        if nbrs_arr.ndim == 3 and tmask_data is not None:
+            tmask_arr = to_numpy(tmask_data)
+            if tmask_arr is not None and tmask_arr.ndim == 4 and tmask_arr.shape[0] > b_idx:
+                bmask = tmask_arr[b_idx].reshape(-1, tmask_arr.shape[-1])  # [N_grid, D]
+                occ = bmask.any(axis=-1)
+                occ_ids = np.where(occ)[0]
+
+                t_len, feat_dim = nbrs_arr.shape[1], nbrs_arr.shape[2]
+                n_grid = bmask.shape[0]
+                out = np.zeros((t_len, n_grid, feat_dim), dtype=nbrs_arr.dtype)
+
+                take = min(len(occ_ids), nbrs_arr.shape[0])
+                if take > 0:
+                    out[:, occ_ids[:take], :] = np.transpose(nbrs_arr[:take], (1, 0, 2))
+                return out
+
+        # Case 3: maybe single-sample [T, N, D]
+        if nbrs_arr.ndim == 3:
+            return nbrs_arr
+
+        return None
+
+    idx = 0 if batch_idx is None else int(batch_idx)
+    unit = 'ft' if input_unit is None else input_unit
+    if show_plot is None:
+        show_plot = save_path is None
+
+    recon_hist = safe_get_batch(hist, idx)
+    gt_fut = safe_get_batch(future, idx)
+    pred_fut = safe_get_batch(pred, idx)
+    hist_mask_arr = safe_get_batch(hist_masked, idx)
+    fut_mask_arr = safe_get_batch(future_mask, idx)
+    nbrs_vis = prepare_nbrs(hist_nbrs, temporal_mask, idx)
+
+    if recon_hist is not None and recon_hist.ndim == 3:
+        recon_hist = recon_hist.squeeze(1)
+    if gt_fut is not None and gt_fut.ndim == 3:
+        gt_fut = gt_fut.squeeze(1)
+    if pred_fut is not None and pred_fut.ndim == 3:
+        pred_fut = pred_fut.squeeze(1)
 
     fig, ax = plt.subplots(figsize=(10, 10))
+    info = {"fut_last": None, "pred_last": None}
 
-    # --- A. 绘制 Hist Nbrs (所有真实历史，包括 Ego) - 黄色 ---
-    # 这是背景信息
-    gt_ego_traj = None
-    if gt_context_hist is not None:
-        # 确保形状是 [T, N, D]
-        if gt_context_hist.ndim == 2:
-            gt_context_hist = gt_context_hist[:, None, :]  # [T, 1, D]
-
-        num_agents = gt_context_hist.shape[1]
-
-        # 记录 GT Ego 以便后续画 Mask
-        gt_ego_traj = gt_context_hist[:, 0, :]
-
-        for i in range(num_agents):
-            traj = gt_context_hist[:, i, :]
-            # 过滤无效轨迹
+    # A. Neighbors (浅黄色)
+    if nbrs_vis is not None:
+        if nbrs_vis.ndim == 2:
+            nbrs_vis = nbrs_vis[:, None, :]
+        for n_idx in range(nbrs_vis.shape[1]):
+            traj = nbrs_vis[:, n_idx, :]
             if np.sum(np.abs(traj)) > 1e-2:
-                # 统一用黄色/橙色表示真实历史背景
-                label = 'GT Hist (Context)' if i == 0 else None
-                ax.plot(traj[:, 1], traj[:, 0], color='orange', alpha=0.6, linewidth=1.5, marker='.', markersize=2,
-                        label=label)
+                ax.plot(
+                    traj[:, 1], traj[:, 0],
+                    color='#F9EEB2', alpha=0.95, linewidth=1.2, marker='.', markersize=2,
+                    label='Neighbors' if n_idx == 0 else None, zorder=1
+                )
 
-    # --- B. 绘制 Mask 标记 (红色 X) ---
-    # 逻辑：对 hist_nbrs 的第 0 个 (GT Ego) 进行掩码对比
-    if mask_arr is not None and gt_ego_traj is not None:
-        # 处理 Mask 维度
-        if mask_arr.ndim > 1 and mask_arr.shape[-1] > 1:
-            m = mask_arr[..., -1]  # 取最后一维作为 mask 标记
-        else:
-            m = mask_arr.squeeze()
-
-        # 截取长度对齐
-        L = min(len(m), len(gt_ego_traj))
-        m = m[:L]
-        traj_to_mark = gt_ego_traj[:L]
-
-        # 找出被掩码的点 (假设值 < 0.5 为被 Mask)
-        masked_indices = np.where(m < 0.5)[0]
-
-        if len(masked_indices) > 0:
-            ax.plot(traj_to_mark[masked_indices, 1], traj_to_mark[masked_indices, 0],
-                    'rx', markersize=8, markeredgewidth=2, label='Masked Input', zorder=10)
-
-    # --- C. 绘制 Hist Model Output (Ego 重构) - 蓝色 ---
+    # B. Ego Hist
+    gt_ego_traj = recon_hist
     if recon_hist is not None:
-        if recon_hist.ndim == 3: recon_hist = recon_hist.squeeze(1)
-        ax.plot(recon_hist[:, 1], recon_hist[:, 0], 'b-o', label='Hist Model Pred', markersize=4, linewidth=2,
-                alpha=0.8)
+        ax.plot(recon_hist[:, 1], recon_hist[:, 0], 'b-o', label='Hist', markersize=4, linewidth=2, alpha=0.8)
 
-    # --- D. 绘制 Future (真实) - 绿色 ---
-    if gt_fut is not None:
-        if gt_fut.ndim == 3: gt_fut = gt_fut.squeeze(1)
+    # C. Hist Mask
+    if hist_mask_arr is not None and gt_ego_traj is not None:
+        m = hist_mask_arr[..., -1] if (hist_mask_arr.ndim > 1 and hist_mask_arr.shape[-1] > 1) else hist_mask_arr.squeeze()
+        L = min(len(m), len(gt_ego_traj))
+        masked_ids = np.where(m[:L] < 0.5)[0]
+        if len(masked_ids) > 0:
+            ax.plot(gt_ego_traj[masked_ids, 1], gt_ego_traj[masked_ids, 0], 'rx',
+                    markersize=8, markeredgewidth=2, label='Masked Input', zorder=10)
+
+    # D. FUT + last point
+    fut_last_idx = None
+    if gt_fut is not None and len(gt_fut) > 0:
         ax.plot(gt_fut[:, 1], gt_fut[:, 0], 'g-*', label='GT Future', markersize=4, linewidth=2)
-
-        # 画一条连接线 (从 GT Hist 终点到 GT Fut 起点)
-        if gt_ego_traj is not None:
+        if gt_ego_traj is not None and len(gt_ego_traj) > 0:
             ax.plot([gt_ego_traj[-1, 1], gt_fut[0, 1]], [gt_ego_traj[-1, 0], gt_fut[0, 0]], 'g--', alpha=0.5)
 
-    # --- E. 绘制 Pred (预测未来) - 蓝色/青色 ---
-    if pred_fut is not None:
-        if pred_fut.ndim == 3: pred_fut = pred_fut.squeeze(1)
-        # 这里用 Cyan (青色) 或者 DodgerBlue 以区别于 Hist Model 的深蓝，保持蓝色系但有区分
+        if fut_mask_arr is not None:
+            fm = np.asarray(fut_mask_arr).squeeze()
+            if fm.ndim > 1:
+                fm = fm[..., 0]
+            valid_ids = np.where(fm[:len(gt_fut)] > 0.5)[0]
+            fut_last_idx = int(valid_ids[-1]) if len(valid_ids) > 0 else len(gt_fut) - 1
+        else:
+            fut_last_idx = len(gt_fut) - 1
+
+        fut_last_pt = gt_fut[fut_last_idx]
+        ax.scatter(fut_last_pt[1], fut_last_pt[0], color='darkgreen', s=28, zorder=12)
+        ax.text(
+            fut_last_pt[1],
+            fut_last_pt[0],
+            f"({fut_last_pt[1]:.2f}, {fut_last_pt[0]:.2f}) {fut_last_idx}",
+            color='darkgreen',
+            fontsize=9,
+                ha='left', va='bottom')
+
+        info["fut_last"] = {"index": fut_last_idx, "coord": (float(fut_last_pt[1]), float(fut_last_pt[0]))}
+        print(f"[Visualization] ({fut_last_pt[1]:.3f}, {fut_last_pt[0]:.3f}) {fut_last_idx}")
+
+    # E. PRED + last point
+    if pred_fut is not None and len(pred_fut) > 0:
         ax.plot(pred_fut[:, 1], pred_fut[:, 0], color='deepskyblue', linestyle='--', marker='x',
                 label='Pred Future', markersize=4, linewidth=2)
 
-    # 设置绘图属性
-    # 车道线 (假设 Y 轴为横向 Lateral)
+        pred_last_idx = len(pred_fut) - 1 if fut_last_idx is None else min(len(pred_fut) - 1, fut_last_idx)
+        pred_last_pt = pred_fut[pred_last_idx]
+        ax.scatter(pred_last_pt[1], pred_last_pt[0], color='navy', s=28, zorder=12)
+        ax.text(
+            pred_last_pt[1],
+            pred_last_pt[0],
+            f"({pred_last_pt[1]:.2f}, {pred_last_pt[0]:.2f}) {pred_last_idx}",
+            color='navy',
+            fontsize=9,
+                ha='left', va='top')
+
+        info["pred_last"] = {"index": pred_last_idx, "coord": (float(pred_last_pt[1]), float(pred_last_pt[0]))}
+        print(f"[Visualization] ({pred_last_pt[1]:.3f}, {pred_last_pt[0]:.3f}) {pred_last_idx}")
+
     for y in [18, 6, -6, -18]:
         ax.axhline(y=y, color='gray', linestyle=':', linewidth=0.5)
 
-    ax.set_xlabel('Longitudinal (m)')
-    ax.set_ylabel('Lateral (m)')
-    ax.legend(loc='best')
-    ax.grid(True, linestyle=':', alpha=0.5)
+    if unit == 'ft':
+        ax.set_xlabel('Longitudinal (ft)')
+        ax.set_ylabel('Lateral (ft)')
+        ft_to_m = lambda x: x * 0.3048
+        m_to_ft = lambda x: x / 0.3048
+        secax_x = ax.secondary_xaxis('top', functions=(ft_to_m, m_to_ft))
+        secax_y = ax.secondary_yaxis('right', functions=(ft_to_m, m_to_ft))
+        secax_x.set_xlabel('Longitudinal (m)')
+        secax_y.set_ylabel('Lateral (m)')
+    else:
+        ax.set_xlabel('Longitudinal (m)')
+        ax.set_ylabel('Lateral (m)')
+        m_to_ft = lambda x: x / 0.3048
+        ft_to_m = lambda x: x * 0.3048
+        secax_x = ax.secondary_xaxis('top', functions=(m_to_ft, ft_to_m))
+        secax_y = ax.secondary_yaxis('right', functions=(m_to_ft, ft_to_m))
+        secax_x.set_xlabel('Longitudinal (ft)')
+        secax_y.set_ylabel('Lateral (ft)')
 
+    if metrics:
+        metric_lines = []
+        for name, values in metrics.items():
+            if isinstance(values, dict):
+                metric_lines.append(f"{name}: {values.get('m', 0.0):.3f} m | {values.get('ft', 0.0):.3f} ft")
+            else:
+                metric_lines.append(f"{name}: {values}")
+        ax.text(
+            0.02, 0.98, "\n".join(metric_lines),
+            transform=ax.transAxes, va='top', ha='left',
+            fontsize=9,
+            bbox=dict(boxstyle='round,pad=0.35', facecolor='white', alpha=0.85, edgecolor='gray')
+        )
+
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(loc='best')
+    ax.grid(True, linestyle=':', alpha=0.5)
     plt.tight_layout()
 
-    if save_path:
+    if save_path is not None:
         plt.savefig(save_path)
-        # print(f"Saved visualization to {save_path}")
-    else:
+    if show_plot:
         plt.show()
-
     plt.close(fig)
-
+    return info

@@ -21,6 +21,7 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
     lane = batch['lane']
     cclass = batch['cclass']
     fut = batch['fut']
+    op_mask = batch['op_mask']
     hist_nbrs = batch['nbrs']
     va_nbrs = batch['nbrs_va']
     lane_nbrs = batch['nbrs_lane']
@@ -41,6 +42,7 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
         hist = hist.to(device)
         hist_nbrs = hist_nbrs.to(device)
     fut = fut.to(device)
+    op_mask = op_mask.to(device)
 
     if mask_type == 'random':
         hist_mask = random_mask(hist, p=mask_prob).to(device)
@@ -56,7 +58,7 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
 
-    return hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask
+    return hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask
 
 
 def train_epoch(model_fut, model_hist, dataloader, optimizer, device, epoch, feature_dim,
@@ -77,7 +79,7 @@ def train_epoch(model_fut, model_hist, dataloader, optimizer, device, epoch, fea
                 desc=f"Epoch {epoch}", ncols=160)
 
     for batch_idx, batch in pbar:
-        hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask = prepare_input_data(
+        hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask = prepare_input_data(
             batch, feature_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
         )
 
@@ -88,7 +90,7 @@ def train_epoch(model_fut, model_hist, dataloader, optimizer, device, epoch, fea
         else:
             loss_h, pred_hist, _, _ = model_hist.forward_train(hist, hist_masked, device)
 
-        loss_f, pred, ade, fde = model_fut.forward_train(pred_hist, hist_nbrs, mask, temporal_mask, fut, device)
+        loss_f, pred, ade, fde = model_fut.forward_train(pred_hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
 
         loss = loss_f + loss_h
 
@@ -167,9 +169,16 @@ def main():
 
     writer = SummaryWriter(log_dir=str(fut_ckpt_dir / 'logs'))
 
-    data_root = Path(__file__).resolve().parent.parent / '/mnt/datasets/ngsimdata'
+    data_root = Path(args.data_root)
     train_path = str(data_root / 'TrainSet.mat')
-    train_dataset = NgsimDataset(train_path, t_h=30, t_f=50, d_s=2)
+    train_dataset = NgsimDataset(
+        train_path,
+        t_h=30,
+        t_f=50,
+        d_s=2,
+        enc_size=args.encoder_input_dim,
+        feature_dim=args.feature_dim
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -177,7 +186,7 @@ def main():
         num_workers=args.num_workers,
         collate_fn=train_dataset.collate_fn,
         pin_memory=True,
-        persistent_workers=True,
+        persistent_workers=args.num_workers > 0,
         drop_last=True
     )
 
@@ -209,7 +218,7 @@ def main():
 
         avg_loss = train_epoch(
             model_fut, model_hist, train_loader, optimizer, device, epoch + 1,
-            args.feature_dim, mask_type='random', mask_prob=0.5, freeze_hist=freeze_hist
+            args.feature_dim, mask_type='random', mask_prob=args.mask_prob, freeze_hist=freeze_hist
         )
 
         print(f"Epoch [{epoch + 1}] Average Loss: {avg_loss:.4f}")
