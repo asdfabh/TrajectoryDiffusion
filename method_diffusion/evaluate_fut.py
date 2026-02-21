@@ -275,9 +275,9 @@ def compute_batch_metrics(pred, target, op_mask, meter_per_unit=0.3048):
     fde_ft = (final_dist * has_valid.float()).sum() / (has_valid.float().sum() + 1e-6)
 
     return {
-        "ADE (batch)": {"m": (ade_ft * meter_per_unit).item(), "ft": ade_ft.item()},
-        "FDE (batch)": {"m": (fde_ft * meter_per_unit).item(), "ft": fde_ft.item()},
-        "RMSE (batch)": {"m": (rmse_ft * meter_per_unit).item(), "ft": rmse_ft.item()},
+        "ADE (batch, residual-anchor)": {"m": (ade_ft * meter_per_unit).item(), "ft": ade_ft.item()},
+        "FDE (batch, residual-anchor)": {"m": (fde_ft * meter_per_unit).item(), "ft": fde_ft.item()},
+        "RMSE (batch, residual-anchor)": {"m": (rmse_ft * meter_per_unit).item(), "ft": rmse_ft.item()},
     }
 
 
@@ -321,7 +321,6 @@ def run_evaluation(args, device):
     test_loader = get_test_loader(args)
     total_test_batches = len(test_loader)
     test_ratio = max(0.0, min(1.0, float(args.test_ratio)))
-    test_ratio = 0.1
     target_test_batches = max(1, int(math.ceil(total_test_batches * test_ratio))) if total_test_batches > 0 else 0
     print(f"[Eval] Test ratio: {test_ratio:.2f}, evaluating {target_test_batches}/{total_test_batches} batches")
 
@@ -344,9 +343,10 @@ def run_evaluation(args, device):
     load_checkpoint(model_fut, args.resume_fut, fut_ckpt_dir, device, model_name="FutModel")
     if hasattr(model_fut, "is_main_process"):
         model_fut.is_main_process = False
+    print("[FutModel] Eval formulation: residual_anchor_rollout")
     print(
         f"[FutModel] Inference sampler: steps={args.num_inference_steps}, "
-        f"spacing={args.inference_timestep_spacing}, eta={args.ddim_eta}, x0_clip={args.x0_clip}"
+        f"spacing={args.inference_timestep_spacing}, eta={args.ddim_eta}, x0_clip={args.x0_clip}, mode=residual_anchor_rollout"
     )
 
     if args.eval_mode == 'joint':
@@ -395,12 +395,12 @@ def run_evaluation(args, device):
                 vis_metrics = compute_single_vis_metrics(pred_fut, fut, op_mask, batch_idx=0)
                 running_summary = calc_fut.get_summary()
                 running_metrics = {
-                    "ADE (running)": {"m": running_summary["overall_ade_m"], "ft": running_summary["overall_ade_ft"]},
-                    "FDE (running)": {"m": running_summary["overall_fde_m"], "ft": running_summary["overall_fde_ft"]},
+                    "ADE (running, residual-anchor)": {"m": running_summary["overall_ade_m"], "ft": running_summary["overall_ade_ft"]},
+                    "FDE (running, residual-anchor)": {"m": running_summary["overall_fde_m"], "ft": running_summary["overall_fde_ft"]},
                 }
                 traj_metrics = {
-                    "ADE (vis traj)": {"m": vis_metrics["ade_m"], "ft": vis_metrics["ade_ft"]},
-                    "FDE (vis traj)": {"m": vis_metrics["fde_m"], "ft": vis_metrics["fde_ft"]},
+                    "ADE (vis traj, residual-anchor)": {"m": vis_metrics["ade_m"], "ft": vis_metrics["ade_ft"]},
+                    "FDE (vis traj, residual-anchor)": {"m": vis_metrics["fde_m"], "ft": vis_metrics["fde_ft"]},
                 }
                 metrics_for_plot = {**traj_metrics, **batch_metrics, **running_metrics}
                 save_path = None
@@ -423,13 +423,13 @@ def run_evaluation(args, device):
                 pred_end = vis_info.get("pred_last") if isinstance(vis_info, dict) else None
 
                 print(
-                    f"[Vis][batch={batch_idx}, sample=0] "
+                    f"[Vis][ResidualAnchor][batch={batch_idx}, sample=0] "
                     f"ADE={vis_metrics['ade_ft']:.4f} ft ({vis_metrics['ade_m']:.4f} m), "
                     f"FDE={vis_metrics['fde_ft']:.4f} ft ({vis_metrics['fde_m']:.4f} m)"
                 )
                 if fut_end and pred_end:
                     print(
-                        f"[Vis][EndPoint idx={vis_metrics['end_index']}] "
+                        f"[Vis][ResidualAnchor][EndPoint idx={vis_metrics['end_index']}] "
                         f"GT(ft)={fut_end['coord']} | Pred(ft)={pred_end['coord']} | "
                         f"GT(m)=({vis_metrics['gt_end_m'][0]:.3f}, {vis_metrics['gt_end_m'][1]:.3f}) | "
                         f"Pred(m)=({vis_metrics['pred_end_m'][0]:.3f}, {vis_metrics['pred_end_m'][1]:.3f})"
@@ -442,7 +442,7 @@ def run_evaluation(args, device):
                             time_indices=[4, 9, 14], time_labels=['1s', '2s', '3s'])
 
     fut_metrics = calc_fut.get_summary()
-    print_metrics_table(fut_metrics, name="Future Prediction")
+    print_metrics_table(fut_metrics, name="Future Prediction (Residual Anchor Rollout)")
 
 
 def main():

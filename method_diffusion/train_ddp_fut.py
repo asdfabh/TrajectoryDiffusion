@@ -12,7 +12,6 @@ from tqdm import tqdm
 import builtins
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.config import get_args_parser
-from method_diffusion.utils.mask_util import random_mask, continuous_mask
 from method_diffusion.models.fut_model import DiffusionFut
 
 
@@ -51,7 +50,7 @@ def reduce_value(value, average=True):
         return value
 
 
-def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, device='cuda'):
+def prepare_input_data(batch, feature_dim, device='cuda'):
     hist = batch['hist']  # [B, T, 2]
     va = batch['va']  # [B, T, 2]
     lane = batch['lane']  # [B, T, 1]
@@ -82,24 +81,12 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
     fut = fut.to(device)
     op_mask = op_mask.to(device)
 
-    # 生成掩码并应用掩码
-    if mask_type == 'random':
-        hist_mask = random_mask(hist, p=mask_prob).to(device)
-    elif mask_type == 'block':
-        hist_mask = continuous_mask(hist, p=mask_prob).to(device)
-    else:
-        hist_mask = random_mask(hist, p=mask_prob).to(device)
-
-    hist_masked_val = hist_mask * hist
-    hist_masked = torch.cat([hist_masked_val, hist_mask], dim=-1) # [B, T, feature_dim+1]
-
-    hist_masked = hist_masked.to(device)
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
 
-    return hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask
+    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
 
-def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, mask_type='random', mask_prob=0.4):
+def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -111,12 +98,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, 
         pbar = enumerate(dataloader)
 
     for batch_idx, batch in pbar:
-        hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask = prepare_input_data(
-            batch, feature_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
-        )
-
-        # loss, pred, ade, fde = model(hist, hist_masked, device)
-        loss, pred, ade, fde = model(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
+        loss = model(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
 
         # Backward
         optimizer.zero_grad()
@@ -131,8 +114,6 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, 
             pbar.set_postfix({
                 'loss': f'{loss.item():.8f}',
                 'avg_loss': f'{total_loss / num_batches:.8f}',
-                'ade_ft': f'{ade.mean().item():.4f}',
-                'fde_ft': f'{fde.mean().item():.4f}',
             })
 
     # Aggregate loss/count across all ranks for a true global average.
@@ -146,7 +127,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, 
 
 
 @torch.no_grad()
-def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, mask_type='random', mask_prob=0.4, eval_ratio=0.1, max_batches=0):
+def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_ratio=0.1, max_batches=0):
     fut_model = model.module if hasattr(model, "module") else model
     fut_model.eval()
     total_loss = 0.0
@@ -170,9 +151,7 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, mask_type
         if batch_idx >= target_batches:
             break
 
-        hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask = prepare_input_data(
-            batch, feature_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
-        )
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
         eval_loss, _, eval_ade, eval_fde = fut_model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
 
         total_loss += float(eval_loss.item())
@@ -192,7 +171,7 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, mask_type
 
 def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, rank):
     start_epoch = 0
-    best_loss = float('inf')
+    best_ade = float('inf')
     ckpt_path = None
 
     if args.resume_fut == 'latest':
@@ -235,12 +214,12 @@ def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, rank):
                 print(f"Warning: Could not load optimizer state (expected due to architecture change): {e}")
 
         start_epoch = state.get('epoch', 0)
-        best_loss = state.get('best_loss', best_loss)
+        best_ade = state.get('best_ade', state.get('best_loss', best_ade))
 
         if rank == 0:
             print(f"Resumed from {ckpt_path} @ epoch {start_epoch}")
 
-    return start_epoch, best_loss
+    return start_epoch, best_ade
 
 
 def main():
@@ -261,24 +240,25 @@ def main():
 
     if rank == 0:
         Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-        fixed_eval_ratio = 0.1
+        fixed_eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
+        if fixed_eval_ratio <= 0.0:
+            fixed_eval_ratio = 0.1
         print(
-            f"[FutModel] Train strategy: self_condition_prob={args.self_condition_prob}, "
-            f"t_align_ratio={args.train_timestep_align_ratio}, "
-            f"train_metric=current_dit_pred"
+            f"[FutModel] Inference sampler: steps={args.num_inference_steps}, "
+            f"spacing={args.inference_timestep_spacing}, eta={args.ddim_eta}, x0_clip={args.x0_clip}"
         )
         print(
-            f"[FutModel] Loss config: pos={args.fut_pos_loss_type}(delta={args.fut_huber_delta}), "
-            f"mode={args.fut_loss_mode}, time_weight=({args.fut_time_weight_min},{args.fut_time_weight_max}), "
-            f"w_pos={args.fut_loss_pos_weight}, w_vel={args.fut_loss_vel_weight}, w_y={args.fut_y_loss_weight}, "
-            f"high_noise_w={args.fut_high_noise_weight}"
+            f"[FutModel] Train strategy: self_condition_prob={args.self_condition_prob}, "
+            f"loss=smooth_l1_residual_anchor, y_weight={args.fut_y_loss_weight}, huber_delta={args.fut_huber_delta}"
         )
         print(
             f"[FutModel] TestSet eval sampling: eval_ratio={fixed_eval_ratio}, "
             f"eval_max_batches={args.eval_max_batches}"
         )
     else:
-        fixed_eval_ratio = 0.1
+        fixed_eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
+        if fixed_eval_ratio <= 0.0:
+            fixed_eval_ratio = 0.1
 
     # Use args.data_root
     data_root = Path(args.data_root)
@@ -345,7 +325,7 @@ def main():
         T_max=args.num_epochs
     )
 
-    start_epoch, best_loss = load_checkpoint_if_needed(
+    start_epoch, best_ade = load_checkpoint_if_needed(
         args, model, optimizer, scheduler, device, rank
     )
 
@@ -356,19 +336,15 @@ def main():
         if rank == 0:
             print(f"\n========== Epoch {epoch + 1}/{args.num_epochs} ==========")
 
-        mask_type = 'random'
-        mask_prob = args.mask_prob
-
         avg_loss = train_epoch(
             model, train_loader, optimizer, device, epoch + 1,
-            args.feature_dim, rank, mask_type=mask_type, mask_prob=mask_prob
+            args.feature_dim, rank
         )
 
         if rank == 0:
             print(f"Epoch [{epoch + 1}] Average Loss: {avg_loss:.4f}")
             eval_loss, eval_ade, eval_fde = evaluate_on_testset(
                 model, test_loader, device, epoch + 1, args.feature_dim,
-                mask_type=mask_type, mask_prob=mask_prob,
                 eval_ratio=fixed_eval_ratio, max_batches=args.eval_max_batches
             )
             print(
@@ -390,7 +366,10 @@ def main():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': avg_loss,
-                'best_loss': best_loss,
+                'eval_loss': eval_loss,
+                'eval_ade': eval_ade,
+                'eval_fde': eval_fde,
+                'best_ade': best_ade,
             }
 
             if (epoch + 1) % args.save_interval == 0:
@@ -398,12 +377,12 @@ def main():
                 torch.save(state, save_path)
                 print(f"Saved checkpoint to {save_path}")
 
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                state['best_loss'] = best_loss
+            if eval_ade < best_ade:
+                best_ade = eval_ade
+                state['best_ade'] = best_ade
                 save_path = Path(args.checkpoint_dir) / "checkpoint_best.pth"
                 torch.save(state, save_path)
-                print(f"Saved best model (Loss: {best_loss:.4f}) to {save_path}")
+                print(f"Saved best model (ADE: {best_ade:.4f} ft) to {save_path}")
 
     cleanup_ddp()
 
