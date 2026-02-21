@@ -25,7 +25,7 @@ def get_args_parser():
 
     # Hist diffusion model
     # parser.add_argument("--input_dim", default=128, type=int)
-    parser.add_argument("--hidden_dim", default=256, type=int)
+    parser.add_argument("--hidden_dim", default=128, type=int)
     parser.add_argument("--output_dim", default=4, type=int)
     parser.add_argument("--hist_length", default=16, type=int)
     parser.add_argument("--pred_length", default=25, type=int)
@@ -50,8 +50,8 @@ def get_args_parser():
     parser.add_argument("--network", default="highwaynet", type=str)
 
     # Fut diffusion model
-    parser.add_argument("--input_dim_fut", default=128, type=int)
-    parser.add_argument("--hidden_dim_fut", default=128, type=int)
+    # parser.add_argument("--input_dim_fut", default=128, type=int)
+    parser.add_argument("--hidden_dim_fut", default=256, type=int)
     parser.add_argument("--output_dim_fut", default=2, type=int)
     parser.add_argument("--heads_fut", default=8, type=int)
     parser.add_argument("--depth_fut", default=6, type=int)
