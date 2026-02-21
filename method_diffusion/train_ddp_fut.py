@@ -1,5 +1,6 @@
 import sys
 import os
+import math
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
@@ -130,12 +131,64 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, 
             pbar.set_postfix({
                 'loss': f'{loss.item():.8f}',
                 'avg_loss': f'{total_loss / num_batches:.8f}',
-                'ade': f'{ade.mean().item():.4f}',
-                'fde': f'{fde.mean().item():.4f}',
+                'ade_ft': f'{ade.mean().item():.4f}',
+                'fde_ft': f'{fde.mean().item():.4f}',
             })
 
-    avg_loss = total_loss / num_batches
+    # Aggregate loss/count across all ranks for a true global average.
+    loss_count = torch.tensor([total_loss, float(num_batches)], device=device)
+    if dist.is_initialized():
+        dist.all_reduce(loss_count, op=dist.ReduceOp.SUM)
+    global_total_loss = float(loss_count[0].item())
+    global_total_batches = max(float(loss_count[1].item()), 1.0)
+    avg_loss = global_total_loss / global_total_batches
     return avg_loss
+
+
+@torch.no_grad()
+def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, mask_type='random', mask_prob=0.4, eval_ratio=0.1, max_batches=0):
+    fut_model = model.module if hasattr(model, "module") else model
+    fut_model.eval()
+    total_loss = 0.0
+    total_ade = 0.0
+    total_fde = 0.0
+    num_batches = 0
+
+    total_batches = len(dataloader)
+    if total_batches == 0:
+        fut_model.train()
+        return 0.0, 0.0, 0.0
+
+    target_batches = total_batches
+    if eval_ratio > 0:
+        target_batches = max(1, int(math.ceil(total_batches * float(eval_ratio))))
+    if max_batches > 0:
+        target_batches = min(target_batches, int(max_batches))
+
+    pbar = tqdm(enumerate(dataloader), total=target_batches, desc=f"Eval(TestSet) Ep{epoch}", dynamic_ncols=True)
+    for batch_idx, batch in pbar:
+        if batch_idx >= target_batches:
+            break
+
+        hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask = prepare_input_data(
+            batch, feature_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
+        )
+        eval_loss, _, eval_ade, eval_fde = fut_model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+
+        total_loss += float(eval_loss.item())
+        total_ade += float(eval_ade.item())
+        total_fde += float(eval_fde.item())
+        num_batches += 1
+        pbar.set_postfix({
+            'eval_loss': f'{eval_loss.item():.8f}',
+            'avg_ade_ft': f'{(total_ade / num_batches):.4f}',
+            'avg_fde_ft': f'{(total_fde / num_batches):.4f}',
+        })
+
+    fut_model.train()
+    if num_batches == 0:
+        return 0.0, 0.0, 0.0
+    return total_loss / num_batches, total_ade / num_batches, total_fde / num_batches
 
 def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, rank):
     start_epoch = 0
@@ -203,19 +256,29 @@ def main():
 
     args = get_args_parser().parse_args()
 
+    # Keep the same checkpoint layout as train_fut.py.
+    args.checkpoint_dir = str(Path(args.checkpoint_dir) / 'fut')
+
     if rank == 0:
         Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        fixed_eval_ratio = 0.1
         print(
-            f"[FutModel] Consistency train: unroll_weight={args.train_unroll_weight}, "
+            f"[FutModel] Train strategy: self_condition_prob={args.self_condition_prob}, "
             f"t_align_ratio={args.train_timestep_align_ratio}, "
-            f"unroll_detach_x0={args.train_unroll_detach_x0}, "
-            f"self_condition_prob={args.self_condition_prob}"
+            f"train_metric=current_dit_pred"
         )
         print(
             f"[FutModel] Loss config: pos={args.fut_pos_loss_type}(delta={args.fut_huber_delta}), "
             f"mode={args.fut_loss_mode}, time_weight=({args.fut_time_weight_min},{args.fut_time_weight_max}), "
-            f"w_pos={args.fut_loss_pos_weight}, w_vel={args.fut_loss_vel_weight}"
+            f"w_pos={args.fut_loss_pos_weight}, w_vel={args.fut_loss_vel_weight}, w_y={args.fut_y_loss_weight}, "
+            f"high_noise_w={args.fut_high_noise_weight}"
         )
+        print(
+            f"[FutModel] TestSet eval sampling: eval_ratio={fixed_eval_ratio}, "
+            f"eval_max_batches={args.eval_max_batches}"
+        )
+    else:
+        fixed_eval_ratio = 0.1
 
     # Use args.data_root
     data_root = Path(args.data_root)
@@ -242,6 +305,27 @@ def main():
         sampler=train_sampler,
         drop_last=True
     )
+
+    test_loader = None
+    if rank == 0:
+        test_path = str(data_root / 'TestSet.mat')
+        test_dataset = NgsimDataset(
+            test_path,
+            t_h=30,
+            t_f=50,
+            d_s=2,
+            enc_size=args.encoder_input_dim,
+            feature_dim=args.feature_dim
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=test_dataset.collate_fn,
+            pin_memory=True,
+            drop_last=False
+        )
 
     model = DiffusionFut(args).to(device)
 
@@ -282,8 +366,21 @@ def main():
 
         if rank == 0:
             print(f"Epoch [{epoch + 1}] Average Loss: {avg_loss:.4f}")
+            eval_loss, eval_ade, eval_fde = evaluate_on_testset(
+                model, test_loader, device, epoch + 1, args.feature_dim,
+                mask_type=mask_type, mask_prob=mask_prob,
+                eval_ratio=fixed_eval_ratio, max_batches=args.eval_max_batches
+            )
+            print(
+                f"TestSet Eval [{epoch + 1}] Loss: {eval_loss:.4f}, "
+                f"ADE: {eval_ade:.4f} ft ({eval_ade * 0.3048:.4f} m), "
+                f"FDE: {eval_fde:.4f} ft ({eval_fde * 0.3048:.4f} m)"
+            )
 
         scheduler.step()
+
+        if dist.is_initialized():
+            dist.barrier()
 
         if rank == 0:
             model_state = model.module.state_dict() if hasattr(model, "module") else model.state_dict()

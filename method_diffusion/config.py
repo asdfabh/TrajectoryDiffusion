@@ -52,7 +52,7 @@ def get_args_parser():
     parser.add_argument("--output_dim_fut", default=2, type=int, help="预测输出维度，如未来位置(x,y)")
     parser.add_argument("--encoder_depth", default=2, type=int, help="Encoder层数")
     parser.add_argument("--heads_fut", default=4, type=int, help="Transformer多头注意力头数")
-    parser.add_argument("--depth_fut", default=3, type=int, help="Transformer层数")
+    parser.add_argument("--depth_fut", default=4, type=int, help="Transformer层数")
     parser.add_argument("--dropout_fut", default=0.1, type=float, help="前馈网络扩展倍数(即hidden_dim乘以该倍率)")
     parser.add_argument("--mlp_ratio_fut", default=4, type=int, help="前馈网络扩展倍数(即hidden_dim乘以该倍率)")
     parser.add_argument("--num_train_timesteps_fut", default=500, type=int, help="前馈网络扩展倍数(即hidden_dim乘以该倍率)")
@@ -67,9 +67,9 @@ def get_args_parser():
 
     # Fut Train Strategy
     parser.add_argument("--self_condition_prob", default=0.5, type=float, help="自条件训练概率，推荐0.5")
-    parser.add_argument("--train_unroll_weight", default=0.4, type=float, help="2-step一致性训练损失权重，<=0表示关闭")
+    parser.add_argument("--train_unroll_weight", default=0.0, type=float, help="[deprecated] 展开去噪权重，当前实现不使用")
     parser.add_argument("--train_timestep_align_ratio", default=0.7, type=float, help="训练t采样对齐推理步点的比例，0~1")
-    parser.add_argument("--train_unroll_detach_x0", default=1, type=int, help="展开去噪时构造x_{t-1}是否detach第一步x0预测，1是0否")
+    parser.add_argument("--train_unroll_detach_x0", default=1, type=int, help="[deprecated] 展开去噪开关，当前实现不使用")
 
     # Fut Loss
     parser.add_argument("--fut_loss_mode", default="l1_time_vel", type=str, choices=["l1_time_vel", "legacy"], help="fut损失模式")
@@ -79,10 +79,11 @@ def get_args_parser():
     parser.add_argument("--fut_huber_delta", default=1.0, type=float, help="Huber位置损失的delta")
     parser.add_argument("--fut_loss_pos_weight", default=1.0, type=float, help="位置损失权重")
     parser.add_argument("--fut_loss_vel_weight", default=0.6, type=float, help="速度损失权重")
+    parser.add_argument("--fut_y_loss_weight", default=3.0, type=float, help="各向异性坐标权重中y轴倍率")
     parser.add_argument("--fut_loss_acc_weight", default=0.15, type=float, help="加速度损失权重(legacy)")
     parser.add_argument("--fut_loss_endpoint_weight", default=0.8, type=float, help="终点损失权重(legacy)")
     parser.add_argument("--fut_high_noise_threshold", default=0.6, type=float, help="高噪声阈值（t/T）")
-    parser.add_argument("--fut_high_noise_weight", default=1.5, type=float, help="高噪声样本损失权重倍率")
+    parser.add_argument("--fut_high_noise_weight", default=1.0, type=float, help="高噪声样本损失权重倍率")
 
     # Fut Train/Eval Visualization
     parser.add_argument("--fut_enable_train_vis", default=0, type=int, help="Fut训练前向是否启用可视化show，默认关闭")

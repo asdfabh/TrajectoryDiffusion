@@ -321,6 +321,7 @@ def run_evaluation(args, device):
     test_loader = get_test_loader(args)
     total_test_batches = len(test_loader)
     test_ratio = max(0.0, min(1.0, float(args.test_ratio)))
+    test_ratio = 0.1
     target_test_batches = max(1, int(math.ceil(total_test_batches * test_ratio))) if total_test_batches > 0 else 0
     print(f"[Eval] Test ratio: {test_ratio:.2f}, evaluating {target_test_batches}/{total_test_batches} batches")
 

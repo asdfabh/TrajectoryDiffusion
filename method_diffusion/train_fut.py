@@ -66,6 +66,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim,
 
     model.train()
     total_loss = 0.0
+    total_ade = 0.0
+    total_fde = 0.0
     num_batches = 0
 
     pbar = tqdm(enumerate(dataloader), total=len(dataloader),
@@ -87,14 +89,24 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim,
         total_loss += loss.item()
         num_batches += 1
 
+        ade_ft = float(ade.item())
+        fde_ft = float(fde.item())
+        total_ade += ade_ft
+        total_fde += fde_ft
+
         pbar.set_postfix({
             'loss': f'{loss.item():.8f}',
             'avg_loss': f'{total_loss/num_batches:.8f}',
-            'ade': f'{ade.mean().item():.4f}',
-            'fde': f'{fde.mean().item():.4f}',
+            'ade_ft': f'{ade_ft:.4f}',
+            'fde_ft': f'{fde_ft:.4f}',
+            'avg_ade_ft': f'{(total_ade/num_batches):.4f}',
+            'avg_fde_ft': f'{(total_fde/num_batches):.4f}',
         })
 
-    return total_loss / num_batches
+    avg_loss = total_loss / num_batches
+    avg_ade = total_ade / num_batches
+    avg_fde = total_fde / num_batches
+    return avg_loss, avg_ade, avg_fde
 
 
 @torch.no_grad()
@@ -205,19 +217,19 @@ def main():
         f"spacing={args.inference_timestep_spacing}, eta={args.ddim_eta}, x0_clip={args.x0_clip}"
     )
     print(
-        f"[FutModel] Train consistency: unroll_weight={args.train_unroll_weight}, "
+        f"[FutModel] Train strategy: self_condition_prob={args.self_condition_prob}, "
         f"t_align_ratio={args.train_timestep_align_ratio}, "
-        f"unroll_detach_x0={args.train_unroll_detach_x0}, "
-        f"self_condition_prob={args.self_condition_prob}"
+        f"train_metric=current_dit_pred"
     )
     print(
         f"[FutModel] Loss config: mode={args.fut_loss_mode}, "
         f"time_weight=({args.fut_time_weight_min},{args.fut_time_weight_max}), "
-        f"w_pos={args.fut_loss_pos_weight}, w_vel={args.fut_loss_vel_weight}, "
+        f"w_pos={args.fut_loss_pos_weight}, w_vel={args.fut_loss_vel_weight}, w_y={args.fut_y_loss_weight}, "
         f"legacy_pos={args.fut_pos_loss_type}(delta={args.fut_huber_delta})"
     )
+    fixed_eval_ratio = 0.1
     print(
-        f"[FutModel] TestSet eval sampling: eval_ratio={args.eval_ratio}, "
+        f"[FutModel] TestSet eval sampling: eval_ratio={fixed_eval_ratio}, "
         f"eval_max_batches={args.eval_max_batches}"
     )
 
@@ -285,20 +297,28 @@ def main():
         mask_type = 'random' # Can be 'block'
         mask_prob = args.mask_prob
 
-        avg_loss = train_epoch(
+        avg_loss, train_ade, train_fde = train_epoch(
             model, train_loader, optimizer, device, epoch + 1,
             args.feature_dim, mask_type=mask_type, mask_prob=mask_prob
         )
         eval_loss, eval_ade, eval_fde = evaluate_on_testset(
             model, test_loader, device, epoch + 1, args.feature_dim,
             mask_type=mask_type, mask_prob=mask_prob,
-            eval_ratio=args.eval_ratio, max_batches=args.eval_max_batches
+            eval_ratio=fixed_eval_ratio, max_batches=args.eval_max_batches
         )
 
-        print(f"Epoch [{epoch + 1}] Average Loss: {avg_loss:.4f}")
+        print(
+            f"Epoch [{epoch + 1}] Average Loss: {avg_loss:.4f}, "
+            f"Train ADE: {train_ade:.4f} ft ({train_ade * 0.3048:.4f} m), "
+            f"Train FDE: {train_fde:.4f} ft ({train_fde * 0.3048:.4f} m)"
+        )
         print(f"TestSet Eval [{epoch + 1}] Loss: {eval_loss:.4f}, ADE: {eval_ade:.4f}, FDE: {eval_fde:.4f}")
 
         writer.add_scalar('Train/Loss', avg_loss, epoch + 1)
+        writer.add_scalar('Train/ADE_ft', train_ade, epoch + 1)
+        writer.add_scalar('Train/FDE_ft', train_fde, epoch + 1)
+        writer.add_scalar('Train/ADE_m', train_ade * 0.3048, epoch + 1)
+        writer.add_scalar('Train/FDE_m', train_fde * 0.3048, epoch + 1)
         writer.add_scalar('Eval/Loss', eval_loss, epoch + 1)
         writer.add_scalar('Eval/ADE', eval_ade, epoch + 1)
         writer.add_scalar('Eval/FDE', eval_fde, epoch + 1)
