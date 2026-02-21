@@ -20,7 +20,7 @@ def get_args_parser():
     parser.add_argument("--save_interval", default=5, type=int)
     parser.add_argument("--mask_prob", default=0.4, type=float)
     parser.add_argument("--checkpoint_dir", default="./checkpoints", type=str)
-    parser.add_argument("--resume_fut", default="None", type=str)
+    parser.add_argument("--resume_fut", default="none", type=str)
     parser.add_argument("--resume_hist", default="best", type=str)
 
     # Hist diffusion model

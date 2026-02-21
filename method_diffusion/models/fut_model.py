@@ -52,6 +52,11 @@ class DiffusionFut(nn.Module):
         nn.init.xavier_uniform_(self.enc_embedding.weight)
         nn.init.constant_(self.enc_embedding.bias, 0)
 
+        # 对齐HistEncoder的输入和Dit的输入维度，方便后续融合全局条件。
+        self.context_proj = nn.Linear(int(args.encoder_input_dim) * 2, self.hidden_dim)
+        nn.init.xavier_uniform_(self.context_proj.weight)
+        nn.init.constant_(self.context_proj.bias, 0)
+
         self.timestep_embedder = dit.TimestepEmbedder(self.hidden_dim, self.time_embedding_size)
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=self.num_train_timesteps,
@@ -116,7 +121,8 @@ class DiffusionFut(nn.Module):
         t_emb = self.timestep_embedder(timesteps)
         combined_input = torch.cat([x_t, pred_x0_cond], dim=-1)
         input_embedded = self.input_embedding(combined_input) + self.pos_embedding(x_t)
-        pred_x0 = self.dit(x=input_embedded, y=t_emb + enc_emb, cross=context)
+        context_aligned = self.context_proj(context)
+        pred_x0 = self.dit(x=input_embedded, y=t_emb + enc_emb, cross=context_aligned)
         return pred_x0
 
     # Compute anisotropic smooth-l1 loss in normalized residual space.
