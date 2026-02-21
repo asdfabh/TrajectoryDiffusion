@@ -15,7 +15,6 @@ class DiffusionFut(nn.Module):
         super(DiffusionFut, self).__init__()
         self.args = args
 
-        self.input_dim = int(args.input_dim_fut)
         self.hidden_dim = int(args.hidden_dim_fut)
         self.output_dim = int(args.output_dim_fut)
         self.heads = int(args.heads_fut)
@@ -44,16 +43,16 @@ class DiffusionFut(nn.Module):
         self.is_main_process = int(os.environ.get("RANK", "0")) == 0
 
         # Input is [x_t_residual, self_condition_residual].
-        self.input_embedding = nn.Linear(self.output_dim * 2, self.input_dim)
-        self.pos_embedding = SequentialPositionalEncoding(self.input_dim)
+        self.input_embedding = nn.Linear(self.output_dim * 2, self.hidden_dim)
+        self.pos_embedding = SequentialPositionalEncoding(self.hidden_dim)
         self.hist_encoder = HistEncoder(args)
 
         # HistEncoder outputs context with 2 * encoder_input_dim channels.
-        self.enc_embedding = nn.Linear(int(args.encoder_input_dim) * 2, self.input_dim)
+        self.enc_embedding = nn.Linear(int(args.encoder_input_dim) * 2, self.hidden_dim)
         nn.init.xavier_uniform_(self.enc_embedding.weight)
         nn.init.constant_(self.enc_embedding.bias, 0)
 
-        self.timestep_embedder = dit.TimestepEmbedder(self.input_dim, self.time_embedding_size)
+        self.timestep_embedder = dit.TimestepEmbedder(self.hidden_dim, self.time_embedding_size)
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=self.num_train_timesteps,
             beta_schedule="squaredcos_cap_v2",
@@ -61,8 +60,8 @@ class DiffusionFut(nn.Module):
             clip_sample=False,
         )
 
-        dit_block = dit.DiTBlock(self.input_dim, self.heads, self.dropout, self.mlp_ratio)
-        final_layer = dit.FinalLayer(self.input_dim, self.T, self.output_dim)
+        dit_block = dit.DiTBlock(self.hidden_dim, self.heads, self.dropout, self.mlp_ratio)
+        final_layer = dit.FinalLayer(self.hidden_dim, self.T, self.output_dim)
         self.dit = dit.DiT(dit_block=dit_block, final_layer=final_layer, depth=self.depth, model_type="x_start")
 
         # Keep current project normalization stats.
@@ -70,6 +69,7 @@ class DiffusionFut(nn.Module):
         self.register_buffer("pos_std", torch.tensor([8.8866, 68.8105]).float(), persistent=False)
         self.register_buffer("va_mean", torch.tensor([21.1503, 0.0060]).float(), persistent=False)
         self.register_buffer("va_std", torch.tensor([13.5983, 4.5057]).float(), persistent=False)
+
 
     @staticmethod
     # Convert op_mask to [B, T] valid mask.
@@ -120,10 +120,30 @@ class DiffusionFut(nn.Module):
         return pred_x0
 
     # Compute anisotropic smooth-l1 loss in normalized residual space.
+    # def computeLoss(self, pred_res, target_res, valid_mask):
+    #     axis_weight = torch.tensor([1.0, self.y_loss_weight], device=pred_res.device, dtype=pred_res.dtype).view(1, 1, 2)
+    #     loss = F.smooth_l1_loss(pred_res, target_res, reduction="none", beta=self.huber_delta)
+    #     loss = loss * axis_weight
+    #     valid = valid_mask.unsqueeze(-1)
+    #     numer = (loss * valid).sum(dim=(1, 2))
+    #     denom = valid.sum(dim=(1, 2)) + 1e-6
+    #     return (numer / denom).mean()
+
     def computeLoss(self, pred_res, target_res, valid_mask):
-        axis_weight = torch.tensor([1.0, self.y_loss_weight], device=pred_res.device, dtype=pred_res.dtype).view(1, 1, 2)
-        loss = F.smooth_l1_loss(pred_res, target_res, reduction="none", beta=self.huber_delta)
-        loss = loss * axis_weight
+        # 将归一化残差还原回真实的物理空间 (单位：英尺)
+        std = self.pos_std.view(1, 1, 2).to(pred_res.device)
+        pred_phys = pred_res[..., :2] * std
+        target_phys = target_res[..., :2] * std
+
+        # 在物理空间直接使用纯粹的 L1 Loss (绝对误差)
+        loss = F.l1_loss(pred_phys, target_phys, reduction="none")
+
+        # 时序递增惩罚：逼迫模型随着时间推移咬死远端 FDE (从 1.0 线性递增到 2.0)
+        T_len = loss.size(1)
+        time_weights = torch.linspace(1.0, 2.0, T_len, device=loss.device, dtype=loss.dtype).view(1, T_len, 1)
+        loss = loss * time_weights
+
+        # 掩码求真实的平均物理误差
         valid = valid_mask.unsqueeze(-1)
         numer = (loss * valid).sum(dim=(1, 2))
         denom = valid.sum(dim=(1, 2)) + 1e-6
@@ -277,11 +297,11 @@ class DiffusionFut(nn.Module):
     def norm(self, x):
         x_norm = x.clone()
         x_norm[..., 0:2] = (x[..., 0:2] - self.pos_mean) / self.pos_std
-        x_norm[..., 0:2] = torch.clamp(x_norm[..., 0:2], -5.0, 5.0)
+        x_norm[..., 0:2] = torch.clamp(x_norm[..., 0:2], -10.0, 10.0)
         channels = x_norm.shape[-1]
         if channels >= 4:
             x_norm[..., 2:4] = (x[..., 2:4] - self.va_mean) / self.va_std
-            x_norm[..., 2:4] = torch.clamp(x_norm[..., 2:4], -5.0, 5.0)
+            x_norm[..., 2:4] = torch.clamp(x_norm[..., 2:4], -10.0, 10.0)
         return x_norm
 
     # De-normalize trajectory features to physical units.

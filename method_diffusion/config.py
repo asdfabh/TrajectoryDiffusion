@@ -14,18 +14,18 @@ def get_args_parser():
 
     # Train runtime
     parser.add_argument("--batch_size", default=512, type=int)
-    parser.add_argument("--num_epochs", default=50, type=int)
+    parser.add_argument("--num_epochs", default=100, type=int)
     parser.add_argument("--num_workers", default=10, type=int)
     parser.add_argument("--learning_rate", default=1e-4, type=float)
     parser.add_argument("--save_interval", default=5, type=int)
     parser.add_argument("--mask_prob", default=0.4, type=float)
     parser.add_argument("--checkpoint_dir", default="./checkpoints", type=str)
-    parser.add_argument("--resume_fut", default="none", type=str)
+    parser.add_argument("--resume_fut", default="None", type=str)
     parser.add_argument("--resume_hist", default="best", type=str)
 
     # Hist diffusion model
-    parser.add_argument("--input_dim", default=128, type=int)
-    parser.add_argument("--hidden_dim", default=128, type=int)
+    # parser.add_argument("--input_dim", default=128, type=int)
+    parser.add_argument("--hidden_dim", default=256, type=int)
     parser.add_argument("--output_dim", default=4, type=int)
     parser.add_argument("--hist_length", default=16, type=int)
     parser.add_argument("--pred_length", default=25, type=int)
@@ -53,8 +53,8 @@ def get_args_parser():
     parser.add_argument("--input_dim_fut", default=128, type=int)
     parser.add_argument("--hidden_dim_fut", default=128, type=int)
     parser.add_argument("--output_dim_fut", default=2, type=int)
-    parser.add_argument("--heads_fut", default=4, type=int)
-    parser.add_argument("--depth_fut", default=4, type=int)
+    parser.add_argument("--heads_fut", default=8, type=int)
+    parser.add_argument("--depth_fut", default=6, type=int)
     parser.add_argument("--dropout_fut", default=0.1, type=float)
     parser.add_argument("--mlp_ratio_fut", default=4, type=int)
     parser.add_argument("--num_train_timesteps_fut", default=500, type=int)
@@ -65,7 +65,7 @@ def get_args_parser():
     parser.add_argument("--num_inference_steps", default=20, type=int)
     parser.add_argument("--inference_timestep_spacing", default="trailing", type=str, choices=["leading", "trailing"])
     parser.add_argument("--ddim_eta", default=0.0, type=float)
-    parser.add_argument("--x0_clip", default=5.0, type=float)
+    parser.add_argument("--x0_clip", default=10.0, type=float)
 
     # Fut train strategy
     parser.add_argument("--self_condition_prob", default=0.5, type=float)

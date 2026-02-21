@@ -450,7 +450,7 @@ def main():
     parser.add_argument('--eval_mode', type=str, default='fut_only', choices=['fut_only', 'joint'],
                         help="评估模式: 'fut_only' (使用GT历史) 或 'joint' (使用Hist模型输出)")
     parser.add_argument('--test_path', type=str, default=None, help="测试集路径 (可选，覆盖默认)")
-    parser.add_argument('--test_ratio', type=float, default=1.0,
+    parser.add_argument('--test_ratio', type=float, default=0.1,
                         help="测试集评估比例，0~1，默认1.0表示全量")
     parser.add_argument('--visualize_samples', type=int, default=0, help="可视化样本数，0表示不绘制")
     parser.add_argument('--visualize_dir', type=str, default=None, help="可视化图片保存目录")
