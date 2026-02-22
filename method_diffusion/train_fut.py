@@ -86,6 +86,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
         loss = model.forwardTrain(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+        # _, pred_fut, _, _ = model.forwardEval_minADE(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, K=5)
 
         optimizer.zero_grad()
         loss.backward()
@@ -105,6 +106,11 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
 
 @torch.no_grad()
 def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_ratio=0.1, max_batches=0):
+    # 固定验证环节的随机数种子，消除采样方差导致的指标波动
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
     model.eval()
     total_loss = 0.0
     total_ade = 0.0
@@ -128,14 +134,7 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
             break
 
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-
-        # 训练过程中的验证阶段，为了保持指标口径一致，统一使用多模态评测函数
-        try:
-            eval_loss, _, eval_ade, eval_fde = model.forwardEval_minADE(hist, hist_nbrs, mask, temporal_mask, fut,
-                                                                        op_mask, device, K=5)
-        except AttributeError:
-            eval_loss, _, eval_ade, eval_fde = model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask,
-                                                                 device)
+        eval_loss, _, eval_ade, eval_fde = model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
 
         total_loss += float(eval_loss.item())
         total_ade += float(eval_ade.item())
@@ -213,11 +212,6 @@ def main():
 
     log_dir = Path(args.checkpoint_dir) / "logs"
     writer = SummaryWriter(log_dir=str(log_dir))
-
-    # 固定验证环节的随机数种子，消除采样方差导致的指标波动
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))

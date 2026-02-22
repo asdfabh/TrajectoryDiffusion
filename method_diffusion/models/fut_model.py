@@ -311,8 +311,59 @@ class DiffusionFut(nn.Module):
         return loss, pred_phys_abs, ade, fde
 
     @torch.no_grad()
+    # def forwardEval_minADE(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, K=5):
+    #     """ OOM-Safe SOTA 多模态评估 (minADE_K)"""
+    #     bsz, t_len, _ = future.shape
+    #     valid_mask = self.toValidMask(op_mask, t_len, bsz, device)
+    #     anchor_phys = hist[..., -1:, :self.output_dim]
+    #     future_phys = future[..., :self.output_dim]
+    #
+    #     hist_norm = self.norm(hist)
+    #     context, _ = self.hist_encoder(hist_norm, self.norm(hist_nbrs), mask, temporal_mask)
+    #     enc_emb = self.encodeGlobalCondition(context)
+    #     context_aligned = self.context_proj(context)
+    #
+    #     infer_scheduler = self.buildInferenceScheduler()
+    #     std_vel = self.vel_std.view(1, 1, 2).to(device)
+    #     mean_vel = self.vel_mean.view(1, 1, 2).to(device)
+    #
+    #     all_preds = []
+    #     for _ in range(K):
+    #         # 每次给予完全独立的随机速度噪声，产生平行宇宙分化
+    #         x_t = torch.randn((bsz, t_len, self.output_dim), device=device)
+    #         pred_vel_norm = self.rolloutFromXt(x_t, context_aligned, enc_emb, infer_scheduler)
+    #         pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
+    #         pred_pos_phys = torch.cumsum(pred_vel_phys, dim=1) + anchor_phys[..., :2]
+    #
+    #         pred_phys_abs = future_phys.clone()
+    #         pred_phys_abs[..., :2] = pred_pos_phys
+    #         all_preds.append(pred_phys_abs)
+    #
+    #     all_preds = torch.stack(all_preds, dim=1)  # [B, K, T, dim]
+    #
+    #     # 计算 minADE_K
+    #     target_phys = future_phys[..., :2].unsqueeze(1)
+    #     diff = torch.norm(all_preds[..., :2] - target_phys, dim=-1)  # [B, K, T]
+    #     valid_mask_exp = valid_mask.unsqueeze(1)  # [B, 1, T]
+    #
+    #     ade_k = (diff * valid_mask_exp).sum(dim=2) / (valid_mask_exp.sum(dim=2) + 1e-6)  # [B, K]
+    #     min_ade, best_k_idx = torch.min(ade_k, dim=1)  # [B]
+    #
+    #     best_k_idx_exp = best_k_idx.view(bsz, 1, 1, 1).expand(bsz, 1, t_len, all_preds.size(-1))
+    #     best_pred_phys = all_preds.gather(1, best_k_idx_exp).squeeze(1)  # [B, T, dim]
+    #
+    #     ade_batch, fde_batch = self.computeAdeFde(best_pred_phys, future, valid_mask)
+    #     dummy_loss = torch.tensor(0.0, device=device)
+    #     self.maybeVisualize(hist, future, best_pred_phys, valid_mask, stage="eval")
+    #
+    #     return dummy_loss, best_pred_phys, ade_batch, fde_batch
+
+    @torch.no_grad()
     def forwardEval_minADE(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, K=5):
-        """ OOM-Safe SOTA 多模态评估 (minADE_K)"""
+        """
+        并行化提速版 SOTA 多模态评估 (minADE_K)
+        通过在 Batch 维度展开，消除 for 循环，推理速度提升 K 倍。
+        """
         bsz, t_len, _ = future.shape
         valid_mask = self.toValidMask(op_mask, t_len, bsz, device)
         anchor_phys = hist[..., -1:, :self.output_dim]
@@ -323,34 +374,58 @@ class DiffusionFut(nn.Module):
         enc_emb = self.encodeGlobalCondition(context)
         context_aligned = self.context_proj(context)
 
+        # 核心提速优化：在 Batch 维度上并行展开 K 倍
+        context_aligned_k = context_aligned.repeat_interleave(K, dim=0)
+        enc_emb_k = enc_emb.repeat_interleave(K, dim=0)
+
         infer_scheduler = self.buildInferenceScheduler()
         std_vel = self.vel_std.view(1, 1, 2).to(device)
         mean_vel = self.vel_mean.view(1, 1, 2).to(device)
 
-        all_preds = []
-        for _ in range(K):
-            # 每次给予完全独立的随机速度噪声，产生平行宇宙分化
-            x_t = torch.randn((bsz, t_len, self.output_dim), device=device)
-            pred_vel_norm = self.rolloutFromXt(x_t, context_aligned, enc_emb, infer_scheduler)
-            pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
-            pred_pos_phys = torch.cumsum(pred_vel_phys, dim=1) + anchor_phys[..., :2]
+        # 一次性生成 bsz * K 份随机噪声，并行执行完整的去噪过程
+        x_t_k = torch.randn((bsz * K, t_len, self.output_dim), device=device)
+        pred_vel_cond_k = torch.zeros((bsz * K, t_len, self.output_dim), device=device, dtype=x_t_k.dtype)
 
-            pred_phys_abs = future_phys.clone()
-            pred_phys_abs[..., :2] = pred_pos_phys
-            all_preds.append(pred_phys_abs)
+        for t in infer_scheduler.timesteps:
+            t_scalar = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
+            timesteps_k = torch.full((bsz * K,), t_scalar, device=device, dtype=torch.long)
 
-        all_preds = torch.stack(all_preds, dim=1)  # [B, K, T, dim]
+            pred_vel_norm_k = self.predictX0(x_t_k, timesteps_k, context_aligned_k, enc_emb_k, pred_vel_cond_k)
+            if self.x0_clip is not None:
+                pred_vel_norm_k = torch.clamp(pred_vel_norm_k, -self.x0_clip, self.x0_clip)
+
+            pred_vel_cond_k = pred_vel_norm_k.detach()
+            try:
+                x_t_k = infer_scheduler.step(pred_vel_norm_k, t, x_t_k, eta=self.ddim_eta).prev_sample
+            except TypeError:
+                x_t_k = infer_scheduler.step(pred_vel_norm_k, t, x_t_k).prev_sample
+
+        # 把并发结果 Reshape 回 [bsz, K, t_len, dim]
+        pred_vel_norm = pred_vel_cond_k.view(bsz, K, t_len, self.output_dim)
+
+        # 积分还原物理坐标 (张量广播)
+        std_vel_k = std_vel.unsqueeze(1)  # [1, 1, 1, 2]
+        mean_vel_k = mean_vel.unsqueeze(1)
+        pred_vel_phys = pred_vel_norm[..., :2] * std_vel_k + mean_vel_k
+
+        anchor_phys_k = anchor_phys[..., :2].unsqueeze(1)  # [bsz, 1, 1, 2]
+        pred_pos_phys = torch.cumsum(pred_vel_phys, dim=2) + anchor_phys_k
+
+        # 兼容多维度特征拼接
+        all_preds = future_phys.unsqueeze(1).repeat(1, K, 1, 1).clone()
+        all_preds[..., :2] = pred_pos_phys
 
         # 计算 minADE_K
-        target_phys = future_phys[..., :2].unsqueeze(1)
-        diff = torch.norm(all_preds[..., :2] - target_phys, dim=-1)  # [B, K, T]
-        valid_mask_exp = valid_mask.unsqueeze(1)  # [B, 1, T]
+        target_phys = future_phys[..., :2].unsqueeze(1)  # [bsz, 1, t_len, 2]
+        diff = torch.norm(all_preds[..., :2] - target_phys, dim=-1)
+        valid_mask_exp = valid_mask.unsqueeze(1)
 
-        ade_k = (diff * valid_mask_exp).sum(dim=2) / (valid_mask_exp.sum(dim=2) + 1e-6)  # [B, K]
-        min_ade, best_k_idx = torch.min(ade_k, dim=1)  # [B]
+        ade_k = (diff * valid_mask_exp).sum(dim=2) / (valid_mask_exp.sum(dim=2) + 1e-6)
+        min_ade, best_k_idx = torch.min(ade_k, dim=1)
 
-        best_k_idx_exp = best_k_idx.view(bsz, 1, 1, 1).expand(bsz, 1, t_len, all_preds.size(-1))
-        best_pred_phys = all_preds.gather(1, best_k_idx_exp).squeeze(1)  # [B, T, dim]
+        # 提取 K 条中最贴合真实意图的那一条
+        best_k_idx_exp = best_k_idx.view(bsz, 1, 1, 1).expand(bsz, 1, t_len, self.output_dim)
+        best_pred_phys = all_preds.gather(1, best_k_idx_exp).squeeze(1)
 
         ade_batch, fde_batch = self.computeAdeFde(best_pred_phys, future, valid_mask)
         dummy_loss = torch.tensor(0.0, device=device)
