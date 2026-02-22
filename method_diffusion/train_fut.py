@@ -1,6 +1,7 @@
 import sys
 import os
 import math
+import copy
 from pathlib import Path
 
 import torch
@@ -13,6 +14,32 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
+
+
+# 指数移动平均 (Exponential Moving Average) 包装器类
+# 用于平滑扩散模型在训练后期的参数高频震荡
+class EMAModel:
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = copy.deepcopy(model.state_dict())
+        # 影子参数仅做记录，不参与反向传播和梯度计算
+        for param in self.shadow.values():
+            if isinstance(param, torch.Tensor):
+                param.requires_grad = False
+
+    def step(self, model):
+        # 每次优化器步进后调用此方法，平滑更新影子权重
+        with torch.no_grad():
+            for name, param in model.state_dict().items():
+                if name in self.shadow:
+                    if param.dtype.is_floating_point:
+                        self.shadow[name].mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
+                    else:
+                        self.shadow[name].copy_(param.data)
+
+    def apply_shadow(self, target_model):
+        # 将当前的影子权重加载到目标模型中，用于评估或推理
+        target_model.load_state_dict(self.shadow)
 
 
 def prepare_input_data(batch, feature_dim, device="cuda"):
@@ -49,7 +76,8 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
 
 
-def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
+# 训练函数新增 ema 参数，在反向传播后进行滑动平均更新
+def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -58,12 +86,15 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
         loss = model.forwardTrain(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
-        # _, pred_fut, _, _ = model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
 
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+
+        # 每次真实权重梯度更新后，让影子模型平滑跟进
+        if ema is not None:
+            ema.step(model)
 
         total_loss += float(loss.item())
         num_batches += 1
@@ -97,14 +128,20 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
             break
 
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        eval_loss, _, eval_ade, eval_fde = model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+
+        # 训练过程中的验证阶段，为了保持指标口径一致，统一使用多模态评测函数
+        try:
+            eval_loss, _, eval_ade, eval_fde = model.forwardEval_minADE(hist, hist_nbrs, mask, temporal_mask, fut,
+                                                                        op_mask, device, K=5)
+        except AttributeError:
+            eval_loss, _, eval_ade, eval_fde = model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask,
+                                                                 device)
 
         total_loss += float(eval_loss.item())
         total_ade += float(eval_ade.item())
         total_fde += float(eval_fde.item())
         num_batches += 1
         pbar.set_postfix({
-            "eval_loss": f"{eval_loss.item():.6f}",
             "avg_ade_ft": f"{(total_ade / num_batches):.4f}",
             "avg_fde_ft": f"{(total_fde / num_batches):.4f}",
         })
@@ -115,7 +152,7 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
     return total_loss / num_batches, total_ade / num_batches, total_fde / num_batches
 
 
-def load_checkpoint_if_needed(args, model, optimizer, scheduler, device):
+def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, ema=None):
     start_epoch = 0
     best_ade = float("inf")
     ckpt_path = None
@@ -143,7 +180,20 @@ def load_checkpoint_if_needed(args, model, optimizer, scheduler, device):
 
     if ckpt_path is not None:
         state = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(state["model_state_dict"], strict=False)
+
+        # 兼容性设计：如果存在 raw_model_state_dict，说明这是带 EMA 的断点，优先用 raw 恢复训练状态
+        if "raw_model_state_dict" in state:
+            model.load_state_dict(state["raw_model_state_dict"], strict=False)
+        else:
+            model.load_state_dict(state["model_state_dict"], strict=False)
+
+        # 同步恢复 EMA 的影子权重
+        if ema is not None:
+            if "model_state_dict" in state and "raw_model_state_dict" in state:
+                ema.shadow = copy.deepcopy(state["model_state_dict"])
+            else:
+                ema.shadow = copy.deepcopy(model.state_dict())
+
         try:
             optimizer.load_state_dict(state["optimizer_state_dict"])
             scheduler.load_state_dict(state["scheduler_state_dict"])
@@ -164,6 +214,11 @@ def main():
     log_dir = Path(args.checkpoint_dir) / "logs"
     writer = SummaryWriter(log_dir=str(log_dir))
 
+    # 固定验证环节的随机数种子，消除采样方差导致的指标波动
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
     if eval_ratio <= 0.0:
@@ -176,9 +231,6 @@ def main():
     print(
         f"[FutModel] Train strategy: self_condition_prob={args.self_condition_prob}, "
         f"loss=smooth_l1_residual_anchor, y_weight={args.fut_y_loss_weight}, huber_delta={args.fut_huber_delta}"
-    )
-    print(
-        f"[FutModel] Architecture: hidden_dim_fut={args.hidden_dim_fut}, depth_fut={args.depth_fut}"
     )
     print(
         f"[FutModel] TestSet eval sampling: eval_ratio={eval_ratio}, eval_max_batches={args.eval_max_batches}"
@@ -227,16 +279,24 @@ def main():
     )
 
     model = DiffusionFut(args).to(device)
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"[FutModel] Parameters: {num_params / 1e6:.3f} M")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
 
-    start_epoch, best_ade = load_checkpoint_if_needed(args, model, optimizer, scheduler, device)
+    # 初始化 EMA 实例，扩散模型黄金衰减率 0.999
+    ema = EMAModel(model, decay=0.999)
+
+    start_epoch, best_ade = load_checkpoint_if_needed(args, model, optimizer, scheduler, device, ema)
 
     for epoch in range(start_epoch, args.num_epochs):
         print(f"\n========== Epoch {epoch + 1}/{args.num_epochs} ==========")
-        avg_loss = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim)
+
+        # 训练阶段：传入 ema 参与权重影子步进
+        avg_loss = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim, ema)
+
+        # 评估阶段：为了不破坏正在训练的原始权重，先深拷贝备份，再套用 EMA 权重
+        original_state = {k: v.clone() for k, v in model.state_dict().items()}
+        ema.apply_shadow(model)
+
         eval_loss, eval_ade, eval_fde = evaluate_on_testset(
             model,
             test_loader,
@@ -246,6 +306,9 @@ def main():
             eval_ratio=eval_ratio,
             max_batches=args.eval_max_batches,
         )
+
+        # 评估结束，将原始训练权重覆盖回来，继续下一轮训练
+        model.load_state_dict(original_state)
 
         print(f"Epoch [{epoch + 1}] Train Loss: {avg_loss:.6f}")
         print(
@@ -264,9 +327,14 @@ def main():
 
         scheduler.step()
 
+        # 模型保存阶段核心逻辑：
+        # 将极其平滑的 EMA 权重存入默认的 model_state_dict 键中。
+        # 这样当你直接用 evaluate_fut.py 跑测试时，无需改任何代码，加载的就是最佳参数。
+        # 同时保存 raw_model_state_dict 用于断点恢复真实的训练状态。
         state = {
             "epoch": epoch + 1,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": ema.shadow,
+            "raw_model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "loss": avg_loss,

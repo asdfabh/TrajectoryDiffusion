@@ -318,6 +318,11 @@ def compute_single_vis_metrics(pred, target, op_mask, batch_idx=0, meter_per_uni
 
 
 def run_evaluation(args, device):
+    # 强制固定测试时的噪声种子！
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
     test_loader = get_test_loader(args)
     total_test_batches = len(test_loader)
     test_ratio = max(0.0, min(1.0, float(args.test_ratio)))
@@ -390,7 +395,8 @@ def run_evaluation(args, device):
                 calc_hist.update(pred_hist[..., :2], hist[..., :2], valid_mask=torch.ones_like(hist[..., 0]))
                 current_hist_input = pred_hist
 
-            _, pred_fut, _, _ = model_fut.forwardEval(current_hist_input, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+            # _, pred_fut, _, _ = model_fut.forwardEval(current_hist_input, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+            _, pred_fut, _, _ = model_fut.forwardEval_minADE(current_hist_input, hist_nbrs, mask, temporal_mask, fut, op_mask, device, K=5)
             calc_fut.update(pred_fut, fut, valid_mask=op_mask)
 
             if visualized_count < args.visualize_samples:
@@ -453,7 +459,7 @@ def main():
     parser.add_argument('--eval_mode', type=str, default='fut_only', choices=['fut_only', 'joint'],
                         help="评估模式: 'fut_only' (使用GT历史) 或 'joint' (使用Hist模型输出)")
     parser.add_argument('--test_path', type=str, default=None, help="测试集路径 (可选，覆盖默认)")
-    parser.add_argument('--test_ratio', type=float, default=0.1, help="测试集评估比例，0~1，默认0.1表示评估10% TestSet")
+    parser.add_argument('--test_ratio', type=float, default=0.03, help="测试集评估比例，0~1，默认0.1表示评估10% TestSet")
     parser.add_argument('--visualize_samples', type=int, default=0, help="可视化样本数，0表示不绘制")
     parser.add_argument('--visualize_dir', type=str, default=None, help="可视化图片保存目录")
     parser.add_argument('--show_plots', action='store_true', help="是否弹窗显示可视化")
