@@ -58,6 +58,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
         loss = model.forwardTrain(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+        # _, pred_fut, _, _ = model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
 
         optimizer.zero_grad()
         loss.backward()
@@ -177,6 +178,9 @@ def main():
         f"loss=smooth_l1_residual_anchor, y_weight={args.fut_y_loss_weight}, huber_delta={args.fut_huber_delta}"
     )
     print(
+        f"[FutModel] Architecture: hidden_dim_fut={args.hidden_dim_fut}, depth_fut={args.depth_fut}"
+    )
+    print(
         f"[FutModel] TestSet eval sampling: eval_ratio={eval_ratio}, eval_max_batches={args.eval_max_batches}"
     )
 
@@ -223,6 +227,8 @@ def main():
     )
 
     model = DiffusionFut(args).to(device)
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"[FutModel] Parameters: {num_params / 1e6:.3f} M")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
 

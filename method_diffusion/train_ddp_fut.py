@@ -252,6 +252,9 @@ def main():
             f"loss=smooth_l1_residual_anchor, y_weight={args.fut_y_loss_weight}, huber_delta={args.fut_huber_delta}"
         )
         print(
+            f"[FutModel] Architecture: hidden_dim_fut={args.hidden_dim_fut}, depth_fut={args.depth_fut}"
+        )
+        print(
             f"[FutModel] TestSet eval sampling: eval_ratio={fixed_eval_ratio}, "
             f"eval_max_batches={args.eval_max_batches}"
         )
@@ -308,6 +311,9 @@ def main():
         )
 
     model = DiffusionFut(args).to(device)
+    if rank == 0:
+        num_params = sum(p.numel() for p in model.parameters())
+        print(f"[FutModel] Parameters: {num_params / 1e6:.3f} M")
 
     # 仅在分布式环境下使用 DDP
     if dist.is_initialized():

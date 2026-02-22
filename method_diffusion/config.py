@@ -24,7 +24,7 @@ def get_args_parser():
     parser.add_argument("--resume_hist", default="best", type=str)
 
     # Hist diffusion model
-    # parser.add_argument("--input_dim", default=128, type=int)
+    parser.add_argument("--input_dim", default=128, type=int)
     parser.add_argument("--hidden_dim", default=128, type=int)
     parser.add_argument("--output_dim", default=4, type=int)
     parser.add_argument("--hist_length", default=16, type=int)
@@ -50,11 +50,11 @@ def get_args_parser():
     parser.add_argument("--network", default="highwaynet", type=str)
 
     # Fut diffusion model
-    # parser.add_argument("--input_dim_fut", default=128, type=int)
-    parser.add_argument("--hidden_dim_fut", default=256, type=int)
+    parser.add_argument("--input_dim_fut", default=128, type=int)
+    parser.add_argument("--hidden_dim_fut", default=128, type=int)
     parser.add_argument("--output_dim_fut", default=2, type=int)
-    parser.add_argument("--heads_fut", default=8, type=int)
-    parser.add_argument("--depth_fut", default=6, type=int)
+    parser.add_argument("--heads_fut", default=4, type=int)
+    parser.add_argument("--depth_fut", default=4, type=int)
     parser.add_argument("--dropout_fut", default=0.1, type=float)
     parser.add_argument("--mlp_ratio_fut", default=4, type=int)
     parser.add_argument("--num_train_timesteps_fut", default=500, type=int)
