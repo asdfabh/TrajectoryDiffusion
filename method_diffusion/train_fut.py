@@ -277,7 +277,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
 
     # 初始化 EMA 实例，扩散模型黄金衰减率 0.999
-    ema = EMAModel(model, decay=0.999)
+    ema = EMAModel(model, decay=0.9999)
 
     start_epoch, best_ade = load_checkpoint_if_needed(args, model, optimizer, scheduler, device, ema)
 
