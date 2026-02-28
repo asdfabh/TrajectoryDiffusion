@@ -252,6 +252,14 @@ def main():
             f"loss=smooth_l1_residual_anchor, y_weight={args.fut_y_loss_weight}, huber_delta={args.fut_huber_delta}"
         )
         print(
+            f"[FutModel] PosLoss warmup: min={args.fut_pos_loss_weight_min}, "
+            f"max={args.fut_pos_loss_weight_max}, warmup_ratio={args.fut_pos_loss_warmup_ratio}"
+        )
+        print(
+            f"[FutModel] CFG: enabled={int(args.cfg_enabled) > 0}, "
+            f"drop_prob={args.cfg_drop_prob}, guidance_scale={args.cfg_guidance_scale}"
+        )
+        print(
             f"[FutModel] Architecture: hidden_dim_fut={args.hidden_dim_fut}, depth_fut={args.depth_fut}"
         )
         print(
@@ -338,9 +346,12 @@ def main():
     for epoch in range(start_epoch, args.num_epochs):
         # 重要：设置 epoch 以保证每个 epoch 的 shuffle 不同
         train_sampler.set_epoch(epoch)
+        fut_model = model.module if hasattr(model, "module") else model
+        fut_model.setTrainProgress(epoch + 1, args.num_epochs)
 
         if rank == 0:
             print(f"\n========== Epoch {epoch + 1}/{args.num_epochs} ==========")
+            print(f"[FutModel] PosLoss alpha(epoch={epoch + 1}): {fut_model.getPosLossWeight():.4f}")
 
         avg_loss = train_epoch(
             model, train_loader, optimizer, device, epoch + 1,

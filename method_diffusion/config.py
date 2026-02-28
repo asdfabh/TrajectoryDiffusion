@@ -69,10 +69,16 @@ def get_args_parser():
 
     # Fut train strategy
     parser.add_argument("--self_condition_prob", default=0.5, type=float)
+    parser.add_argument("--cfg_enabled", default=1, type=int)
+    parser.add_argument("--cfg_drop_prob", default=0.15, type=float)
+    parser.add_argument("--cfg_guidance_scale", default=2.0, type=float)
 
     # Fut loss
     parser.add_argument("--fut_y_loss_weight", default=2.0, type=float)
     parser.add_argument("--fut_huber_delta", default=1.0, type=float)
+    parser.add_argument("--fut_pos_loss_weight_min", default=0.0, type=float)
+    parser.add_argument("--fut_pos_loss_weight_max", default=1.0, type=float)
+    parser.add_argument("--fut_pos_loss_warmup_ratio", default=0.2, type=float)
 
     # Fut visualization
     parser.add_argument("--fut_enable_train_vis", default=0, type=int)

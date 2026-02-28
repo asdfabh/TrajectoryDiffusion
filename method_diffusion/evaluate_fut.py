@@ -356,6 +356,10 @@ def run_evaluation(args, device):
         f"[FutModel] Inference sampler: steps={args.num_inference_steps}, "
         f"spacing={args.inference_timestep_spacing}, eta={args.ddim_eta}, x0_clip={args.x0_clip}, mode=residual_anchor_rollout"
     )
+    print(
+        f"[FutModel] CFG: enabled={int(args.cfg_enabled) > 0}, "
+        f"drop_prob={args.cfg_drop_prob}, guidance_scale={args.cfg_guidance_scale}"
+    )
 
     if args.eval_mode == 'joint':
         print("\n[Init] Initializing Hist Model for Joint Evaluation...")
@@ -459,7 +463,7 @@ def main():
     parser.add_argument('--eval_mode', type=str, default='fut_only', choices=['fut_only', 'joint'],
                         help="评估模式: 'fut_only' (使用GT历史) 或 'joint' (使用Hist模型输出)")
     parser.add_argument('--test_path', type=str, default=None, help="测试集路径 (可选，覆盖默认)")
-    parser.add_argument('--test_ratio', type=float, default=0.03, help="测试集评估比例，0~1，默认0.1表示评估10% TestSet")
+    parser.add_argument('--test_ratio', type=float, default=1.0, help="测试集评估比例，0~1，默认0.1表示评估10% TestSet")
     parser.add_argument('--visualize_samples', type=int, default=0, help="可视化样本数，0表示不绘制")
     parser.add_argument('--visualize_dir', type=str, default=None, help="可视化图片保存目录")
     parser.add_argument('--show_plots', action='store_true', help="是否弹窗显示可视化")

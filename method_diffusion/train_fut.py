@@ -227,6 +227,14 @@ def main():
         f"loss=smooth_l1_residual_anchor, y_weight={args.fut_y_loss_weight}, huber_delta={args.fut_huber_delta}"
     )
     print(
+        f"[FutModel] PosLoss warmup: min={args.fut_pos_loss_weight_min}, "
+        f"max={args.fut_pos_loss_weight_max}, warmup_ratio={args.fut_pos_loss_warmup_ratio}"
+    )
+    print(
+        f"[FutModel] CFG: enabled={int(args.cfg_enabled) > 0}, "
+        f"drop_prob={args.cfg_drop_prob}, guidance_scale={args.cfg_guidance_scale}"
+    )
+    print(
         f"[FutModel] TestSet eval sampling: eval_ratio={eval_ratio}, eval_max_batches={args.eval_max_batches}"
     )
 
@@ -283,6 +291,9 @@ def main():
 
     for epoch in range(start_epoch, args.num_epochs):
         print(f"\n========== Epoch {epoch + 1}/{args.num_epochs} ==========")
+        model.setTrainProgress(epoch + 1, args.num_epochs)
+        cur_pos_weight = model.getPosLossWeight()
+        print(f"[FutModel] PosLoss alpha(epoch={epoch + 1}): {cur_pos_weight:.4f}")
 
         # 训练阶段：传入 ema 参与权重影子步进
         avg_loss = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim, ema)
@@ -317,6 +328,7 @@ def main():
         writer.add_scalar("Eval/FDE_ft", eval_fde, epoch + 1)
         writer.add_scalar("Eval/ADE_m", eval_ade * 0.3048, epoch + 1)
         writer.add_scalar("Eval/FDE_m", eval_fde * 0.3048, epoch + 1)
+        writer.add_scalar("Train/PosLossWeight", cur_pos_weight, epoch + 1)
         writer.add_scalar("Train/LR", optimizer.param_groups[0]["lr"], epoch + 1)
 
         scheduler.step()
