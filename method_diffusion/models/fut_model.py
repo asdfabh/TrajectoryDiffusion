@@ -77,6 +77,7 @@ class DiffusionFut(nn.Module):
             prediction_type="sample",
             clip_sample=False,
         )
+        self.latest_loss_stats = {}
 
         dit_block = dit.DiTBlock(self.hidden_dim, self.heads, self.dropout, self.mlp_ratio)  # 单层 DiT Block 模板。
         final_layer = dit.FinalLayer(self.hidden_dim, self.T, self.output_dim)  # DiT 输出头（映射到 output_dim）。
@@ -90,9 +91,9 @@ class DiffusionFut(nn.Module):
         self.register_buffer("va_std", torch.tensor([13.5983, 4.5057]).float(), persistent=False)  # 速度/加速度标准差 [v_std, a_std]。
 
         # 核心新增：专门针对帧间相对位移 (Velocity) 的高斯先验参数
-        # 横向 X 变道速度极小均值约 0，纵向 Y 每帧(0.2s)平均约 11ft
-        self.register_buffer("vel_mean", torch.tensor([0.0066, 6.9922]).float(), persistent=False)  # 速度均值先验 [dx_mean, dy_mean]。
-        self.register_buffer("vel_std", torch.tensor([0.1695, 3.0166]).float(), persistent=False)  # 速度标准差先验 [dx_std, dy_std]。
+        # 横向 X 变道速度极小均值约 0，纵向 Y 每帧(0.2s)均值约 8ft（全量统计）。
+        self.register_buffer("vel_mean", torch.tensor([-0.004182, 5.041937]).float(), persistent=False)  # 速度均值先验 [dx_mean, dy_mean]。
+        self.register_buffer("vel_std", torch.tensor([0.150222, 2.951254]).float(), persistent=False)  # 速度标准差先验 [dx_std, dy_std]。
 
     # 将 op_mask 统一为有效帧掩码 valid_mask：支持 None/[B,T]/[B,T,C](默认 [B,T,2])，其中 1 表示有效(非掩码)、0 表示无效。
     @staticmethod
@@ -186,18 +187,21 @@ class DiffusionFut(nn.Module):
         loss_vel = F.smooth_l1_loss(pred_vel_norm, target_vel_norm, reduction="none", beta=self.huber_delta)
         loss_vel = loss_vel * axis_weight
 
-        # 2. 积分回物理位置域 (宏观绝对约束)：全局可导梯度反传，彻底打断累积误差！
+        # 2. 积分回物理位置域 (宏观绝对约束)：全局可导梯度反传，抑制累积误差
         std_vel = self.vel_std.view(1, 1, 2).to(pred_vel_norm.device)
         mean_vel = self.vel_mean.view(1, 1, 2).to(pred_vel_norm.device)
 
         pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
-        # Cumsum 将速度积分还原为绝对坐标
         pred_pos_phys = torch.cumsum(pred_vel_phys, dim=1) + anchor_phys[..., :2]
 
-        # 将位置误差除以位置标准差，让宏观梯度的尺度与微观梯度保持对等公平
-        std_pos = self.pos_std.view(1, 1, 2).to(pred_vel_norm.device)
-        pos_diff = (pred_pos_phys - future_phys[..., :2]) / std_pos
-        loss_pos = torch.abs(pos_diff)
+        # 方差感知标准化: 对积分误差按 sqrt(t) * vel_std 归一化
+        # 近似利用 Var(sum v_i) ~ t * Var(v) 的统计关系，让各时刻位置项梯度量级更平衡。
+        t_len = pred_pos_phys.size(1)
+        t_seq = torch.arange(1, t_len + 1, device=pred_pos_phys.device, dtype=pred_pos_phys.dtype).view(1, t_len, 1)
+        pos_scale = torch.sqrt(t_seq) * std_vel
+        pos_diff_norm = (pred_pos_phys - future_phys[..., :2]) / (pos_scale + 1e-6)
+        loss_pos = F.smooth_l1_loss(pos_diff_norm, torch.zeros_like(pos_diff_norm),
+                                    reduction="none", beta=self.huber_delta)
 
         # 维度安全补齐 (应对 output_dim > 2 的情况)
         if self.output_dim > 2:
@@ -205,10 +209,8 @@ class DiffusionFut(nn.Module):
                               dtype=loss_pos.dtype)
             loss_pos = torch.cat([loss_pos, pad], dim=-1)
 
-        # 施加时间递增权重，逼迫模型对远端 FDE 负责
-        T_len = loss_pos.size(1)
-        time_weights = torch.linspace(1.0, 2.0, T_len, device=loss_pos.device, dtype=loss_pos.dtype).view(1, T_len, 1)
-        loss_pos = loss_pos * time_weights * axis_weight
+        # 去掉线性时间放大，避免与积分链路叠加导致远端项过度主导
+        loss_pos = loss_pos * axis_weight
 
         # 双轨合一
         pos_weight = self.getPosLossWeight()
@@ -217,7 +219,19 @@ class DiffusionFut(nn.Module):
         valid = valid_mask.unsqueeze(-1)
         numer = (total_loss * valid).sum(dim=(1, 2))
         denom = valid.sum(dim=(1, 2)) + 1e-6
-        return (numer / denom).mean()
+        loss_total_mean = (numer / denom).mean()
+
+        vel_numer = (loss_vel * valid).sum(dim=(1, 2))
+        pos_numer = (loss_pos * valid).sum(dim=(1, 2))
+        loss_vel_mean = (vel_numer / denom).mean()
+        loss_pos_mean = (pos_numer / denom).mean()
+
+        self.latest_loss_stats = {
+            "loss_total": float(loss_total_mean.detach().cpu().item()),
+            "loss_vel": float(loss_vel_mean.detach().cpu().item()),
+            "loss_pos": float(loss_pos_mean.detach().cpu().item()),
+        }
+        return loss_total_mean
 
     # 计算批量 ADE/FDE：ADE 用所有有效点平均距离，FDE 取每条轨迹最后一个有效时刻距离。
     @staticmethod
@@ -411,54 +425,6 @@ class DiffusionFut(nn.Module):
         ade, fde = self.computeAdeFde(pred_phys_abs, future, valid_mask)
         self.maybeVisualize(hist, future, pred_phys_abs, valid_mask, stage="eval")
         return loss, pred_phys_abs, ade, fde
-
-    @torch.no_grad()
-    # def forwardEval_minADE(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, K=5):
-    #     """ OOM-Safe SOTA 多模态评估 (minADE_K)"""
-    #     bsz, t_len, _ = future.shape
-    #     valid_mask = self.toValidMask(op_mask, t_len, bsz, device)
-    #     anchor_phys = hist[..., -1:, :self.output_dim]
-    #     future_phys = future[..., :self.output_dim]
-    #
-    #     hist_norm = self.norm(hist)
-    #     context, _ = self.hist_encoder(hist_norm, self.norm(hist_nbrs), mask, temporal_mask)
-    #     enc_emb = self.encodeGlobalCondition(context)
-    #     context_aligned = self.context_proj(context)
-    #
-    #     infer_scheduler = self.buildInferenceScheduler()
-    #     std_vel = self.vel_std.view(1, 1, 2).to(device)
-    #     mean_vel = self.vel_mean.view(1, 1, 2).to(device)
-    #
-    #     all_preds = []
-    #     for _ in range(K):
-    #         # 每次给予完全独立的随机速度噪声，产生平行宇宙分化
-    #         x_t = torch.randn((bsz, t_len, self.output_dim), device=device)
-    #         pred_vel_norm = self.rolloutFromXt(x_t, context_aligned, enc_emb, infer_scheduler)
-    #         pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
-    #         pred_pos_phys = torch.cumsum(pred_vel_phys, dim=1) + anchor_phys[..., :2]
-    #
-    #         pred_phys_abs = future_phys.clone()
-    #         pred_phys_abs[..., :2] = pred_pos_phys
-    #         all_preds.append(pred_phys_abs)
-    #
-    #     all_preds = torch.stack(all_preds, dim=1)  # [B, K, T, dim]
-    #
-    #     # 计算 minADE_K
-    #     target_phys = future_phys[..., :2].unsqueeze(1)
-    #     diff = torch.norm(all_preds[..., :2] - target_phys, dim=-1)  # [B, K, T]
-    #     valid_mask_exp = valid_mask.unsqueeze(1)  # [B, 1, T]
-    #
-    #     ade_k = (diff * valid_mask_exp).sum(dim=2) / (valid_mask_exp.sum(dim=2) + 1e-6)  # [B, K]
-    #     min_ade, best_k_idx = torch.min(ade_k, dim=1)  # [B]
-    #
-    #     best_k_idx_exp = best_k_idx.view(bsz, 1, 1, 1).expand(bsz, 1, t_len, all_preds.size(-1))
-    #     best_pred_phys = all_preds.gather(1, best_k_idx_exp).squeeze(1)  # [B, T, dim]
-    #
-    #     ade_batch, fde_batch = self.computeAdeFde(best_pred_phys, future, valid_mask)
-    #     dummy_loss = torch.tensor(0.0, device=device)
-    #     self.maybeVisualize(hist, future, best_pred_phys, valid_mask, stage="eval")
-    #
-    #     return dummy_loss, best_pred_phys, ade_batch, fde_batch
 
     # 多模态评估(minADE_K)：并行采样 K 条候选轨迹并选最小 ADE 的一条用于打分。
     @torch.no_grad()
