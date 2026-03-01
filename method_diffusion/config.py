@@ -69,7 +69,7 @@ def get_args_parser():
 
     # Fut train strategy
     parser.add_argument("--self_condition_prob", default=0.5, type=float)
-    parser.add_argument("--cfg_enabled", default=1, type=int)
+    parser.add_argument("--cfg_enabled", default=0, type=int)
     parser.add_argument("--cfg_drop_prob", default=0.15, type=float)
     parser.add_argument("--cfg_guidance_scale", default=2.0, type=float)
 
@@ -86,7 +86,7 @@ def get_args_parser():
     parser.add_argument("--fut_vis_every_n", default=200, type=int)
 
     # Eval
-    parser.add_argument("--eval_ratio", default=0.1, type=float)
+    parser.add_argument("--eval_ratio", default=0.03, type=float)
     parser.add_argument("--eval_max_batches", default=0, type=int)
     parser.add_argument("--num_samples", default=5, type=int)
     parser.add_argument("--sample_ids", default="", type=str)

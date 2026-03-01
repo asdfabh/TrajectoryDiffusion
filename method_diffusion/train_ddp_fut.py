@@ -1,6 +1,7 @@
 import sys
 import os
 import math
+import csv
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
@@ -23,8 +24,13 @@ def setup_ddp():
         local_rank = int(os.environ["LOCAL_RANK"])
 
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank)
-        dist.barrier()
+        try:
+            dist.init_process_group(
+                backend="nccl", init_method="env://", world_size=world_size, rank=rank, device_id=local_rank
+            )
+        except TypeError:
+            dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank)
+        dist.barrier(device_ids=[local_rank])
         return rank, local_rank, world_size
     else:
         print("Not using distributed mode")
@@ -86,9 +92,21 @@ def prepare_input_data(batch, feature_dim, device='cuda'):
 
     return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
 
+
+def get_model_loss_stats(model):
+    module = model.module if hasattr(model, "module") else model
+    stats = getattr(module, "latest_loss_stats", None)
+    if not isinstance(stats, dict):
+        return None
+    return stats
+
+
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
     model.train()
     total_loss = 0.0
+    total_loss_vel = 0.0
+    total_loss_pos = 0.0
+    stat_batches = 0
     num_batches = 0
 
     # 只有 Rank 0 显示进度条
@@ -109,21 +127,42 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
 
         total_loss += loss.item()
         num_batches += 1
+        stats = get_model_loss_stats(model)
+        if stats is not None:
+            total_loss_vel += float(stats.get("loss_vel", 0.0))
+            total_loss_pos += float(stats.get("loss_pos", 0.0))
+            stat_batches += 1
 
         if rank == 0:
-            pbar.set_postfix({
-                'loss': f'{loss.item():.8f}',
-                'avg_loss': f'{total_loss / num_batches:.8f}',
-            })
+            if stats is None:
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.8f}',
+                    'avg_loss': f'{total_loss / num_batches:.8f}',
+                })
+            else:
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.8f}',
+                    'avg_loss': f'{total_loss / num_batches:.8f}',
+                    'vel': f'{float(stats.get("loss_vel", 0.0)):.8f}',
+                    'pos': f'{float(stats.get("loss_pos", 0.0)):.8f}',
+                })
 
     # Aggregate loss/count across all ranks for a true global average.
-    loss_count = torch.tensor([total_loss, float(num_batches)], device=device)
+    loss_count = torch.tensor(
+        [total_loss, float(num_batches), total_loss_vel, total_loss_pos, float(stat_batches)],
+        device=device
+    )
     if dist.is_initialized():
         dist.all_reduce(loss_count, op=dist.ReduceOp.SUM)
     global_total_loss = float(loss_count[0].item())
     global_total_batches = max(float(loss_count[1].item()), 1.0)
+    global_total_vel = float(loss_count[2].item())
+    global_total_pos = float(loss_count[3].item())
+    global_stat_batches = max(float(loss_count[4].item()), 1.0)
     avg_loss = global_total_loss / global_total_batches
-    return avg_loss
+    avg_loss_vel = global_total_vel / global_stat_batches
+    avg_loss_pos = global_total_pos / global_stat_batches
+    return avg_loss, avg_loss_vel, avg_loss_pos
 
 
 @torch.no_grad()
@@ -133,12 +172,15 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
     total_loss = 0.0
     total_ade = 0.0
     total_fde = 0.0
+    total_loss_vel = 0.0
+    total_loss_pos = 0.0
+    stat_batches = 0
     num_batches = 0
 
     total_batches = len(dataloader)
     if total_batches == 0:
         fut_model.train()
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0
 
     target_batches = total_batches
     if eval_ratio > 0:
@@ -158,6 +200,11 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
         total_ade += float(eval_ade.item())
         total_fde += float(eval_fde.item())
         num_batches += 1
+        stats = get_model_loss_stats(fut_model)
+        if stats is not None:
+            total_loss_vel += float(stats.get("loss_vel", 0.0))
+            total_loss_pos += float(stats.get("loss_pos", 0.0))
+            stat_batches += 1
         pbar.set_postfix({
             'eval_loss': f'{eval_loss.item():.8f}',
             'avg_ade_ft': f'{(total_ade / num_batches):.4f}',
@@ -166,8 +213,14 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
 
     fut_model.train()
     if num_batches == 0:
-        return 0.0, 0.0, 0.0
-    return total_loss / num_batches, total_ade / num_batches, total_fde / num_batches
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+    return (
+        total_loss / num_batches,
+        total_ade / num_batches,
+        total_fde / num_batches,
+        total_loss_vel / max(stat_batches, 1),
+        total_loss_pos / max(stat_batches, 1),
+    )
 
 def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, rank):
     start_epoch = 0
@@ -237,6 +290,30 @@ def main():
 
     # Keep the same checkpoint layout as train_fut.py.
     args.checkpoint_dir = str(Path(args.checkpoint_dir) / 'fut')
+    if rank == 0:
+        log_dir = Path(args.checkpoint_dir) / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = log_dir / "train_eval_metrics.csv"
+        if not csv_path.exists():
+            with csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer_csv = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "epoch",
+                        "train_loss_total",
+                        "train_loss_vel",
+                        "train_loss_pos",
+                        "eval_loss_total",
+                        "eval_loss_vel",
+                        "eval_loss_pos",
+                        "eval_ade_ft",
+                        "eval_fde_ft",
+                        "eval_ade_m",
+                        "eval_fde_m",
+                        "lr",
+                    ],
+                )
+                writer_csv.writeheader()
 
     if rank == 0:
         Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
@@ -325,7 +402,17 @@ def main():
 
     # 仅在分布式环境下使用 DDP
     if dist.is_initialized():
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        # CFG 关闭时，无条件分支参数会长期不参与反传。
+        # 打开 unused 参数检测，避免 DDP 在下一迭代报 reduction 未完成错误。
+        find_unused = (int(args.cfg_enabled) <= 0) or (float(args.cfg_drop_prob) <= 0.0)
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=find_unused
+        )
+        if rank == 0:
+            print(f"[DDP] find_unused_parameters={find_unused}")
     else:
         print("Running in non-distributed mode (Single GPU/CPU)")
 
@@ -353,27 +440,66 @@ def main():
             print(f"\n========== Epoch {epoch + 1}/{args.num_epochs} ==========")
             print(f"[FutModel] PosLoss alpha(epoch={epoch + 1}): {fut_model.getPosLossWeight():.4f}")
 
-        avg_loss = train_epoch(
+        avg_loss, avg_loss_vel, avg_loss_pos = train_epoch(
             model, train_loader, optimizer, device, epoch + 1,
             args.feature_dim, rank
         )
 
         if rank == 0:
-            print(f"Epoch [{epoch + 1}] Average Loss: {avg_loss:.4f}")
-            eval_loss, eval_ade, eval_fde = evaluate_on_testset(
+            print(
+                f"Epoch [{epoch + 1}] Average Loss: total={avg_loss:.6f}, "
+                f"vel={avg_loss_vel:.6f}, pos={avg_loss_pos:.6f}"
+            )
+            eval_loss, eval_ade, eval_fde, eval_loss_vel, eval_loss_pos = evaluate_on_testset(
                 model, test_loader, device, epoch + 1, args.feature_dim,
                 eval_ratio=fixed_eval_ratio, max_batches=args.eval_max_batches
             )
             print(
-                f"TestSet Eval [{epoch + 1}] Loss: {eval_loss:.4f}, "
+                f"TestSet Eval [{epoch + 1}] Loss: total={eval_loss:.6f}, "
+                f"vel={eval_loss_vel:.6f}, pos={eval_loss_pos:.6f}, "
                 f"ADE: {eval_ade:.4f} ft ({eval_ade * 0.3048:.4f} m), "
                 f"FDE: {eval_fde:.4f} ft ({eval_fde * 0.3048:.4f} m)"
             )
 
+            with csv_path.open("a", newline="", encoding="utf-8") as f:
+                writer_csv = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "epoch",
+                        "train_loss_total",
+                        "train_loss_vel",
+                        "train_loss_pos",
+                        "eval_loss_total",
+                        "eval_loss_vel",
+                        "eval_loss_pos",
+                        "eval_ade_ft",
+                        "eval_fde_ft",
+                        "eval_ade_m",
+                        "eval_fde_m",
+                        "lr",
+                    ],
+                )
+                writer_csv.writerow(
+                    {
+                        "epoch": epoch + 1,
+                        "train_loss_total": f"{avg_loss:.8f}",
+                        "train_loss_vel": f"{avg_loss_vel:.8f}",
+                        "train_loss_pos": f"{avg_loss_pos:.8f}",
+                        "eval_loss_total": f"{eval_loss:.8f}",
+                        "eval_loss_vel": f"{eval_loss_vel:.8f}",
+                        "eval_loss_pos": f"{eval_loss_pos:.8f}",
+                        "eval_ade_ft": f"{eval_ade:.8f}",
+                        "eval_fde_ft": f"{eval_fde:.8f}",
+                        "eval_ade_m": f"{eval_ade * 0.3048:.8f}",
+                        "eval_fde_m": f"{eval_fde * 0.3048:.8f}",
+                        "lr": f"{optimizer.param_groups[0]['lr']:.10f}",
+                    }
+                )
+
         scheduler.step()
 
         if dist.is_initialized():
-            dist.barrier()
+            dist.barrier(device_ids=[local_rank])
 
         if rank == 0:
             model_state = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
@@ -383,7 +509,11 @@ def main():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': avg_loss,
+                'train_loss_vel': avg_loss_vel,
+                'train_loss_pos': avg_loss_pos,
                 'eval_loss': eval_loss,
+                'eval_loss_vel': eval_loss_vel,
+                'eval_loss_pos': eval_loss_pos,
                 'eval_ade': eval_ade,
                 'eval_fde': eval_fde,
                 'best_ade': best_ade,

@@ -77,6 +77,7 @@ class DiffusionFut(nn.Module):
             prediction_type="sample",
             clip_sample=False,
         )
+        self.latest_loss_stats = {}
 
         dit_block = dit.DiTBlock(self.hidden_dim, self.heads, self.dropout, self.mlp_ratio)  # 单层 DiT Block 模板。
         final_layer = dit.FinalLayer(self.hidden_dim, self.T, self.output_dim)  # DiT 输出头（映射到 output_dim）。
@@ -186,15 +187,15 @@ class DiffusionFut(nn.Module):
         loss_vel = F.smooth_l1_loss(pred_vel_norm, target_vel_norm, reduction="none", beta=self.huber_delta)
         loss_vel = loss_vel * axis_weight
 
-        # 2. 积分回物理位置域 (宏观绝对约束)：全局可导梯度反传，抑制累积漂移
+        # 2. 积分回物理位置域 (宏观绝对约束)：全局可导梯度反传，抑制累积误差
         std_vel = self.vel_std.view(1, 1, 2).to(pred_vel_norm.device)
         mean_vel = self.vel_mean.view(1, 1, 2).to(pred_vel_norm.device)
 
         pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
         pred_pos_phys = torch.cumsum(pred_vel_phys, dim=1) + anchor_phys[..., :2]
 
-        # 方差感知标准化：对积分误差按 sqrt(t) * vel_std 归一化
-        # 近似利用 Var(sum v_i) ~ t * Var(v) 的统计关系，让各时刻位置项梯度量级更平衡
+        # 方差感知标准化: 对积分误差按 sqrt(t) * vel_std 归一化
+        # 近似利用 Var(sum v_i) ~ t * Var(v) 的统计关系，让各时刻位置项梯度量级更平衡。
         t_len = pred_pos_phys.size(1)
         t_seq = torch.arange(1, t_len + 1, device=pred_pos_phys.device, dtype=pred_pos_phys.dtype).view(1, t_len, 1)
         pos_scale = torch.sqrt(t_seq) * std_vel
@@ -218,7 +219,19 @@ class DiffusionFut(nn.Module):
         valid = valid_mask.unsqueeze(-1)
         numer = (total_loss * valid).sum(dim=(1, 2))
         denom = valid.sum(dim=(1, 2)) + 1e-6
-        return (numer / denom).mean()
+        loss_total_mean = (numer / denom).mean()
+
+        vel_numer = (loss_vel * valid).sum(dim=(1, 2))
+        pos_numer = (loss_pos * valid).sum(dim=(1, 2))
+        loss_vel_mean = (vel_numer / denom).mean()
+        loss_pos_mean = (pos_numer / denom).mean()
+
+        self.latest_loss_stats = {
+            "loss_total": float(loss_total_mean.detach().cpu().item()),
+            "loss_vel": float(loss_vel_mean.detach().cpu().item()),
+            "loss_pos": float(loss_pos_mean.detach().cpu().item()),
+        }
+        return loss_total_mean
 
     # 计算批量 ADE/FDE：ADE 用所有有效点平均距离，FDE 取每条轨迹最后一个有效时刻距离。
     @staticmethod
