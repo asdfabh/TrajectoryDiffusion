@@ -2,7 +2,6 @@ import sys
 import os
 import math
 import copy
-import csv
 from pathlib import Path
 
 import torch
@@ -77,20 +76,10 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
 
 
-def get_model_loss_stats(model):
-    stats = getattr(model, "latest_loss_stats", None)
-    if not isinstance(stats, dict):
-        return None
-    return stats
-
-
 # 训练函数新增 ema 参数，在反向传播后进行滑动平均更新
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
     model.train()
     total_loss = 0.0
-    total_loss_vel = 0.0
-    total_loss_pos = 0.0
-    stat_batches = 0
     num_batches = 0
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Epoch {epoch} Train", ncols=120)
 
@@ -110,24 +99,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
 
         total_loss += float(loss.item())
         num_batches += 1
-        stats = get_model_loss_stats(model)
-        if stats is not None:
-            total_loss_vel += float(stats.get("loss_vel", 0.0))
-            total_loss_pos += float(stats.get("loss_pos", 0.0))
-            stat_batches += 1
-            pbar.set_postfix({
-                "loss": f"{loss.item():.6f}",
-                "avg_loss": f"{(total_loss / num_batches):.6f}",
-                "vel": f"{float(stats.get('loss_vel', 0.0)):.6f}",
-                "pos": f"{float(stats.get('loss_pos', 0.0)):.6f}",
-            })
-        else:
-            pbar.set_postfix({"loss": f"{loss.item():.6f}", "avg_loss": f"{(total_loss / num_batches):.6f}"})
+        pbar.set_postfix({"loss": f"{loss.item():.6f}", "avg_loss": f"{(total_loss / num_batches):.6f}"})
 
-    avg_loss = total_loss / max(num_batches, 1)
-    avg_loss_vel = total_loss_vel / max(stat_batches, 1)
-    avg_loss_pos = total_loss_pos / max(stat_batches, 1)
-    return avg_loss, avg_loss_vel, avg_loss_pos
+    return total_loss / max(num_batches, 1)
 
 
 @torch.no_grad()
@@ -141,15 +115,12 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
     total_loss = 0.0
     total_ade = 0.0
     total_fde = 0.0
-    total_loss_vel = 0.0
-    total_loss_pos = 0.0
-    stat_batches = 0
     num_batches = 0
 
     total_batches = len(dataloader)
     if total_batches == 0:
         model.train()
-        return 0.0, 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
     target_batches = total_batches
     if eval_ratio > 0:
@@ -169,11 +140,6 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
         total_ade += float(eval_ade.item())
         total_fde += float(eval_fde.item())
         num_batches += 1
-        stats = get_model_loss_stats(model)
-        if stats is not None:
-            total_loss_vel += float(stats.get("loss_vel", 0.0))
-            total_loss_pos += float(stats.get("loss_pos", 0.0))
-            stat_batches += 1
         pbar.set_postfix({
             "avg_ade_ft": f"{(total_ade / num_batches):.4f}",
             "avg_fde_ft": f"{(total_fde / num_batches):.4f}",
@@ -181,14 +147,8 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
 
     model.train()
     if num_batches == 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0
-    return (
-        total_loss / num_batches,
-        total_ade / num_batches,
-        total_fde / num_batches,
-        total_loss_vel / max(stat_batches, 1),
-        total_loss_pos / max(stat_batches, 1),
-    )
+        return 0.0, 0.0, 0.0
+    return total_loss / num_batches, total_ade / num_batches, total_fde / num_batches
 
 
 def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, ema=None):
@@ -251,29 +211,7 @@ def main():
     Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
     log_dir = Path(args.checkpoint_dir) / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(log_dir))
-    csv_path = log_dir / "train_eval_metrics.csv"
-    if not csv_path.exists():
-        with csv_path.open("w", newline="", encoding="utf-8") as f:
-            writer_csv = csv.DictWriter(
-                f,
-                fieldnames=[
-                    "epoch",
-                    "train_loss_total",
-                    "train_loss_vel",
-                    "train_loss_pos",
-                    "eval_loss_total",
-                    "eval_loss_vel",
-                    "eval_loss_pos",
-                    "eval_ade_ft",
-                    "eval_fde_ft",
-                    "eval_ade_m",
-                    "eval_fde_m",
-                    "lr",
-                ],
-            )
-            writer_csv.writeheader()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
@@ -287,14 +225,6 @@ def main():
     print(
         f"[FutModel] Train strategy: self_condition_prob={args.self_condition_prob}, "
         f"loss=smooth_l1_residual_anchor, y_weight={args.fut_y_loss_weight}, huber_delta={args.fut_huber_delta}"
-    )
-    print(
-        f"[FutModel] PosLoss warmup: min={args.fut_pos_loss_weight_min}, "
-        f"max={args.fut_pos_loss_weight_max}, warmup_ratio={args.fut_pos_loss_warmup_ratio}"
-    )
-    print(
-        f"[FutModel] CFG: enabled={int(args.cfg_enabled) > 0}, "
-        f"drop_prob={args.cfg_drop_prob}, guidance_scale={args.cfg_guidance_scale}"
     )
     print(
         f"[FutModel] TestSet eval sampling: eval_ratio={eval_ratio}, eval_max_batches={args.eval_max_batches}"
@@ -353,19 +283,15 @@ def main():
 
     for epoch in range(start_epoch, args.num_epochs):
         print(f"\n========== Epoch {epoch + 1}/{args.num_epochs} ==========")
-        model.setTrainProgress(epoch + 1, args.num_epochs)
-        cur_pos_weight = model.getPosLossWeight()
-        print(f"[FutModel] PosLoss alpha(epoch={epoch + 1}): {cur_pos_weight:.4f}")
 
         # 训练阶段：传入 ema 参与权重影子步进
-        avg_loss, avg_loss_vel, avg_loss_pos = train_epoch(model, train_loader, optimizer, device, epoch + 1,
-                                                           args.feature_dim, ema)
+        avg_loss = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim, ema)
 
         # 评估阶段：为了不破坏正在训练的原始权重，先深拷贝备份，再套用 EMA 权重
         original_state = {k: v.clone() for k, v in model.state_dict().items()}
         ema.apply_shadow(model)
 
-        eval_loss, eval_ade, eval_fde, eval_loss_vel, eval_loss_pos = evaluate_on_testset(
+        eval_loss, eval_ade, eval_fde = evaluate_on_testset(
             model,
             test_loader,
             device,
@@ -378,64 +304,20 @@ def main():
         # 评估结束，将原始训练权重覆盖回来，继续下一轮训练
         model.load_state_dict(original_state)
 
+        print(f"Epoch [{epoch + 1}] Train Loss: {avg_loss:.6f}")
         print(
-            f"Epoch [{epoch + 1}] Train Loss: total={avg_loss:.6f}, "
-            f"vel={avg_loss_vel:.6f}, pos={avg_loss_pos:.6f}"
-        )
-        print(
-            f"TestSet Eval [{epoch + 1}] Loss: total={eval_loss:.6f}, "
-            f"vel={eval_loss_vel:.6f}, pos={eval_loss_pos:.6f}, "
+            f"TestSet Eval [{epoch + 1}] Loss: {eval_loss:.6f}, "
             f"ADE: {eval_ade:.4f} ft ({eval_ade * 0.3048:.4f} m), "
             f"FDE: {eval_fde:.4f} ft ({eval_fde * 0.3048:.4f} m)"
         )
 
-        writer.add_scalar("Train/Loss_total", avg_loss, epoch + 1)
-        writer.add_scalar("Train/Loss_vel", avg_loss_vel, epoch + 1)
-        writer.add_scalar("Train/Loss_pos", avg_loss_pos, epoch + 1)
-        writer.add_scalar("Eval/Loss_total", eval_loss, epoch + 1)
-        writer.add_scalar("Eval/Loss_vel", eval_loss_vel, epoch + 1)
-        writer.add_scalar("Eval/Loss_pos", eval_loss_pos, epoch + 1)
+        writer.add_scalar("Train/Loss", avg_loss, epoch + 1)
+        writer.add_scalar("Eval/Loss", eval_loss, epoch + 1)
         writer.add_scalar("Eval/ADE_ft", eval_ade, epoch + 1)
         writer.add_scalar("Eval/FDE_ft", eval_fde, epoch + 1)
         writer.add_scalar("Eval/ADE_m", eval_ade * 0.3048, epoch + 1)
         writer.add_scalar("Eval/FDE_m", eval_fde * 0.3048, epoch + 1)
-        writer.add_scalar("Train/PosLossWeight", cur_pos_weight, epoch + 1)
         writer.add_scalar("Train/LR", optimizer.param_groups[0]["lr"], epoch + 1)
-
-        with csv_path.open("a", newline="", encoding="utf-8") as f:
-            writer_csv = csv.DictWriter(
-                f,
-                fieldnames=[
-                    "epoch",
-                    "train_loss_total",
-                    "train_loss_vel",
-                    "train_loss_pos",
-                    "eval_loss_total",
-                    "eval_loss_vel",
-                    "eval_loss_pos",
-                    "eval_ade_ft",
-                    "eval_fde_ft",
-                    "eval_ade_m",
-                    "eval_fde_m",
-                    "lr",
-                ],
-            )
-            writer_csv.writerow(
-                {
-                    "epoch": epoch + 1,
-                    "train_loss_total": f"{avg_loss:.8f}",
-                    "train_loss_vel": f"{avg_loss_vel:.8f}",
-                    "train_loss_pos": f"{avg_loss_pos:.8f}",
-                    "eval_loss_total": f"{eval_loss:.8f}",
-                    "eval_loss_vel": f"{eval_loss_vel:.8f}",
-                    "eval_loss_pos": f"{eval_loss_pos:.8f}",
-                    "eval_ade_ft": f"{eval_ade:.8f}",
-                    "eval_fde_ft": f"{eval_fde:.8f}",
-                    "eval_ade_m": f"{eval_ade * 0.3048:.8f}",
-                    "eval_fde_m": f"{eval_fde * 0.3048:.8f}",
-                    "lr": f"{optimizer.param_groups[0]['lr']:.10f}",
-                }
-            )
 
         scheduler.step()
 
@@ -450,11 +332,7 @@ def main():
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "loss": avg_loss,
-            "train_loss_vel": avg_loss_vel,
-            "train_loss_pos": avg_loss_pos,
             "eval_loss": eval_loss,
-            "eval_loss_vel": eval_loss_vel,
-            "eval_loss_pos": eval_loss_pos,
             "eval_ade": eval_ade,
             "eval_fde": eval_fde,
             "best_ade": best_ade,
