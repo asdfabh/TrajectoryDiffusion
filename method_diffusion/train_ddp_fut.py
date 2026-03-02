@@ -89,17 +89,21 @@ def prepare_input_data(batch, feature_dim, device='cuda'):
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
     model.train()
     total_loss = 0.0
+    total_vel_loss = 0.0
+    total_pos_loss = 0.0
+    total_pos_x_loss = 0.0
+    total_pos_y_loss = 0.0
     num_batches = 0
 
     # 只有 Rank 0 显示进度条
     if rank == 0:
-        pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch}", dynamic_ncols=True)
+        pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch}", ncols=220)
     else:
         pbar = enumerate(dataloader)
 
     for batch_idx, batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        loss = model(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+        loss, loss_parts = model(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, return_components=True)
 
         # Backward
         optimizer.zero_grad()
@@ -108,22 +112,40 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
         optimizer.step()
 
         total_loss += loss.item()
+        total_vel_loss += float(loss_parts["loss_vel"].item())
+        total_pos_loss += float(loss_parts["loss_pos"].item())
+        total_pos_x_loss += float(loss_parts["loss_pos_x"].item())
+        total_pos_y_loss += float(loss_parts["loss_pos_y"].item())
         num_batches += 1
 
         if rank == 0:
             pbar.set_postfix({
-                'loss': f'{loss.item():.8f}',
-                'avg_loss': f'{total_loss / num_batches:.8f}',
+                'loss': f'{loss.item():.6f}',
+                'avg_loss': f'{total_loss / num_batches:.6f}',
+                'vel': f'{total_vel_loss / num_batches:.6f}',
+                'pos': f'{total_pos_loss / num_batches:.6f}',
+                'pos_xy': f'{total_pos_x_loss / num_batches:.6f}/{total_pos_y_loss / num_batches:.6f}',
             })
 
-    # Aggregate loss/count across all ranks for a true global average.
-    loss_count = torch.tensor([total_loss, float(num_batches)], device=device)
+    # Aggregate metrics/count across all ranks for true global averages.
+    loss_count = torch.tensor([
+        total_loss,
+        total_vel_loss,
+        total_pos_loss,
+        total_pos_x_loss,
+        total_pos_y_loss,
+        float(num_batches)
+    ], device=device)
     if dist.is_initialized():
         dist.all_reduce(loss_count, op=dist.ReduceOp.SUM)
-    global_total_loss = float(loss_count[0].item())
-    global_total_batches = max(float(loss_count[1].item()), 1.0)
-    avg_loss = global_total_loss / global_total_batches
-    return avg_loss
+    global_total_batches = max(float(loss_count[5].item()), 1.0)
+    return {
+        "loss": float(loss_count[0].item()) / global_total_batches,
+        "loss_vel": float(loss_count[1].item()) / global_total_batches,
+        "loss_pos": float(loss_count[2].item()) / global_total_batches,
+        "loss_pos_x": float(loss_count[3].item()) / global_total_batches,
+        "loss_pos_y": float(loss_count[4].item()) / global_total_batches,
+    }
 
 
 @torch.no_grad()
@@ -249,7 +271,9 @@ def main():
         )
         print(
             f"[FutModel] Train strategy: self_condition_prob={args.self_condition_prob}, "
-            f"loss=smooth_l1_residual_anchor, y_weight={args.fut_y_loss_weight}, huber_delta={args.fut_huber_delta}"
+            f"loss=vel_huber+whiten_pos_huber, y_weight={args.fut_y_loss_weight}, "
+            f"huber_delta={args.fut_huber_delta}, pos_weight={args.fut_pos_loss_weight}, "
+            f"pos_whiten_eps={args.fut_pos_whiten_eps}"
         )
         print(
             f"[FutModel] Architecture: hidden_dim_fut={args.hidden_dim_fut}, depth_fut={args.depth_fut}"
@@ -342,13 +366,19 @@ def main():
         if rank == 0:
             print(f"\n========== Epoch {epoch + 1}/{args.num_epochs} ==========")
 
-        avg_loss = train_epoch(
+        train_stats = train_epoch(
             model, train_loader, optimizer, device, epoch + 1,
             args.feature_dim, rank
         )
+        avg_loss = float(train_stats["loss"])
 
         if rank == 0:
             print(f"Epoch [{epoch + 1}] Average Loss: {avg_loss:.4f}")
+            print(
+                f"Train Detail [{epoch + 1}] Vel: {train_stats['loss_vel']:.6f}, "
+                f"Pos: {train_stats['loss_pos']:.6f}, "
+                f"PosXY: {train_stats['loss_pos_x']:.6f}/{train_stats['loss_pos_y']:.6f}"
+            )
             eval_loss, eval_ade, eval_fde = evaluate_on_testset(
                 model, test_loader, device, epoch + 1, args.feature_dim,
                 eval_ratio=fixed_eval_ratio, max_batches=args.eval_max_batches

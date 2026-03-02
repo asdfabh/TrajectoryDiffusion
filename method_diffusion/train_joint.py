@@ -73,10 +73,18 @@ def train_epoch(model_fut, model_hist, dataloader, optimizer, device, epoch, fea
     total_loss = 0.0
     total_loss_hist = 0.0
     total_loss_fut = 0.0
+    total_loss_fut_vel = 0.0
+    total_loss_fut_pos = 0.0
+    total_loss_fut_pos_x = 0.0
+    total_loss_fut_pos_y = 0.0
     num_batches = 0
 
-    pbar = tqdm(enumerate(dataloader), total=len(dataloader),
-                desc=f"Epoch {epoch}", ncols=160)
+    pbar = tqdm(
+        enumerate(dataloader),
+        total=len(dataloader),
+        desc=f"Ep{epoch}",
+        ncols=260,
+    )
 
     for batch_idx, batch in pbar:
         hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask = prepare_input_data(
@@ -90,7 +98,9 @@ def train_epoch(model_fut, model_hist, dataloader, optimizer, device, epoch, fea
         else:
             loss_h, pred_hist, _, _ = model_hist.forward_train(hist, hist_masked, device)
 
-        loss_f = model_fut.forwardTrain(pred_hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+        loss_f, fut_parts = model_fut.forwardTrain(
+            pred_hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, return_components=True
+        )
 
         loss = loss_f + loss_h
 
@@ -108,15 +118,30 @@ def train_epoch(model_fut, model_hist, dataloader, optimizer, device, epoch, fea
         total_loss += loss.item()
         total_loss_hist += curr_loss_h
         total_loss_fut += loss_f.item()
+        total_loss_fut_vel += float(fut_parts["loss_vel"].item())
+        total_loss_fut_pos += float(fut_parts["loss_pos"].item())
+        total_loss_fut_pos_x += float(fut_parts["loss_pos_x"].item())
+        total_loss_fut_pos_y += float(fut_parts["loss_pos_y"].item())
         num_batches += 1
 
         pbar.set_postfix({
-            'L_all': f'{total_loss / num_batches:.4f}',
-            'L_hist': f'{total_loss_hist / num_batches:.4f}',
-            'L_fut': f'{total_loss_fut / num_batches:.4f}',
+            'L_all': f'{total_loss / num_batches:.6f}',
+            'L_hist': f'{total_loss_hist / num_batches:.6f}',
+            'L_fut': f'{total_loss_fut / num_batches:.6f}',
+            'L_fut_vel': f'{total_loss_fut_vel / num_batches:.6f}',
+            'L_fut_pos': f'{total_loss_fut_pos / num_batches:.6f}',
+            'L_fut_pos_xy': f'{total_loss_fut_pos_x / num_batches:.6f}/{total_loss_fut_pos_y / num_batches:.6f}',
         })
 
-    return total_loss / num_batches
+    return {
+        "loss_all": total_loss / num_batches,
+        "loss_hist": total_loss_hist / num_batches,
+        "loss_fut": total_loss_fut / num_batches,
+        "loss_fut_vel": total_loss_fut_vel / num_batches,
+        "loss_fut_pos": total_loss_fut_pos / num_batches,
+        "loss_fut_pos_x": total_loss_fut_pos_x / num_batches,
+        "loss_fut_pos_y": total_loss_fut_pos_y / num_batches,
+    }
 
 
 def load_checkpoint_generic(resume_arg, default_dir, model, device, model_name="Model"):
@@ -214,13 +239,25 @@ def main():
     for epoch in range(start_epoch, args.num_epochs):
         print(f"\n========== Epoch {epoch + 1}/{args.num_epochs} ==========")
 
-        avg_loss = train_epoch(
+        train_stats = train_epoch(
             model_fut, model_hist, train_loader, optimizer, device, epoch + 1,
             args.feature_dim, mask_type='random', mask_prob=args.mask_prob, freeze_hist=freeze_hist
         )
+        avg_loss = train_stats["loss_all"]
 
         print(f"Epoch [{epoch + 1}] Average Loss: {avg_loss:.4f}")
+        print(
+            f"Fut Detail [{epoch + 1}] Vel: {train_stats['loss_fut_vel']:.6f}, "
+            f"Pos: {train_stats['loss_fut_pos']:.6f}, "
+            f"PosXY: {train_stats['loss_fut_pos_x']:.6f}/{train_stats['loss_fut_pos_y']:.6f}"
+        )
         writer.add_scalar('Train/Loss', avg_loss, epoch + 1)
+        writer.add_scalar('Train/Loss_hist', train_stats["loss_hist"], epoch + 1)
+        writer.add_scalar('Train/Loss_fut', train_stats["loss_fut"], epoch + 1)
+        writer.add_scalar('Train/Loss_fut_vel', train_stats["loss_fut_vel"], epoch + 1)
+        writer.add_scalar('Train/Loss_fut_pos', train_stats["loss_fut_pos"], epoch + 1)
+        writer.add_scalar('Train/Loss_fut_pos_x', train_stats["loss_fut_pos_x"], epoch + 1)
+        writer.add_scalar('Train/Loss_fut_pos_y', train_stats["loss_fut_pos_y"], epoch + 1)
         scheduler.step()
 
         state_fut = {

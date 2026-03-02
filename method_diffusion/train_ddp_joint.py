@@ -100,10 +100,14 @@ def train_epoch(model_fut, model_hist, dataloader, optimizer, device, epoch, fea
         model_hist.train()
 
     total_loss = 0.0
+    total_loss_fut_vel = 0.0
+    total_loss_fut_pos = 0.0
+    total_loss_fut_pos_x = 0.0
+    total_loss_fut_pos_y = 0.0
     num_batches = 0
 
     if rank == 0:
-        pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch}", dynamic_ncols=True)
+        pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch}", ncols=260)
     else:
         pbar = enumerate(dataloader)
 
@@ -120,7 +124,9 @@ def train_epoch(model_fut, model_hist, dataloader, optimizer, device, epoch, fea
         else:
             loss_h, pred_hist_clean, _, _ = model_hist(hist, hist_masked, device)
 
-        loss_f, pred, ade, fde = model_fut(pred_hist_clean, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+        loss_f, fut_parts = model_fut(
+            pred_hist_clean, hist_nbrs, mask, temporal_mask, fut, op_mask, device, return_components=True
+        )
 
         loss = loss_f + loss_h
 
@@ -135,23 +141,46 @@ def train_epoch(model_fut, model_hist, dataloader, optimizer, device, epoch, fea
 
         with torch.no_grad():
             curr_loss = torch.tensor(loss.item(), device=device)
+            curr_loss_fut_vel = torch.tensor(float(fut_parts["loss_vel"].item()), device=device)
+            curr_loss_fut_pos = torch.tensor(float(fut_parts["loss_pos"].item()), device=device)
+            curr_loss_fut_pos_x = torch.tensor(float(fut_parts["loss_pos_x"].item()), device=device)
+            curr_loss_fut_pos_y = torch.tensor(float(fut_parts["loss_pos_y"].item()), device=device)
             if dist.is_initialized():
                 dist.all_reduce(curr_loss)
+                dist.all_reduce(curr_loss_fut_vel)
+                dist.all_reduce(curr_loss_fut_pos)
+                dist.all_reduce(curr_loss_fut_pos_x)
+                dist.all_reduce(curr_loss_fut_pos_y)
                 total_loss += curr_loss.item() / dist.get_world_size()
+                total_loss_fut_vel += curr_loss_fut_vel.item() / dist.get_world_size()
+                total_loss_fut_pos += curr_loss_fut_pos.item() / dist.get_world_size()
+                total_loss_fut_pos_x += curr_loss_fut_pos_x.item() / dist.get_world_size()
+                total_loss_fut_pos_y += curr_loss_fut_pos_y.item() / dist.get_world_size()
             else:
                 total_loss += curr_loss.item()
+                total_loss_fut_vel += curr_loss_fut_vel.item()
+                total_loss_fut_pos += curr_loss_fut_pos.item()
+                total_loss_fut_pos_x += curr_loss_fut_pos_x.item()
+                total_loss_fut_pos_y += curr_loss_fut_pos_y.item()
 
         num_batches += 1
 
         if rank == 0:
             pbar.set_postfix({
-                'loss': f'{loss.item():.8f}',
-                'avg_loss': f'{total_loss / num_batches:.8f}',
-                'ade': f'{ade.mean().item():.4f}',
-                'fde': f'{fde.mean().item():.4f}',
+                'loss': f'{loss.item():.6f}',
+                'avg_loss': f'{total_loss / num_batches:.6f}',
+                'vel': f'{total_loss_fut_vel / num_batches:.6f}',
+                'pos': f'{total_loss_fut_pos / num_batches:.6f}',
+                'pos_xy': f'{total_loss_fut_pos_x / num_batches:.6f}/{total_loss_fut_pos_y / num_batches:.6f}',
             })
 
-    return total_loss / num_batches
+    return {
+        "loss_all": total_loss / num_batches,
+        "loss_fut_vel": total_loss_fut_vel / num_batches,
+        "loss_fut_pos": total_loss_fut_pos / num_batches,
+        "loss_fut_pos_x": total_loss_fut_pos_x / num_batches,
+        "loss_fut_pos_y": total_loss_fut_pos_y / num_batches,
+    }
 
 
 def load_checkpoint_ddp(resume_arg, default_dir, model, device, rank, model_name="Model"):
@@ -270,13 +299,19 @@ def main():
         train_sampler.set_epoch(epoch)
         if rank == 0: print(f"\n========== Epoch {epoch + 1}/{args.num_epochs} ==========")
 
-        avg_loss = train_epoch(
+        train_stats = train_epoch(
             model_fut, model_hist, train_loader, optimizer, device, epoch + 1,
             args.feature_dim, rank, mask_type='random', mask_prob=args.mask_prob, freeze_hist=freeze_hist
         )
+        avg_loss = train_stats["loss_all"]
 
         if rank == 0:
             print(f"Epoch [{epoch + 1}] Average Loss: {avg_loss:.4f}")
+            print(
+                f"Fut Detail [{epoch + 1}] Vel: {train_stats['loss_fut_vel']:.6f}, "
+                f"Pos: {train_stats['loss_fut_pos']:.6f}, "
+                f"PosXY: {train_stats['loss_fut_pos_x']:.6f}/{train_stats['loss_fut_pos_y']:.6f}"
+            )
 
             state_fut = {
                 'epoch': epoch + 1,

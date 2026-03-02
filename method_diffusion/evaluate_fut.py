@@ -90,7 +90,7 @@ class MetricsCalculator:
     def update(self, pred, target, valid_mask=None):
         pred = pred[:, :self.t_max, :2]
         target = target[:, :self.t_max, :2]
-        B, T, _ = pred.shape
+        _, T, _ = pred.shape
         valid_mask = self._normalize_valid_mask(valid_mask, pred)[:, :T]
 
         diff = pred - target
@@ -224,9 +224,17 @@ def get_test_loader(args):
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=test_dataset.collate_fn,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0,
     )
     return test_loader
+
+
+def resolve_checkpoint_base_dir(checkpoint_dir):
+    ckpt_path = Path(checkpoint_dir)
+    if ckpt_path.is_absolute():
+        return ckpt_path
+    return (Path.cwd() / ckpt_path).resolve()
 
 
 def print_metrics_table(metrics, name="Model", time_indices=[4, 9, 14, 19, 24],
@@ -330,15 +338,7 @@ def run_evaluation(args, device):
     print(f"[Eval] Test ratio: {test_ratio:.2f}, evaluating {target_test_batches}/{total_test_batches} batches")
 
     model_hist = None
-    model_fut = None
-
-    script_dir = Path(__file__).resolve().parent
-
-    arg_ckpt_path = Path(args.checkpoint_dir)
-    if arg_ckpt_path.is_absolute():
-        base_ckpt_dir = arg_ckpt_path
-    else:
-        base_ckpt_dir = script_dir / arg_ckpt_path.name
+    base_ckpt_dir = resolve_checkpoint_base_dir(args.checkpoint_dir)
 
     hist_ckpt_dir = base_ckpt_dir / 'hist'
     fut_ckpt_dir = base_ckpt_dir / 'fut'
@@ -355,10 +355,6 @@ def run_evaluation(args, device):
     print(
         f"[FutModel] Inference sampler: steps={args.num_inference_steps}, "
         f"spacing={args.inference_timestep_spacing}, eta={args.ddim_eta}, x0_clip={args.x0_clip}, mode=residual_anchor_rollout"
-    )
-    print(
-        f"[FutModel] CFG: enabled={int(args.cfg_enabled) > 0}, "
-        f"drop_prob={args.cfg_drop_prob}, guidance_scale={args.cfg_guidance_scale}"
     )
 
     if args.eval_mode == 'joint':
@@ -399,11 +395,15 @@ def run_evaluation(args, device):
                 calc_hist.update(pred_hist[..., :2], hist[..., :2], valid_mask=torch.ones_like(hist[..., 0]))
                 current_hist_input = pred_hist
 
-            # _, pred_fut, _, _ = model_fut.forwardEval(current_hist_input, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
-            _, pred_fut, _, _ = model_fut.forwardEval_minADE(current_hist_input, hist_nbrs, mask, temporal_mask, fut, op_mask, device, K=5)
+            k_samples = max(1, int(args.num_samples))
+            _, pred_fut, _, _ = model_fut.forwardEval_minADE(
+                current_hist_input, hist_nbrs, mask, temporal_mask, fut, op_mask, device, K=k_samples
+            )
             calc_fut.update(pred_fut, fut, valid_mask=op_mask)
 
             if visualized_count < args.visualize_samples:
+                pred_all_vis = getattr(model_fut, "last_minade_all_preds", None)
+                pred_best_idx_vis = getattr(model_fut, "last_minade_best_idx", None)
                 batch_metrics = compute_batch_metrics(pred_fut, fut, op_mask)
                 vis_metrics = compute_single_vis_metrics(pred_fut, fut, op_mask, batch_idx=0)
                 running_summary = calc_fut.get_summary()
@@ -422,9 +422,12 @@ def run_evaluation(args, device):
 
                 vis_info = visualize_batch_trajectories(
                     hist=current_hist_input,
-                    hist_nbrs=None,
+                    hist_nbrs=hist_nbrs,
+                    temporal_mask=temporal_mask,
                     future=fut,
                     pred=pred_fut,
+                    pred_all=pred_all_vis,
+                    pred_best_idx=pred_best_idx_vis,
                     hist_masked=hist_mask,
                     batch_idx=0,
                     save_path=str(save_path) if save_path else None,
@@ -463,7 +466,7 @@ def main():
     parser.add_argument('--eval_mode', type=str, default='fut_only', choices=['fut_only', 'joint'],
                         help="评估模式: 'fut_only' (使用GT历史) 或 'joint' (使用Hist模型输出)")
     parser.add_argument('--test_path', type=str, default=None, help="测试集路径 (可选，覆盖默认)")
-    parser.add_argument('--test_ratio', type=float, default=1.0, help="测试集评估比例，0~1，默认0.1表示评估10% TestSet")
+    parser.add_argument('--test_ratio', type=float, default=0.1, help="测试集评估比例，0~1，默认0.1表示评估10% TestSet")
     parser.add_argument('--visualize_samples', type=int, default=0, help="可视化样本数，0表示不绘制")
     parser.add_argument('--visualize_dir', type=str, default=None, help="可视化图片保存目录")
     parser.add_argument('--show_plots', action='store_true', help="是否弹窗显示可视化")

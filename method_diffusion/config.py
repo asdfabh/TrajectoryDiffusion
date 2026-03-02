@@ -73,6 +73,8 @@ def get_args_parser():
     # Fut loss
     parser.add_argument("--fut_y_loss_weight", default=2.0, type=float)
     parser.add_argument("--fut_huber_delta", default=1.0, type=float)
+    parser.add_argument("--fut_pos_loss_weight", default=0.5, type=float)
+    parser.add_argument("--fut_pos_whiten_eps", default=1e-4, type=float)
 
     # Fut visualization
     parser.add_argument("--fut_enable_train_vis", default=0, type=int)

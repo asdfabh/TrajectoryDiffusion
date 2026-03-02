@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 from pathlib import Path
 from method_diffusion.models.hist_model import DiffusionPast
-from method_diffusion.dataset.ngsim_dataset import NgsimDataset
+from method_diffusion.dataset.ngsim_hist_dataset import NgsimHistDataset
 from method_diffusion.config import get_args_parser
 from method_diffusion.utils.mask_util import random_mask, continuous_mask
 from tqdm import tqdm
@@ -147,7 +147,7 @@ def main():
     train_path = str(data_root / 'TrainSet.mat')
 
     # 创建数据集和 DataLoader
-    train_dataset = NgsimDataset(train_path, t_h=30, t_f=50, d_s=2)
+    train_dataset = NgsimHistDataset(train_path, t_h=30, d_s=2)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,

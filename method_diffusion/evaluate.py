@@ -10,7 +10,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from method_diffusion.models.hist_model import DiffusionPast
-from method_diffusion.dataset.ngsim_dataset import NgsimDataset
+from method_diffusion.dataset.ngsim_hist_dataset import NgsimHistDataset
 from method_diffusion.config import get_args_parser
 from method_diffusion.utils.mask_util import random_mask, continuous_mask
 
@@ -120,7 +120,7 @@ def main():
 
     print(f"Loading test data from: {test_path}")
 
-    test_dataset = NgsimDataset(test_path, t_h=30, t_f=50, d_s=2)
+    test_dataset = NgsimHistDataset(test_path, t_h=30, d_s=2)
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,

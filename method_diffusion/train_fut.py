@@ -80,13 +80,24 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
     model.train()
     total_loss = 0.0
+    total_vel_loss = 0.0
+    total_pos_loss = 0.0
+    total_pos_x_loss = 0.0
+    total_pos_y_loss = 0.0
     num_batches = 0
-    pbar = tqdm(dataloader, total=len(dataloader), desc=f"Epoch {epoch} Train", ncols=120)
+    pbar = tqdm(
+        dataloader,
+        total=len(dataloader),
+        desc=f"Ep{epoch} Train",
+        ncols=220,
+    )
 
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        loss = model.forwardTrain(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
-        # _, pred_fut, _, _ = model.forwardEval_minADE(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, K=5)
+        loss, loss_parts = model.forwardTrain(
+            hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, return_components=True
+        )
+        _, pred_fut, _, _ = model.forwardEval_minADE(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, K=5)
 
         optimizer.zero_grad()
         loss.backward()
@@ -98,10 +109,27 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
             ema.step(model)
 
         total_loss += float(loss.item())
+        total_vel_loss += float(loss_parts["loss_vel"].item())
+        total_pos_loss += float(loss_parts["loss_pos"].item())
+        total_pos_x_loss += float(loss_parts["loss_pos_x"].item())
+        total_pos_y_loss += float(loss_parts["loss_pos_y"].item())
         num_batches += 1
-        pbar.set_postfix({"loss": f"{loss.item():.6f}", "avg_loss": f"{(total_loss / num_batches):.6f}"})
+        pbar.set_postfix({
+            "loss": f"{loss.item():.6f}",
+            "avg_loss": f"{(total_loss / num_batches):.6f}",
+            "vel": f"{(total_vel_loss / num_batches):.6f}",
+            "pos": f"{(total_pos_loss / num_batches):.6f}",
+            "pos_xy": f"{(total_pos_x_loss / num_batches):.6f}/{(total_pos_y_loss / num_batches):.6f}",
+        })
 
-    return total_loss / max(num_batches, 1)
+    denom = max(num_batches, 1)
+    return {
+        "loss": total_loss / denom,
+        "loss_vel": total_vel_loss / denom,
+        "loss_pos": total_pos_loss / denom,
+        "loss_pos_x": total_pos_x_loss / denom,
+        "loss_pos_y": total_pos_y_loss / denom,
+    }
 
 
 @torch.no_grad()
@@ -224,7 +252,9 @@ def main():
     )
     print(
         f"[FutModel] Train strategy: self_condition_prob={args.self_condition_prob}, "
-        f"loss=smooth_l1_residual_anchor, y_weight={args.fut_y_loss_weight}, huber_delta={args.fut_huber_delta}"
+        f"loss=vel_huber+whiten_pos_huber, y_weight={args.fut_y_loss_weight}, "
+        f"huber_delta={args.fut_huber_delta}, pos_weight={args.fut_pos_loss_weight}, "
+        f"pos_whiten_eps={args.fut_pos_whiten_eps}"
     )
     print(
         f"[FutModel] TestSet eval sampling: eval_ratio={eval_ratio}, eval_max_batches={args.eval_max_batches}"
@@ -285,7 +315,8 @@ def main():
         print(f"\n========== Epoch {epoch + 1}/{args.num_epochs} ==========")
 
         # 训练阶段：传入 ema 参与权重影子步进
-        avg_loss = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim, ema)
+        train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim, ema)
+        avg_loss = float(train_stats["loss"])
 
         # 评估阶段：为了不破坏正在训练的原始权重，先深拷贝备份，再套用 EMA 权重
         original_state = {k: v.clone() for k, v in model.state_dict().items()}
@@ -306,12 +337,21 @@ def main():
 
         print(f"Epoch [{epoch + 1}] Train Loss: {avg_loss:.6f}")
         print(
+            f"Train Detail [{epoch + 1}] Vel: {train_stats['loss_vel']:.6f}, "
+            f"Pos: {train_stats['loss_pos']:.6f}, "
+            f"PosXY: {train_stats['loss_pos_x']:.6f}/{train_stats['loss_pos_y']:.6f}"
+        )
+        print(
             f"TestSet Eval [{epoch + 1}] Loss: {eval_loss:.6f}, "
             f"ADE: {eval_ade:.4f} ft ({eval_ade * 0.3048:.4f} m), "
             f"FDE: {eval_fde:.4f} ft ({eval_fde * 0.3048:.4f} m)"
         )
 
         writer.add_scalar("Train/Loss", avg_loss, epoch + 1)
+        writer.add_scalar("Train/Loss_vel", train_stats["loss_vel"], epoch + 1)
+        writer.add_scalar("Train/Loss_pos", train_stats["loss_pos"], epoch + 1)
+        writer.add_scalar("Train/Loss_pos_x", train_stats["loss_pos_x"], epoch + 1)
+        writer.add_scalar("Train/Loss_pos_y", train_stats["loss_pos_y"], epoch + 1)
         writer.add_scalar("Eval/Loss", eval_loss, epoch + 1)
         writer.add_scalar("Eval/ADE_ft", eval_ade, epoch + 1)
         writer.add_scalar("Eval/FDE_ft", eval_fde, epoch + 1)

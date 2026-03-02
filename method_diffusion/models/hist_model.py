@@ -53,6 +53,14 @@ class DiffusionPast(nn.Module):
         for key, value in self.norm_config.items():
             self.register_buffer(key, torch.from_numpy(value).float())
 
+    def build_condition(self, hist_masked_value, hist_mask):
+        """
+        将条件统一到归一化空间，避免与 x_t 的尺度不一致。
+        cond = [norm(masked_value), mask_bit]
+        """
+        cond_value = self.norm(hist_masked_value)
+        return torch.cat([cond_value, hist_mask.float()], dim=-1)
+
     def compute_motion_loss(self, pred, target, mask):
         """
         pred: [B, T, D]
@@ -85,6 +93,7 @@ class DiffusionPast(nn.Module):
         target_acc = target_vel[:, 1:, :] - target_vel[:, :-1, :]
         loss_acc = ((pred_acc - target_acc) ** 2).mean()
 
+        # 按当前策略：先保留加速度损失计算，但不计入总损失
         total_loss = loss_known + 1.5 * loss_unknown + 0.7 * loss_vel
         return total_loss
 
@@ -92,20 +101,21 @@ class DiffusionPast(nn.Module):
     def forward_train(self, hist, hist_masked, device):
         B, T,  _ = hist_masked.shape
 
-        hist_mask = hist_masked[..., -1:]  # [B, T, 1]
+        hist_mask = hist_masked[..., -1:].float()  # [B, T, 1]
         hist_masked_value = hist_masked[..., :-1]  # [B, T, dim]
-        hist_masked_norm = self.norm(hist_masked_value) # [B, T, dim]
-        x_start = hist_masked_norm # [B, T, dim]
+        cond = self.build_condition(hist_masked_value, hist_mask)  # [B, T, dim+1]
+
+        # 训练加噪对象改为 full x0，条件仍为 masked 轨迹
+        x_start = self.norm(hist)  # [B, T, dim]
         timesteps = torch.randint(0, self.num_train_timesteps, (B,), device=device)
         noise = torch.randn_like(x_start)
         x_noisy = self.diffusion_scheduler.add_noise(x_start, noise, timesteps)
-        model_input = torch.cat([x_noisy, hist_masked], dim=-1)  # [B, T, 2*dim+1]
+        model_input = torch.cat([x_noisy, cond], dim=-1)  # [B, T, 2*dim+1]
 
         input_embedded = self.input_embedding(model_input) + self.pos_embedding(model_input)
         pred_x0 = self.dit(x=input_embedded, t=timesteps)
 
-        mask = hist_mask.unsqueeze(-1)
-        loss = self.compute_motion_loss(pred_x0, self.norm(hist), mask)
+        loss = self.compute_motion_loss(pred_x0, x_start, hist_mask)
         # loss = torch.nn.functional.mse_loss(pred_x0, self.norm(hist))
 
         pred = self.denorm(pred_x0)
@@ -132,22 +142,41 @@ class DiffusionPast(nn.Module):
     def forward_eval(self, hist, hist_masked, device):
         B, T, _ = hist_masked.shape
 
-        hist_masked_norm = self.norm(hist_masked)
-        hist_mask = hist_masked[..., -1:]
-        x_start = hist_masked_norm[..., :4]  # [B, T, dim]
-        timesteps = torch.randint(0, self.num_train_timesteps, (B,), device=device)
-        noise = torch.randn_like(x_start)
-        x_t = self.diffusion_scheduler.add_noise(x_start, noise, timesteps)
+        hist_mask = hist_masked[..., -1:].float()
+        mask_unknown = 1.0 - hist_mask
+        hist_masked_value = hist_masked[..., :-1]
+        cond = self.build_condition(hist_masked_value, hist_mask)
+        known_x0 = self.norm(hist_masked_value)
 
+        # Hybrid 初始化：已知位置来自 q(x_t | x0_known)，未知位置使用纯噪声
         self.diffusion_scheduler.set_timesteps(self.num_inference_steps)
-        for t in self.diffusion_scheduler.timesteps:
-            model_input = torch.cat((x_t, hist_masked), dim=-1)
-            timesteps = torch.full((B,), t, device=device, dtype=torch.long)
+        infer_timesteps = self.diffusion_scheduler.timesteps
+        init_t = int(infer_timesteps[0])
+        init_t_batch = torch.full((B,), init_t, device=device, dtype=torch.long)
+        known_noise = torch.randn_like(known_x0)
+        known_x_t = self.diffusion_scheduler.add_noise(known_x0, known_noise, init_t_batch)
+        unknown_x_t = torch.randn_like(known_x0)
+        x_t = hist_mask * known_x_t + mask_unknown * unknown_x_t
+
+        for idx, t in enumerate(infer_timesteps):
+            t_batch = torch.full((B,), int(t), device=device, dtype=torch.long)
+            model_input = torch.cat((x_t, cond), dim=-1)
             input_embedded = self.input_embedding(model_input) + self.pos_embedding(model_input)
-            pred_x0_norm = self.dit(x=input_embedded, t=timesteps)
+            pred_x0_norm = self.dit(x=input_embedded, t=t_batch)
+
+            # 采样阶段强约束已观测轨迹，模型重点修复缺失段
+            pred_x0_norm = hist_mask * known_x0 + mask_unknown * pred_x0_norm
             x_t = self.diffusion_scheduler.step(pred_x0_norm, t, x_t).prev_sample
 
-        final_pred = self.denorm(x_t)
+            # 准备下一步：将已知位置重新投影到对应噪声层
+            if idx < len(infer_timesteps) - 1:
+                next_t = int(infer_timesteps[idx + 1])
+                next_t_batch = torch.full((B,), next_t, device=device, dtype=torch.long)
+                known_x_next = self.diffusion_scheduler.add_noise(known_x0, known_noise, next_t_batch)
+                x_t = hist_mask * known_x_next + mask_unknown * x_t
+
+        final_pred_norm = hist_mask * known_x0 + mask_unknown * x_t
+        final_pred = self.denorm(final_pred_norm)
         loss = torch.nn.functional.mse_loss(final_pred, hist)
         diff = final_pred[..., :2] - hist[..., :2]
         dist = torch.norm(diff, dim=-1)  # [B, T]
@@ -175,13 +204,17 @@ class DiffusionPast(nn.Module):
     # hist = [B, T, dim], nbrs = [N_total, T, dim]. dim = x, y, v, a, laneID, class
     def norm(self, x):
         x_norm = x.clone()
-        x_norm[..., 0:2] = (x[..., 0:2] - self.pos_mean) / self.pos_std  # x, y
-        x_norm[..., 2:4] = (x[..., 2:4] - self.va_mean) / self.va_std  # v, a
+        if x_norm.size(-1) >= 2:
+            x_norm[..., 0:2] = (x[..., 0:2] - self.pos_mean) / self.pos_std  # x, y
+        if x_norm.size(-1) >= 4:
+            x_norm[..., 2:4] = (x[..., 2:4] - self.va_mean) / self.va_std  # v, a
         x_norm = torch.clamp(x_norm, -5.0, 5.0)
         return x_norm
 
     def denorm(self, x):
         x_denorm = x.clone()
-        x_denorm[..., 0:2] = x[..., 0:2] * self.pos_std + self.pos_mean  # x, y
-        x_denorm[..., 2:4] = x[..., 2:4] * self.va_std + self.va_mean  # v, a
+        if x_denorm.size(-1) >= 2:
+            x_denorm[..., 0:2] = x[..., 0:2] * self.pos_std + self.pos_mean  # x, y
+        if x_denorm.size(-1) >= 4:
+            x_denorm[..., 2:4] = x[..., 2:4] * self.va_std + self.va_mean  # v, a
         return x_denorm

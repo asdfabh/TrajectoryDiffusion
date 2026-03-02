@@ -30,6 +30,8 @@ class DiffusionFut(nn.Module):
         self.self_condition_prob = min(max(float(args.self_condition_prob), 0.0), 1.0)
         self.y_loss_weight = max(1.0, float(args.fut_y_loss_weight))
         self.huber_delta = max(1e-4, float(args.fut_huber_delta))
+        self.pos_loss_weight = max(0.0, float(args.fut_pos_loss_weight))
+        self.pos_whiten_eps = max(1e-8, float(args.fut_pos_whiten_eps))
         x0_clip_val = float(args.x0_clip)
         self.x0_clip = x0_clip_val if x0_clip_val > 0 else None
 
@@ -80,6 +82,8 @@ class DiffusionFut(nn.Module):
         # 核心新增：专门针对帧间相对位移 (Velocity) 的高斯先验参数（全量统计）
         self.register_buffer("vel_mean", torch.tensor([-0.004182, 5.041937]).float(), persistent=False)
         self.register_buffer("vel_std", torch.tensor([0.150222, 2.951254]).float(), persistent=False)
+        self.register_buffer("vel_cov", torch.diag(self.vel_std ** 2), persistent=False)
+        self.register_buffer("pos_whiten_mats", self.build_pos_whiten_mats(self.T), persistent=False)
 
     @staticmethod
     def toValidMask(op_mask, seq_len, batch_size, device):
@@ -115,7 +119,26 @@ class DiffusionFut(nn.Module):
         input_embedded = self.input_embedding(combined_input) + self.pos_embedding(x_t)
         return self.dit(x=input_embedded, y=t_emb + enc_emb, cross=context_aligned)
 
-    def computeLoss(self, pred_vel_norm, target_vel_norm, future_phys, anchor_phys, valid_mask):
+    def build_pos_whiten_mats(self, t_len):
+        t_seq = torch.arange(1, t_len + 1, dtype=self.vel_std.dtype).view(t_len, 1, 1)
+        base_cov = self.vel_cov.view(1, 2, 2)
+        eye = torch.eye(2, dtype=self.vel_std.dtype).view(1, 2, 2)
+        cov_t = t_seq * base_cov + self.pos_whiten_eps * eye
+        chol_t = torch.linalg.cholesky(cov_t)
+        return torch.linalg.inv(chol_t)
+
+    def get_pos_whiten_mats(self, t_len, device, dtype):
+        if t_len <= self.pos_whiten_mats.size(0):
+            return self.pos_whiten_mats[:t_len].to(device=device, dtype=dtype)
+
+        t_seq = torch.arange(1, t_len + 1, device=device, dtype=dtype).view(t_len, 1, 1)
+        base_cov = self.vel_cov.to(device=device, dtype=dtype).view(1, 2, 2)
+        eye = torch.eye(2, device=device, dtype=dtype).view(1, 2, 2)
+        cov_t = t_seq * base_cov + self.pos_whiten_eps * eye
+        chol_t = torch.linalg.cholesky(cov_t)
+        return torch.linalg.inv(chol_t)
+
+    def computeLoss(self, pred_vel_norm, target_vel_norm, future_phys, anchor_phys, valid_mask, return_parts=False):
         """ 双轨闭环 Loss：微观治抖动 (Vel)，宏观防累积漂移 (Pos)"""
         vel_weights = [1.0] * self.output_dim
         if self.output_dim >= 2:
@@ -135,13 +158,15 @@ class DiffusionFut(nn.Module):
         pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
         pred_pos_phys = torch.cumsum(pred_vel_phys, dim=1) + anchor_phys[..., :2]
 
-        # 方差感知标准化：对积分误差按 sqrt(t) * vel_std 归一化
-        # 近似利用 Var(sum v_i) ~ t * Var(v_i) 的关系，让各时刻位置项梯度量级更平衡
+        # 白化位置误差：按时序相关方差的 Cholesky 逆进行标准化，避免 x/y 尺度失衡
         t_len = pred_pos_phys.size(1)
-        t_seq = torch.arange(1, t_len + 1, device=pred_pos_phys.device, dtype=pred_pos_phys.dtype).view(1, t_len, 1)
-        pos_scale = torch.sqrt(t_seq) * std_vel
-        pos_diff_norm = (pred_pos_phys - future_phys[..., :2]) / (pos_scale + 1e-6)
-        loss_pos = F.smooth_l1_loss(pos_diff_norm, torch.zeros_like(pos_diff_norm), reduction="none", beta=self.huber_delta)
+        pos_err = pred_pos_phys - future_phys[..., :2]
+        whiten_mats = self.get_pos_whiten_mats(t_len, pred_pos_phys.device, pred_pos_phys.dtype)
+        pos_err_white = torch.einsum("tij,btj->bti", whiten_mats, pos_err)
+        loss_pos_xy = F.smooth_l1_loss(
+            pos_err_white, torch.zeros_like(pos_err_white), reduction="none", beta=self.huber_delta
+        )
+        loss_pos = loss_pos_xy
 
         # 维度安全补齐 (应对 output_dim > 2 的情况)
         if self.output_dim > 2:
@@ -149,15 +174,32 @@ class DiffusionFut(nn.Module):
                               dtype=loss_pos.dtype)
             loss_pos = torch.cat([loss_pos, pad], dim=-1)
 
-        # 位置项保持各轴等权，避免与速度项的 y 轴加权叠加导致双重强化
-
         # 双轨合一
-        total_loss = loss_vel + loss_pos
+        total_loss = loss_vel + self.pos_loss_weight * loss_pos
 
         valid = valid_mask.unsqueeze(-1)
         numer = (total_loss * valid).sum(dim=(1, 2))
         denom = valid.sum(dim=(1, 2)) + 1e-6
-        return (numer / denom).mean()
+        total_mean = (numer / denom).mean()
+
+        if not return_parts:
+            return total_mean
+
+        vel_mean = ((loss_vel * valid).sum(dim=(1, 2)) / denom).mean()
+        pos_mean = ((loss_pos * valid).sum(dim=(1, 2)) / denom).mean()
+        valid_t = valid_mask
+        denom_t = valid_t.sum(dim=1) + 1e-6
+        pos_x_mean = ((loss_pos_xy[..., 0] * valid_t).sum(dim=1) / denom_t).mean()
+        pos_y_mean = ((loss_pos_xy[..., 1] * valid_t).sum(dim=1) / denom_t).mean()
+
+        parts = {
+            "loss_total": total_mean.detach(),
+            "loss_vel": vel_mean.detach(),
+            "loss_pos": pos_mean.detach(),
+            "loss_pos_x": pos_x_mean.detach(),
+            "loss_pos_y": pos_y_mean.detach(),
+        }
+        return total_mean, parts
 
     @staticmethod
     def computeAdeFde(pred, target, valid_mask):
@@ -200,7 +242,8 @@ class DiffusionFut(nn.Module):
                 x_t = infer_scheduler.step(pred_vel_norm, t, x_t).prev_sample
         return pred_vel_cond
 
-    def maybeVisualize(self, hist, future, pred, valid_mask, stage):
+    def maybeVisualize(self, hist, hist_nbrs, temporal_mask, future, pred, valid_mask, stage,
+                       pred_all=None, pred_best_idx=None):
         if not self.is_main_process: return
         if stage == "train":
             self.trainForwardCalls += 1
@@ -213,11 +256,23 @@ class DiffusionFut(nn.Module):
         vis_ade, vis_fde = self.computeSingleAdeFde(pred, future, valid_mask, batch_idx=vis_batch_idx)
         metrics = {"ADE(vis traj)": {"ft": vis_ade.item(), "m": vis_ade.item() * self.meter_per_foot},
                    "FDE(vis traj)": {"ft": vis_fde.item(), "m": vis_fde.item() * self.meter_per_foot}}
-        visualize_batch_trajectories(hist=hist, hist_nbrs=None, temporal_mask=None, future=future, pred=pred,
-                                     future_mask=valid_mask, batch_idx=vis_batch_idx, save_path=None, metrics=metrics,
-                                     input_unit="ft", show_plot=True)
+        visualize_batch_trajectories(
+            hist=hist,
+            hist_nbrs=hist_nbrs,
+            temporal_mask=temporal_mask,
+            future=future,
+            pred=pred,
+            pred_all=pred_all,
+            pred_best_idx=pred_best_idx,
+            future_mask=valid_mask,
+            batch_idx=vis_batch_idx,
+            save_path=None,
+            metrics=metrics,
+            input_unit="ft",
+            show_plot=True,
+        )
 
-    def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
+    def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, return_components=False):
         bsz, t_len, _ = future.shape
         valid_mask = self.toValidMask(op_mask, t_len, bsz, device)
 
@@ -257,7 +312,14 @@ class DiffusionFut(nn.Module):
         pred_vel_norm_t = self.predictX0(x_t, timesteps, context_aligned, enc_emb, pred_vel_cond)
 
         # 传入双轨 Loss 防累积漂移
-        loss = self.computeLoss(pred_vel_norm_t, target_vel_norm, future_phys, anchor_phys, valid_mask)
+        loss, loss_parts = self.computeLoss(
+            pred_vel_norm_t,
+            target_vel_norm,
+            future_phys,
+            anchor_phys,
+            valid_mask,
+            return_parts=True,
+        )
 
         if self.fut_enable_train_vis:
             pred_vel_phys_t = pred_vel_norm_t[..., :2] * std_vel + mean_vel
@@ -266,8 +328,18 @@ class DiffusionFut(nn.Module):
             # 兼容多维度输出拼接
             pred_phys_abs = future_phys.clone()
             pred_phys_abs[..., :2] = pred_pos_phys
-            self.maybeVisualize(hist, future, pred_phys_abs, valid_mask, stage="train")
+            self.maybeVisualize(
+                hist=hist,
+                hist_nbrs=hist_nbrs,
+                temporal_mask=temporal_mask,
+                future=future,
+                pred=pred_phys_abs,
+                valid_mask=valid_mask,
+                stage="train",
+            )
 
+        if return_components:
+            return loss, loss_parts
         return loss
 
     @torch.no_grad()
@@ -303,11 +375,25 @@ class DiffusionFut(nn.Module):
         shifted_future = torch.cat([anchor_phys, future_phys[:, :-1, :]], dim=1)
         target_vel_norm = future_phys.clone()
         target_vel_norm[..., :2] = ((future_phys[..., :2] - shifted_future[..., :2]) - mean_vel) / std_vel
-        loss = self.computeLoss(pred_vel_norm, torch.clamp(target_vel_norm, -10.0, 10.0), future_phys, anchor_phys,
-                                valid_mask)
+        loss = self.computeLoss(
+            pred_vel_norm,
+            torch.clamp(target_vel_norm, -10.0, 10.0),
+            future_phys,
+            anchor_phys,
+            valid_mask,
+            return_parts=False,
+        )
 
         ade, fde = self.computeAdeFde(pred_phys_abs, future, valid_mask)
-        self.maybeVisualize(hist, future, pred_phys_abs, valid_mask, stage="eval")
+        self.maybeVisualize(
+            hist=hist,
+            hist_nbrs=hist_nbrs,
+            temporal_mask=temporal_mask,
+            future=future,
+            pred=pred_phys_abs,
+            valid_mask=valid_mask,
+            stage="eval",
+        )
         return loss, pred_phys_abs, ade, fde
 
     @torch.no_grad()
@@ -379,14 +465,30 @@ class DiffusionFut(nn.Module):
         best_k_idx_exp = best_k_idx.view(bsz, 1, 1, 1).expand(bsz, 1, t_len, self.output_dim)
         best_pred_phys = all_preds.gather(1, best_k_idx_exp).squeeze(1)
 
+        # 缓存多模态采样结果，供外部评估/可视化直接使用
+        self.last_minade_all_preds = all_preds.detach()
+        self.last_minade_best_idx = best_k_idx.detach()
+
         ade_batch, fde_batch = self.computeAdeFde(best_pred_phys, future, valid_mask)
         dummy_loss = torch.tensor(0.0, device=device)
-        self.maybeVisualize(hist, future, best_pred_phys, valid_mask, stage="eval")
+        self.maybeVisualize(
+            hist=hist,
+            hist_nbrs=hist_nbrs,
+            temporal_mask=temporal_mask,
+            future=future,
+            pred=best_pred_phys,
+            valid_mask=valid_mask,
+            stage="eval",
+            pred_all=all_preds,
+            pred_best_idx=best_k_idx,
+        )
 
         return dummy_loss, best_pred_phys, ade_batch, fde_batch
 
-    def forward(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
-        return self.forwardTrain(hist, hist_nbrs, mask, temporal_mask, future, op_mask, device)
+    def forward(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, return_components=False):
+        return self.forwardTrain(
+            hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, return_components=return_components
+        )
 
     def norm(self, x):
         x_norm = x.clone()
