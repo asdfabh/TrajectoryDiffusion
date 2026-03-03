@@ -90,12 +90,11 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
     model.train()
     total_loss = 0.0
     total_vel_loss = 0.0
+    total_vel_x_loss = 0.0
+    total_vel_y_loss = 0.0
     total_pos_loss = 0.0
     total_pos_x_loss = 0.0
     total_pos_y_loss = 0.0
-    total_pos_white_loss = 0.0
-    total_pos_euclid_loss = 0.0
-    total_fde_anchor_loss = 0.0
     num_batches = 0
 
     # 只有 Rank 0 显示进度条
@@ -116,12 +115,11 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
 
         total_loss += loss.item()
         total_vel_loss += float(loss_parts["loss_vel"].item())
+        total_vel_x_loss += float(loss_parts["loss_vel_x"].item())
+        total_vel_y_loss += float(loss_parts["loss_vel_y"].item())
         total_pos_loss += float(loss_parts["loss_pos"].item())
         total_pos_x_loss += float(loss_parts["loss_pos_x"].item())
         total_pos_y_loss += float(loss_parts["loss_pos_y"].item())
-        total_pos_white_loss += float(loss_parts["loss_pos_white"].item()) if "loss_pos_white" in loss_parts else 0.0
-        total_pos_euclid_loss += float(loss_parts["loss_pos_euclid"].item()) if "loss_pos_euclid" in loss_parts else 0.0
-        total_fde_anchor_loss += float(loss_parts["loss_fde"].item()) if "loss_fde" in loss_parts else 0.0
         num_batches += 1
 
         if rank == 0:
@@ -129,36 +127,33 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
                 'loss': f'{loss.item():.6f}',
                 'avg_loss': f'{total_loss / num_batches:.6f}',
                 'vel': f'{total_vel_loss / num_batches:.6f}',
+                'vel_xy': f'{total_vel_x_loss / num_batches:.6f}/{total_vel_y_loss / num_batches:.6f}',
                 'pos': f'{total_pos_loss / num_batches:.6f}',
                 'pos_xy': f'{total_pos_x_loss / num_batches:.6f}/{total_pos_y_loss / num_batches:.6f}',
-                'pos_we': f'{total_pos_white_loss / num_batches:.6f}/{total_pos_euclid_loss / num_batches:.6f}',
-                'fde_a': f'{total_fde_anchor_loss / num_batches:.6f}',
             })
 
     # Aggregate metrics/count across all ranks for true global averages.
     loss_count = torch.tensor([
         total_loss,
         total_vel_loss,
+        total_vel_x_loss,
+        total_vel_y_loss,
         total_pos_loss,
         total_pos_x_loss,
         total_pos_y_loss,
-        total_pos_white_loss,
-        total_pos_euclid_loss,
-        total_fde_anchor_loss,
         float(num_batches)
     ], device=device)
     if dist.is_initialized():
         dist.all_reduce(loss_count, op=dist.ReduceOp.SUM)
-    global_total_batches = max(float(loss_count[8].item()), 1.0)
+    global_total_batches = max(float(loss_count[7].item()), 1.0)
     return {
         "loss": float(loss_count[0].item()) / global_total_batches,
         "loss_vel": float(loss_count[1].item()) / global_total_batches,
-        "loss_pos": float(loss_count[2].item()) / global_total_batches,
-        "loss_pos_x": float(loss_count[3].item()) / global_total_batches,
-        "loss_pos_y": float(loss_count[4].item()) / global_total_batches,
-        "loss_pos_white": float(loss_count[5].item()) / global_total_batches,
-        "loss_pos_euclid": float(loss_count[6].item()) / global_total_batches,
-        "loss_fde": float(loss_count[7].item()) / global_total_batches,
+        "loss_vel_x": float(loss_count[2].item()) / global_total_batches,
+        "loss_vel_y": float(loss_count[3].item()) / global_total_batches,
+        "loss_pos": float(loss_count[4].item()) / global_total_batches,
+        "loss_pos_x": float(loss_count[5].item()) / global_total_batches,
+        "loss_pos_y": float(loss_count[6].item()) / global_total_batches,
     }
 
 
@@ -285,12 +280,8 @@ def main():
         )
         print(
             f"[FutModel] Train strategy: self_condition_prob={args.self_condition_prob}, "
-            f"loss=vel_huber+tempered_whiten_euclid+fde_anchor, y_weight={args.fut_y_loss_weight}, "
-            f"huber_delta={args.fut_huber_delta}, pos_weight={args.fut_pos_loss_weight}, "
-            f"gamma={args.fut_gamma_white}, lambda_white={args.fut_lambda_white}, "
-            f"lambda_euclid={args.fut_lambda_euclid}, lambda_fde={args.fut_lambda_fde}, "
-            f"s_iso={args.fut_s_iso}, eig_floor={args.fut_white_eig_floor}, "
-            f"cov_xy={args.fut_vel_cov_xy}, pos_whiten_eps={args.fut_pos_whiten_eps}"
+            f"loss=vel_huber+pos_huber_physical_time_discount, y_weight={args.fut_y_loss_weight}, "
+            f"huber_delta={args.fut_huber_delta}, pos_weight={args.fut_pos_loss_weight}"
         )
         print(
             f"[FutModel] Architecture: hidden_dim_fut={args.hidden_dim_fut}, depth_fut={args.depth_fut}"
@@ -393,10 +384,9 @@ def main():
             print(f"Epoch [{epoch + 1}] Average Loss: {avg_loss:.4f}")
             print(
                 f"Train Detail [{epoch + 1}] Vel: {train_stats['loss_vel']:.6f}, "
+                f"VelXY: {train_stats['loss_vel_x']:.6f}/{train_stats['loss_vel_y']:.6f}, "
                 f"Pos: {train_stats['loss_pos']:.6f}, "
-                f"PosXY: {train_stats['loss_pos_x']:.6f}/{train_stats['loss_pos_y']:.6f}, "
-                f"PosWE: {train_stats['loss_pos_white']:.6f}/{train_stats['loss_pos_euclid']:.6f}, "
-                f"FDE_A: {train_stats['loss_fde']:.6f}"
+                f"PosXY: {train_stats['loss_pos_x']:.6f}/{train_stats['loss_pos_y']:.6f}"
             )
             eval_loss, eval_ade, eval_fde = evaluate_on_testset(
                 model, test_loader, device, epoch + 1, args.feature_dim,

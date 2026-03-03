@@ -104,12 +104,11 @@ def train_epoch(
     total_loss_hist_weighted = 0.0
     total_loss_fut = 0.0
     total_loss_fut_vel = 0.0
+    total_loss_fut_vel_x = 0.0
+    total_loss_fut_vel_y = 0.0
     total_loss_fut_pos = 0.0
     total_loss_fut_pos_x = 0.0
     total_loss_fut_pos_y = 0.0
-    total_loss_fut_pos_white = 0.0
-    total_loss_fut_pos_euclid = 0.0
-    total_loss_fut_fde = 0.0
     num_batches = 0
 
     pbar = tqdm(
@@ -156,12 +155,11 @@ def train_epoch(
         total_loss_hist_weighted += curr_loss_h_weighted
         total_loss_fut += float(loss_f.item())
         total_loss_fut_vel += float(fut_parts["loss_vel"].item())
+        total_loss_fut_vel_x += float(fut_parts["loss_vel_x"].item())
+        total_loss_fut_vel_y += float(fut_parts["loss_vel_y"].item())
         total_loss_fut_pos += float(fut_parts["loss_pos"].item())
         total_loss_fut_pos_x += float(fut_parts["loss_pos_x"].item())
         total_loss_fut_pos_y += float(fut_parts["loss_pos_y"].item())
-        total_loss_fut_pos_white += float(fut_parts["loss_pos_white"].item()) if "loss_pos_white" in fut_parts else 0.0
-        total_loss_fut_pos_euclid += float(fut_parts["loss_pos_euclid"].item()) if "loss_pos_euclid" in fut_parts else 0.0
-        total_loss_fut_fde += float(fut_parts["loss_fde"].item()) if "loss_fde" in fut_parts else 0.0
         num_batches += 1
 
         pbar.set_postfix({
@@ -170,10 +168,9 @@ def train_epoch(
             'L_hist_w': f'{total_loss_hist_weighted / num_batches:.6f}',
             'L_fut': f'{total_loss_fut / num_batches:.6f}',
             'L_fut_vel': f'{total_loss_fut_vel / num_batches:.6f}',
+            'L_fut_vel_xy': f'{total_loss_fut_vel_x / num_batches:.6f}/{total_loss_fut_vel_y / num_batches:.6f}',
             'L_fut_pos': f'{total_loss_fut_pos / num_batches:.6f}',
             'L_fut_pos_xy': f'{total_loss_fut_pos_x / num_batches:.6f}/{total_loss_fut_pos_y / num_batches:.6f}',
-            'L_fut_pos_we': f'{total_loss_fut_pos_white / num_batches:.6f}/{total_loss_fut_pos_euclid / num_batches:.6f}',
-            'L_fut_fde_a': f'{total_loss_fut_fde / num_batches:.6f}',
         })
 
     return {
@@ -182,12 +179,11 @@ def train_epoch(
         "loss_hist_weighted": total_loss_hist_weighted / num_batches,
         "loss_fut": total_loss_fut / num_batches,
         "loss_fut_vel": total_loss_fut_vel / num_batches,
+        "loss_fut_vel_x": total_loss_fut_vel_x / num_batches,
+        "loss_fut_vel_y": total_loss_fut_vel_y / num_batches,
         "loss_fut_pos": total_loss_fut_pos / num_batches,
         "loss_fut_pos_x": total_loss_fut_pos_x / num_batches,
         "loss_fut_pos_y": total_loss_fut_pos_y / num_batches,
-        "loss_fut_pos_white": total_loss_fut_pos_white / num_batches,
-        "loss_fut_pos_euclid": total_loss_fut_pos_euclid / num_batches,
-        "loss_fut_fde": total_loss_fut_fde / num_batches,
     }
 
 
@@ -327,10 +323,9 @@ def main():
         )
         print(
             f"Fut Detail [{epoch + 1}] Vel: {train_stats['loss_fut_vel']:.6f}, "
+            f"VelXY: {train_stats['loss_fut_vel_x']:.6f}/{train_stats['loss_fut_vel_y']:.6f}, "
             f"Pos: {train_stats['loss_fut_pos']:.6f}, "
-            f"PosXY: {train_stats['loss_fut_pos_x']:.6f}/{train_stats['loss_fut_pos_y']:.6f}, "
-            f"PosWE: {train_stats['loss_fut_pos_white']:.6f}/{train_stats['loss_fut_pos_euclid']:.6f}, "
-            f"FDE_A: {train_stats['loss_fut_fde']:.6f}"
+            f"PosXY: {train_stats['loss_fut_pos_x']:.6f}/{train_stats['loss_fut_pos_y']:.6f}"
         )
 
         writer.add_scalar('Train/Loss', avg_loss, epoch + 1)
@@ -338,12 +333,11 @@ def main():
         writer.add_scalar('Train/Loss_hist_weighted', train_stats["loss_hist_weighted"], epoch + 1)
         writer.add_scalar('Train/Loss_fut', train_stats["loss_fut"], epoch + 1)
         writer.add_scalar('Train/Loss_fut_vel', train_stats["loss_fut_vel"], epoch + 1)
+        writer.add_scalar('Train/Loss_fut_vel_x', train_stats["loss_fut_vel_x"], epoch + 1)
+        writer.add_scalar('Train/Loss_fut_vel_y', train_stats["loss_fut_vel_y"], epoch + 1)
         writer.add_scalar('Train/Loss_fut_pos', train_stats["loss_fut_pos"], epoch + 1)
         writer.add_scalar('Train/Loss_fut_pos_x', train_stats["loss_fut_pos_x"], epoch + 1)
         writer.add_scalar('Train/Loss_fut_pos_y', train_stats["loss_fut_pos_y"], epoch + 1)
-        writer.add_scalar('Train/Loss_fut_pos_white', train_stats["loss_fut_pos_white"], epoch + 1)
-        writer.add_scalar('Train/Loss_fut_pos_euclid', train_stats["loss_fut_pos_euclid"], epoch + 1)
-        writer.add_scalar('Train/Loss_fut_fde_anchor', train_stats["loss_fut_fde"], epoch + 1)
         scheduler.step()
 
         state_fut = {

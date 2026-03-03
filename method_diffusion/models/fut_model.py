@@ -31,13 +31,6 @@ class DiffusionFut(nn.Module):
         self.y_loss_weight = max(1.0, float(args.fut_y_loss_weight))
         self.huber_delta = max(1e-4, float(args.fut_huber_delta))
         self.pos_loss_weight = max(0.0, float(args.fut_pos_loss_weight))
-        self.pos_whiten_eps = max(1e-8, float(args.fut_pos_whiten_eps))
-        self.gamma_white = min(max(float(args.fut_gamma_white), 0.0), 1.0)
-        self.lambda_white = max(0.0, float(args.fut_lambda_white))
-        self.lambda_euclid = max(0.0, float(args.fut_lambda_euclid))
-        self.lambda_fde = max(0.0, float(args.fut_lambda_fde))
-        self.s_iso = max(1e-6, float(args.fut_s_iso))
-        self.white_eig_floor = max(1e-8, float(args.fut_white_eig_floor))
         x0_clip_val = float(args.x0_clip)
         self.x0_clip = x0_clip_val if x0_clip_val > 0 else None
 
@@ -85,19 +78,12 @@ class DiffusionFut(nn.Module):
         self.register_buffer("va_mean", torch.tensor([21.1503, 0.0060]).float(), persistent=False)
         self.register_buffer("va_std", torch.tensor([13.5983, 4.5057]).float(), persistent=False)
 
-        # 核心新增：专门针对帧间相对位移 (Velocity) 的高斯先验参数（全量统计）
+        # 针对帧间相对位移 (Velocity) 的归一化参数
         vel_mean = torch.tensor([-0.004182, 5.041937], dtype=torch.float32)
         vel_std = torch.tensor([0.150222, 2.951254], dtype=torch.float32)
-        var_x, var_y = float(vel_std[0].item() ** 2), float(vel_std[1].item() ** 2)
-        max_cov_xy = 0.99 * float((var_x * var_y) ** 0.5)
-        cov_xy = float(args.fut_vel_cov_xy)
-        cov_xy = max(-max_cov_xy, min(max_cov_xy, cov_xy))
-        vel_cov = torch.tensor([[var_x, cov_xy], [cov_xy, var_y]], dtype=torch.float32)
 
         self.register_buffer("vel_mean", vel_mean, persistent=False)
         self.register_buffer("vel_std", vel_std, persistent=False)
-        self.register_buffer("vel_cov", vel_cov, persistent=False)
-        self.register_buffer("pos_whiten_mats", self.build_pos_whiten_mats(self.T), persistent=False)
 
     @staticmethod
     def toValidMask(op_mask, seq_len, batch_size, device):
@@ -133,34 +119,8 @@ class DiffusionFut(nn.Module):
         input_embedded = self.input_embedding(combined_input) + self.pos_embedding(x_t)
         return self.dit(x=input_embedded, y=t_emb + enc_emb, cross=context_aligned)
 
-    def _build_tempered_whiten(self, cov_t, gamma):
-        eig_vals, eig_vecs = torch.linalg.eigh(cov_t)
-        eig_vals = torch.clamp(eig_vals, min=self.white_eig_floor)
-        power = -(1.0 - gamma) * 0.5
-        eig_pow = torch.diag_embed(eig_vals.pow(power))
-        return torch.matmul(torch.matmul(eig_vecs, eig_pow), eig_vecs.transpose(1, 2))
-
-    def build_pos_whiten_mats(self, t_len, gamma=None):
-        if gamma is None:
-            gamma = self.gamma_white
-        t_seq = torch.arange(1, t_len + 1, dtype=self.vel_std.dtype).view(t_len, 1, 1)
-        base_cov = self.vel_cov.view(1, 2, 2)
-        eye = torch.eye(2, dtype=self.vel_std.dtype).view(1, 2, 2)
-        cov_t = t_seq * base_cov + self.pos_whiten_eps * eye
-        return self._build_tempered_whiten(cov_t, gamma)
-
-    def get_pos_whiten_mats(self, t_len, device, dtype):
-        if t_len <= self.pos_whiten_mats.size(0):
-            return self.pos_whiten_mats[:t_len].to(device=device, dtype=dtype)
-
-        t_seq = torch.arange(1, t_len + 1, device=device, dtype=dtype).view(t_len, 1, 1)
-        base_cov = self.vel_cov.to(device=device, dtype=dtype).view(1, 2, 2)
-        eye = torch.eye(2, device=device, dtype=dtype).view(1, 2, 2)
-        cov_t = t_seq * base_cov + self.pos_whiten_eps * eye
-        return self._build_tempered_whiten(cov_t, self.gamma_white)
-
     def computeLoss(self, pred_vel_norm, target_vel_norm, future_phys, anchor_phys, valid_mask, return_parts=False):
-        """双轨闭环 Loss: vel_huber + (tempered_whiten + euclid_anchor) + fde_anchor"""
+        """双轨 Loss: vel_huber + pos_huber(physical, 1/sqrt(t))."""
         vel_weights = [1.0] * self.output_dim
         if self.output_dim >= 2:
             vel_weights[1] = self.y_loss_weight
@@ -172,38 +132,22 @@ class DiffusionFut(nn.Module):
         loss_vel = F.smooth_l1_loss(pred_vel_norm, target_vel_norm, reduction="none", beta=self.huber_delta)
         loss_vel = loss_vel * vel_axis_weight
 
-        # 2. 积分回物理位置域 (宏观绝对约束)：全局可导梯度反传，抑制累积误差
+        # 2. 积分回物理位置域 (宏观绝对约束)
         std_vel = self.vel_std.view(1, 1, 2).to(pred_vel_norm.device)
         mean_vel = self.vel_mean.view(1, 1, 2).to(pred_vel_norm.device)
 
         pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
         pred_pos_phys = torch.cumsum(pred_vel_phys, dim=1) + anchor_phys[..., :2]
-
-        # 通道 A: 温和白化误差（建模统计相关性与尺度）
         t_len = pred_pos_phys.size(1)
         pos_err = pred_pos_phys - future_phys[..., :2]
-        whiten_mats = self.get_pos_whiten_mats(t_len, pred_pos_phys.device, pred_pos_phys.dtype)
-        pos_err_white = torch.einsum("tij,btj->bti", whiten_mats, pos_err)
-        loss_pos_white_xy = F.smooth_l1_loss(
-            pos_err_white, torch.zeros_like(pos_err_white), reduction="none", beta=self.huber_delta
+
+        # 3. 物理空间位置损失 + 1/sqrt(t) 时间折扣
+        loss_pos_raw = F.smooth_l1_loss(
+            pos_err, torch.zeros_like(pos_err), reduction="none", beta=self.huber_delta
         )
-
-        # 通道 B: 欧氏锚定误差（直接对齐 ADE）
-        pos_err_euclid = pos_err / self.s_iso
-        loss_pos_euclid_xy = F.smooth_l1_loss(
-            pos_err_euclid, torch.zeros_like(pos_err_euclid), reduction="none", beta=self.huber_delta
-        )
-
-        mix_denom = self.lambda_white + self.lambda_euclid
-        if mix_denom > 0.0:
-            mix_white = self.lambda_white / mix_denom
-            mix_euclid = self.lambda_euclid / mix_denom
-        else:
-            mix_white = 0.0
-            mix_euclid = 1.0
-
-        loss_pos_xy = mix_white * loss_pos_white_xy + mix_euclid * loss_pos_euclid_xy
-        loss_pos = loss_pos_xy
+        t_seq = torch.arange(1, t_len + 1, device=pred_pos_phys.device, dtype=pred_pos_phys.dtype).view(1, t_len, 1)
+        time_weights = 1.0 / torch.sqrt(t_seq)
+        loss_pos = loss_pos_raw * time_weights
 
         # 维度安全补齐 (应对 output_dim > 2 的情况)
         if self.output_dim > 2:
@@ -211,56 +155,37 @@ class DiffusionFut(nn.Module):
                               dtype=loss_pos.dtype)
             loss_pos = torch.cat([loss_pos, pad], dim=-1)
 
-        main_loss = loss_vel + self.pos_loss_weight * loss_pos
+        total_loss = loss_vel + self.pos_loss_weight * loss_pos
 
         valid = valid_mask.unsqueeze(-1)
-        numer = (main_loss * valid).sum(dim=(1, 2))
+        numer = (total_loss * valid).sum(dim=(1, 2))
         denom = valid.sum(dim=(1, 2)) + 1e-6
-        main_mean = (numer / denom).mean()
-
-        # 通道 C: FDE 锚定（直接对齐 FDE）
-        valid_counts = valid_mask.sum(dim=1).long()
-        has_valid = valid_counts > 0
-        last_idx = torch.clamp(valid_counts - 1, min=0)
-        last_idx_exp = last_idx.view(-1, 1, 1).expand(-1, 1, 2)
-        pos_err_fde = pos_err.gather(1, last_idx_exp).squeeze(1)
-        loss_fde_xy = F.smooth_l1_loss(
-            pos_err_fde / self.s_iso, torch.zeros_like(pos_err_fde), reduction="none", beta=self.huber_delta
-        )
-        loss_fde_per = loss_fde_xy.mean(dim=-1)
-        has_valid_f = has_valid.float()
-        loss_fde = (loss_fde_per * has_valid_f).sum() / (has_valid_f.sum() + 1e-6)
-
-        total_mean = main_mean + self.lambda_fde * loss_fde
+        total_mean = (numer / denom).mean()
 
         if not return_parts:
             return total_mean
 
         vel_mean = ((loss_vel * valid).sum(dim=(1, 2)) / denom).mean()
         pos_mean = ((loss_pos * valid).sum(dim=(1, 2)) / denom).mean()
-        pos_white_mean = ((loss_pos_white_xy * valid).sum(dim=(1, 2)) / denom).mean()
-        pos_euclid_mean = ((loss_pos_euclid_xy * valid).sum(dim=(1, 2)) / denom).mean()
 
         valid_t = valid_mask
         denom_t = valid_t.sum(dim=1) + 1e-6
-        pos_x_mean = ((loss_pos_xy[..., 0] * valid_t).sum(dim=1) / denom_t).mean()
-        pos_y_mean = ((loss_pos_xy[..., 1] * valid_t).sum(dim=1) / denom_t).mean()
-        fde_x_mean = (loss_fde_xy[:, 0] * has_valid_f).sum() / (has_valid_f.sum() + 1e-6)
-        fde_y_mean = (loss_fde_xy[:, 1] * has_valid_f).sum() / (has_valid_f.sum() + 1e-6)
+        vel_x_mean = ((loss_vel[..., 0] * valid_t).sum(dim=1) / denom_t).mean()
+        if self.output_dim >= 2:
+            vel_y_mean = ((loss_vel[..., 1] * valid_t).sum(dim=1) / denom_t).mean()
+        else:
+            vel_y_mean = vel_x_mean.new_tensor(0.0)
+        pos_x_mean = ((loss_pos[..., 0] * valid_t).sum(dim=1) / denom_t).mean()
+        pos_y_mean = ((loss_pos[..., 1] * valid_t).sum(dim=1) / denom_t).mean()
 
         parts = {
             "loss_total": total_mean.detach(),
             "loss_vel": vel_mean.detach(),
+            "loss_vel_x": vel_x_mean.detach(),
+            "loss_vel_y": vel_y_mean.detach(),
             "loss_pos": pos_mean.detach(),
             "loss_pos_x": pos_x_mean.detach(),
             "loss_pos_y": pos_y_mean.detach(),
-            "loss_pos_white": pos_white_mean.detach(),
-            "loss_pos_euclid": pos_euclid_mean.detach(),
-            "loss_fde": loss_fde.detach(),
-            "loss_fde_x": fde_x_mean.detach(),
-            "loss_fde_y": fde_y_mean.detach(),
-            "mix_white": pred_vel_norm.new_tensor(mix_white).detach(),
-            "mix_euclid": pred_vel_norm.new_tensor(mix_euclid).detach(),
         }
         return total_mean, parts
 
