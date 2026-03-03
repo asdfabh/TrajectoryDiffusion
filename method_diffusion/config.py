@@ -23,6 +23,12 @@ def get_args_parser():
     parser.add_argument("--resume_fut", default="none", type=str)
     parser.add_argument("--resume_hist", default="best", type=str)
 
+    # Joint train strategy
+    parser.add_argument("--joint_freeze_hist", default=1, type=int)
+    parser.add_argument("--joint_hist_loss_weight", default=0.0, type=float)
+    parser.add_argument("--joint_detach_hist_for_fut", default=1, type=int)
+    parser.add_argument("--joint_hist_lr_scale", default=0.2, type=float)
+
     # Hist diffusion model
     parser.add_argument("--input_dim", default=128, type=int)
     parser.add_argument("--hidden_dim", default=128, type=int)

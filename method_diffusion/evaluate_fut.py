@@ -342,6 +342,8 @@ def run_evaluation(args, device):
 
     hist_ckpt_dir = base_ckpt_dir / 'hist'
     fut_ckpt_dir = base_ckpt_dir / 'fut'
+    print(f"[Eval] Checkpoint base dir: {base_ckpt_dir}")
+    print(f"[Eval] Fut checkpoint target: resume_fut={args.resume_fut}, dir={fut_ckpt_dir}")
 
     print("\n[Init] Initializing Fut Model...")
     model_fut = DiffusionFut(args).to(device)
@@ -359,6 +361,7 @@ def run_evaluation(args, device):
 
     if args.eval_mode == 'joint':
         print("\n[Init] Initializing Hist Model for Joint Evaluation...")
+        print(f"[Eval] Hist checkpoint target: resume_hist={args.resume_hist}, dir={hist_ckpt_dir}")
         model_hist = DiffusionPast(args).to(device)
         load_checkpoint(model_hist, args.resume_hist, hist_ckpt_dir, device, model_name="HistModel")
 
