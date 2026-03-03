@@ -84,6 +84,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
     total_pos_loss = 0.0
     total_pos_x_loss = 0.0
     total_pos_y_loss = 0.0
+    total_pos_white_loss = 0.0
+    total_pos_euclid_loss = 0.0
+    total_fde_anchor_loss = 0.0
     num_batches = 0
     pbar = tqdm(
         dataloader,
@@ -113,6 +116,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
         total_pos_loss += float(loss_parts["loss_pos"].item())
         total_pos_x_loss += float(loss_parts["loss_pos_x"].item())
         total_pos_y_loss += float(loss_parts["loss_pos_y"].item())
+        total_pos_white_loss += float(loss_parts["loss_pos_white"].item()) if "loss_pos_white" in loss_parts else 0.0
+        total_pos_euclid_loss += float(loss_parts["loss_pos_euclid"].item()) if "loss_pos_euclid" in loss_parts else 0.0
+        total_fde_anchor_loss += float(loss_parts["loss_fde"].item()) if "loss_fde" in loss_parts else 0.0
         num_batches += 1
         pbar.set_postfix({
             "loss": f"{loss.item():.6f}",
@@ -120,6 +126,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
             "vel": f"{(total_vel_loss / num_batches):.6f}",
             "pos": f"{(total_pos_loss / num_batches):.6f}",
             "pos_xy": f"{(total_pos_x_loss / num_batches):.6f}/{(total_pos_y_loss / num_batches):.6f}",
+            "pos_we": f"{(total_pos_white_loss / num_batches):.6f}/{(total_pos_euclid_loss / num_batches):.6f}",
+            "fde_a": f"{(total_fde_anchor_loss / num_batches):.6f}",
         })
 
     denom = max(num_batches, 1)
@@ -129,6 +137,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
         "loss_pos": total_pos_loss / denom,
         "loss_pos_x": total_pos_x_loss / denom,
         "loss_pos_y": total_pos_y_loss / denom,
+        "loss_pos_white": total_pos_white_loss / denom,
+        "loss_pos_euclid": total_pos_euclid_loss / denom,
+        "loss_fde": total_fde_anchor_loss / denom,
     }
 
 
@@ -252,9 +263,12 @@ def main():
     )
     print(
         f"[FutModel] Train strategy: self_condition_prob={args.self_condition_prob}, "
-        f"loss=vel_huber+whiten_pos_huber, y_weight={args.fut_y_loss_weight}, "
+        f"loss=vel_huber+tempered_whiten_euclid+fde_anchor, y_weight={args.fut_y_loss_weight}, "
         f"huber_delta={args.fut_huber_delta}, pos_weight={args.fut_pos_loss_weight}, "
-        f"pos_whiten_eps={args.fut_pos_whiten_eps}"
+        f"gamma={args.fut_gamma_white}, lambda_white={args.fut_lambda_white}, "
+        f"lambda_euclid={args.fut_lambda_euclid}, lambda_fde={args.fut_lambda_fde}, "
+        f"s_iso={args.fut_s_iso}, eig_floor={args.fut_white_eig_floor}, "
+        f"cov_xy={args.fut_vel_cov_xy}, pos_whiten_eps={args.fut_pos_whiten_eps}"
     )
     print(
         f"[FutModel] TestSet eval sampling: eval_ratio={eval_ratio}, eval_max_batches={args.eval_max_batches}"
@@ -339,7 +353,9 @@ def main():
         print(
             f"Train Detail [{epoch + 1}] Vel: {train_stats['loss_vel']:.6f}, "
             f"Pos: {train_stats['loss_pos']:.6f}, "
-            f"PosXY: {train_stats['loss_pos_x']:.6f}/{train_stats['loss_pos_y']:.6f}"
+            f"PosXY: {train_stats['loss_pos_x']:.6f}/{train_stats['loss_pos_y']:.6f}, "
+            f"PosWE: {train_stats['loss_pos_white']:.6f}/{train_stats['loss_pos_euclid']:.6f}, "
+            f"FDE_A: {train_stats['loss_fde']:.6f}"
         )
         print(
             f"TestSet Eval [{epoch + 1}] Loss: {eval_loss:.6f}, "
@@ -352,6 +368,9 @@ def main():
         writer.add_scalar("Train/Loss_pos", train_stats["loss_pos"], epoch + 1)
         writer.add_scalar("Train/Loss_pos_x", train_stats["loss_pos_x"], epoch + 1)
         writer.add_scalar("Train/Loss_pos_y", train_stats["loss_pos_y"], epoch + 1)
+        writer.add_scalar("Train/Loss_pos_white", train_stats["loss_pos_white"], epoch + 1)
+        writer.add_scalar("Train/Loss_pos_euclid", train_stats["loss_pos_euclid"], epoch + 1)
+        writer.add_scalar("Train/Loss_fde_anchor", train_stats["loss_fde"], epoch + 1)
         writer.add_scalar("Eval/Loss", eval_loss, epoch + 1)
         writer.add_scalar("Eval/ADE_ft", eval_ade, epoch + 1)
         writer.add_scalar("Eval/FDE_ft", eval_fde, epoch + 1)

@@ -81,6 +81,13 @@ def get_args_parser():
     parser.add_argument("--fut_huber_delta", default=1.0, type=float)
     parser.add_argument("--fut_pos_loss_weight", default=0.5, type=float)
     parser.add_argument("--fut_pos_whiten_eps", default=1e-4, type=float)
+    parser.add_argument("--fut_gamma_white", default=0.75, type=float)
+    parser.add_argument("--fut_lambda_white", default=0.35, type=float)
+    parser.add_argument("--fut_lambda_euclid", default=0.65, type=float)
+    parser.add_argument("--fut_lambda_fde", default=0.15, type=float)
+    parser.add_argument("--fut_s_iso", default=1.0, type=float)
+    parser.add_argument("--fut_white_eig_floor", default=1e-4, type=float)
+    parser.add_argument("--fut_vel_cov_xy", default=0.0, type=float)
 
     # Fut visualization
     parser.add_argument("--fut_enable_train_vis", default=0, type=int)

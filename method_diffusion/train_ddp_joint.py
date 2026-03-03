@@ -133,6 +133,9 @@ def train_epoch(
     total_loss_fut_pos = 0.0
     total_loss_fut_pos_x = 0.0
     total_loss_fut_pos_y = 0.0
+    total_loss_fut_pos_white = 0.0
+    total_loss_fut_pos_euclid = 0.0
+    total_loss_fut_fde = 0.0
     num_batches = 0
 
     if rank == 0:
@@ -178,6 +181,9 @@ def train_epoch(
         total_loss_fut_pos += float(fut_parts["loss_pos"].item())
         total_loss_fut_pos_x += float(fut_parts["loss_pos_x"].item())
         total_loss_fut_pos_y += float(fut_parts["loss_pos_y"].item())
+        total_loss_fut_pos_white += float(fut_parts["loss_pos_white"].item()) if "loss_pos_white" in fut_parts else 0.0
+        total_loss_fut_pos_euclid += float(fut_parts["loss_pos_euclid"].item()) if "loss_pos_euclid" in fut_parts else 0.0
+        total_loss_fut_fde += float(fut_parts["loss_fde"].item()) if "loss_fde" in fut_parts else 0.0
         num_batches += 1
 
         if rank == 0:
@@ -189,6 +195,8 @@ def train_epoch(
                 'L_fut_vel': f'{total_loss_fut_vel / num_batches:.6f}',
                 'L_fut_pos': f'{total_loss_fut_pos / num_batches:.6f}',
                 'L_fut_pos_xy': f'{total_loss_fut_pos_x / num_batches:.6f}/{total_loss_fut_pos_y / num_batches:.6f}',
+                'L_fut_pos_we': f'{total_loss_fut_pos_white / num_batches:.6f}/{total_loss_fut_pos_euclid / num_batches:.6f}',
+                'L_fut_fde_a': f'{total_loss_fut_fde / num_batches:.6f}',
             })
 
     stats = torch.tensor([
@@ -200,12 +208,15 @@ def train_epoch(
         total_loss_fut_pos,
         total_loss_fut_pos_x,
         total_loss_fut_pos_y,
+        total_loss_fut_pos_white,
+        total_loss_fut_pos_euclid,
+        total_loss_fut_fde,
         float(num_batches),
     ], device=device)
     if dist.is_initialized():
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
-    global_num_batches = max(float(stats[8].item()), 1.0)
+    global_num_batches = max(float(stats[11].item()), 1.0)
     return {
         "loss_all": float(stats[0].item()) / global_num_batches,
         "loss_hist": float(stats[1].item()) / global_num_batches,
@@ -215,6 +226,9 @@ def train_epoch(
         "loss_fut_pos": float(stats[5].item()) / global_num_batches,
         "loss_fut_pos_x": float(stats[6].item()) / global_num_batches,
         "loss_fut_pos_y": float(stats[7].item()) / global_num_batches,
+        "loss_fut_pos_white": float(stats[8].item()) / global_num_batches,
+        "loss_fut_pos_euclid": float(stats[9].item()) / global_num_batches,
+        "loss_fut_fde": float(stats[10].item()) / global_num_batches,
     }
 
 
@@ -380,7 +394,9 @@ def main():
             print(
                 f"Fut Detail [{epoch + 1}] Vel: {train_stats['loss_fut_vel']:.6f}, "
                 f"Pos: {train_stats['loss_fut_pos']:.6f}, "
-                f"PosXY: {train_stats['loss_fut_pos_x']:.6f}/{train_stats['loss_fut_pos_y']:.6f}"
+                f"PosXY: {train_stats['loss_fut_pos_x']:.6f}/{train_stats['loss_fut_pos_y']:.6f}, "
+                f"PosWE: {train_stats['loss_fut_pos_white']:.6f}/{train_stats['loss_fut_pos_euclid']:.6f}, "
+                f"FDE_A: {train_stats['loss_fut_fde']:.6f}"
             )
 
             state_fut = {
