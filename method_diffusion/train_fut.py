@@ -99,6 +99,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
         loss, loss_parts = model.forwardTrain(
             hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, return_components=True
         )
+        # _, pred_fut, _, _ = model.forwardEval_minADE(
+        #     hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, K=6
+        # )
 
         optimizer.zero_grad()
         loss.backward()

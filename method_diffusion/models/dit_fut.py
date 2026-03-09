@@ -54,13 +54,10 @@ class DiTBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(dim, 6 * dim, bias=True)
         )
-        self.norm3 = nn.LayerNorm(dim)
-        self.cross_attn = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
-        self.norm4 = nn.LayerNorm(dim)
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-        self.mlp2 = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
-
-    def forward(self, x, y, cross, attn_mask=None):
+    def forward(self, x, y, attn_mask=None):
 
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(6, dim=1)
 
@@ -69,9 +66,6 @@ class DiTBlock(nn.Module):
 
         modulated_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = x + gate_mlp.unsqueeze(1) * self.mlp1(modulated_x)
-
-        x = x + self.cross_attn(self.norm3(x), cross, cross)[0]
-        x = x + self.mlp2(self.norm4(x))
 
         return x
 
@@ -117,10 +111,10 @@ class DiT(nn.Module):
     def model_type(self):
         return self._model_type
 
-    def forward(self, x, y, cross):
+    def forward(self, x, y, fut_len, attn_mask=None):
         for block in self.blocks:
-            x = block(x, y, cross)
-        x = self.final_layer(x, y)
+            x = block(x, y, attn_mask=attn_mask)
+        x = self.final_layer(x[:, -fut_len:, :], y)
 
         return x
 
