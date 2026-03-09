@@ -52,8 +52,14 @@ def append_epoch_text_log(
         f.write(line)
 
 
-TRAIN_BAR_FORMAT = "{desc}: {percentage:3.0f}%|{bar:6}| {n_fmt}/{total_fmt} {postfix}"
-EVAL_BAR_FORMAT = "{desc}: {percentage:3.0f}%|{bar:6}| {n_fmt}/{total_fmt} {postfix}"
+TRAIN_BAR_FORMAT = (
+    "{desc}: {percentage:3.0f}%|{bar:6}| {n_fmt}/{total_fmt} "
+    "[{elapsed}<{remaining}, {rate_fmt}] {postfix}"
+)
+EVAL_BAR_FORMAT = (
+    "{desc}: {percentage:3.0f}%|{bar:6}| {n_fmt}/{total_fmt} "
+    "[{elapsed}<{remaining}, {rate_fmt}] {postfix}"
+)
 
 
 # 指数移动平均 (Exponential Moving Average) 包装器类
