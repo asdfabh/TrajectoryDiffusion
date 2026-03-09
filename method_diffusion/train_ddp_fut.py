@@ -1,6 +1,7 @@
 import sys
 import os
 import math
+import copy
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
@@ -53,6 +54,27 @@ def append_epoch_text_log(
 
 TRAIN_BAR_FORMAT = "{desc}: {percentage:3.0f}%|{bar:6}| {n_fmt}/{total_fmt} {postfix}"
 EVAL_BAR_FORMAT = "{desc}: {percentage:3.0f}%|{bar:6}| {n_fmt}/{total_fmt} {postfix}"
+
+
+class EMAModel:
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = copy.deepcopy(model.state_dict())
+        for param in self.shadow.values():
+            if isinstance(param, torch.Tensor):
+                param.requires_grad = False
+
+    def step(self, model):
+        with torch.no_grad():
+            for name, param in model.state_dict().items():
+                if name in self.shadow:
+                    if param.dtype.is_floating_point:
+                        self.shadow[name].mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
+                    else:
+                        self.shadow[name].copy_(param.data)
+
+    def apply_shadow(self, target_model):
+        target_model.load_state_dict(self.shadow)
 
 
 def setup_ddp():
@@ -126,7 +148,7 @@ def prepare_input_data(batch, feature_dim, device='cuda'):
 
     return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
 
-def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
+def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, ema=None):
     model.train()
     total_loss = 0.0
     total_vel_loss = 0.0
@@ -158,6 +180,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        if ema is not None:
+            unwrapped_model = model.module if hasattr(model, "module") else model
+            ema.step(unwrapped_model)
 
         total_loss += loss.item()
         total_vel_loss += float(loss_parts["loss_vel"].item())
@@ -202,6 +227,10 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
 
 @torch.no_grad()
 def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_ratio=0.1, max_batches=0):
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
     fut_model = model.module if hasattr(model, "module") else model
     fut_model.eval()
     total_loss = 0.0
@@ -248,56 +277,55 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
         return 0.0, 0.0, 0.0
     return total_loss / num_batches, total_ade / num_batches, total_fde / num_batches
 
-def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, rank):
+def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, ema=None):
     start_epoch = 0
-    best_ade = float('inf')
+    best_ade = float("inf")
     ckpt_path = None
 
-    if args.resume_fut == 'latest':
-        ckpts = sorted(Path(args.checkpoint_dir).glob('checkpoint_epoch_*.pth'))
+    if args.resume_fut == "latest":
+        ckpts = sorted(Path(args.checkpoint_dir).glob("checkpoint_epoch_*.pth"))
         if ckpts:
             ckpt_path = ckpts[-1]
-    elif args.resume_fut == 'best':
-        best_candidate = Path(args.checkpoint_dir) / 'checkpoint_best.pth'
+    elif args.resume_fut == "best":
+        best_candidate = Path(args.checkpoint_dir) / "checkpoint_best.pth"
         if best_candidate.exists():
             ckpt_path = best_candidate
-    elif args.resume_fut.startswith('epoch'):
+    elif args.resume_fut.startswith("epoch"):
         try:
-            epoch_num = int(args.resume_fut.replace('epoch', ''))
-            ckpt_path = Path(args.checkpoint_dir) / f'checkpoint_epoch_{epoch_num}.pth'
+            epoch_num = int(args.resume_fut.replace("epoch", ""))
+            cand = Path(args.checkpoint_dir) / f"checkpoint_epoch_{epoch_num}.pth"
+            if cand.exists():
+                ckpt_path = cand
         except ValueError:
-            pass
-    elif args.resume_fut not in ('none', ''):
-        ckpt_path = Path(args.resume_fut)
+            ckpt_path = None
+    elif args.resume_fut not in ("none", ""):
+        cand = Path(args.resume_fut)
+        if cand.exists():
+            ckpt_path = cand
 
-    if ckpt_path and ckpt_path.exists():
+    if ckpt_path is not None:
         state = torch.load(ckpt_path, map_location=device)
 
-        model_dict = state['model_state_dict']
-        new_state_dict = {}
-        for k, v in model_dict.items():
-            if k.startswith('module.'):
-                new_state_dict[k[7:]] = v
+        if "raw_model_state_dict" in state:
+            model.load_state_dict(state["raw_model_state_dict"], strict=False)
+        else:
+            model.load_state_dict(state["model_state_dict"], strict=False)
+
+        if ema is not None:
+            if "model_state_dict" in state and "raw_model_state_dict" in state:
+                ema.shadow = copy.deepcopy(state["model_state_dict"])
             else:
-                new_state_dict[k] = v
+                ema.shadow = copy.deepcopy(model.state_dict())
 
-        # 使用 strict=False，因为可能存在新旧模型结构差异
-        model.load_state_dict(new_state_dict, strict=False)
-
-        # 架构变更后，优化器状态可能不兼容，此处静默跳过以避免无意义 warning。
         try:
-            if 'optimizer_state_dict' in state:
-                optimizer.load_state_dict(state['optimizer_state_dict'])
-            if 'scheduler_state_dict' in state:
-                scheduler.load_state_dict(state['scheduler_state_dict'])
+            optimizer.load_state_dict(state["optimizer_state_dict"])
+            scheduler.load_state_dict(state["scheduler_state_dict"])
         except Exception:
             pass
 
-        start_epoch = state.get('epoch', 0)
-        best_ade = state.get('best_ade', state.get('best_loss', best_ade))
-
-        if rank == 0:
-            print(f"Resumed from {ckpt_path} @ epoch {start_epoch}")
+        start_epoch = int(state.get("epoch", 0))
+        best_ade = float(state.get("best_ade", state.get("best_loss", best_ade)))
+        print(f"Resumed from {ckpt_path} @ epoch {start_epoch}")
 
     return start_epoch, best_ade
 
@@ -356,10 +384,16 @@ def main():
     )
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    actual_batch_size = max(1, args.batch_size // world_size)
+    if rank == 0:
+        print(
+            f"[FutModel] BatchSize(per-gpu/global): {actual_batch_size}/{actual_batch_size * world_size} "
+            f"(requested global target={args.batch_size})"
+        )
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,  # 每个 GPU 的 batch size
+        batch_size=actual_batch_size,
         shuffle=False,  # Sampler 负责 shuffle
         num_workers=args.num_workers,
         collate_fn=train_dataset.collate_fn,
@@ -381,7 +415,7 @@ def main():
         )
         test_loader = DataLoader(
             test_dataset,
-            batch_size=args.batch_size,
+            batch_size=actual_batch_size,
             shuffle=False,
             num_workers=args.num_workers,
             collate_fn=test_dataset.collate_fn,
@@ -394,12 +428,6 @@ def main():
         num_params = sum(p.numel() for p in model.parameters())
         print(f"[FutModel] Parameters: {num_params / 1e6:.3f} M")
 
-    # 仅在分布式环境下使用 DDP
-    if dist.is_initialized():
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
-    else:
-        print("Running in non-distributed mode (Single GPU/CPU)")
-
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -409,10 +437,16 @@ def main():
         optimizer,
         T_max=args.num_epochs
     )
-
+    ema = EMAModel(model, decay=0.9999)
     start_epoch, best_ade = load_checkpoint_if_needed(
-        args, model, optimizer, scheduler, device, rank
+        args, model, optimizer, scheduler, device, ema
     )
+
+    # 仅在分布式环境下使用 DDP
+    if dist.is_initialized():
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+    else:
+        print("Running in non-distributed mode (Single GPU/CPU)")
 
     for epoch in range(start_epoch, args.num_epochs):
         # 重要：设置 epoch 以保证每个 epoch 的 shuffle 不同
@@ -423,11 +457,15 @@ def main():
 
         train_stats = train_epoch(
             model, train_loader, optimizer, device, epoch + 1,
-            args.feature_dim, rank
+            args.feature_dim, rank, ema=ema
         )
         avg_loss = float(train_stats["loss"])
 
         if rank == 0:
+            unwrapped_model = model.module if hasattr(model, "module") else model
+            original_state = {k: v.clone() for k, v in unwrapped_model.state_dict().items()}
+            ema.apply_shadow(unwrapped_model)
+
             print(f"Epoch [{epoch + 1}] Average Loss: {avg_loss:.6f}")
             print(
                 f"Train Detail [{epoch + 1}] Vel: {train_stats['loss_vel']:.6f}, "
@@ -444,6 +482,8 @@ def main():
                 f"ADE: {eval_ade:.6f} ft ({eval_ade * 0.3048:.6f} m), "
                 f"FDE: {eval_fde:.6f} ft ({eval_fde * 0.3048:.6f} m)"
             )
+            unwrapped_model.load_state_dict(original_state)
+
             current_lr = optimizer.param_groups[0]["lr"]
             append_epoch_text_log(
                 log_path=epoch_text_log_path,
@@ -462,10 +502,11 @@ def main():
             dist.barrier()
 
         if rank == 0:
-            model_state = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
+            unwrapped_model = model.module if hasattr(model, "module") else model
             state = {
                 'epoch': epoch + 1,
-                'model_state_dict': model_state,
+                'model_state_dict': ema.shadow,
+                'raw_model_state_dict': unwrapped_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': avg_loss,
