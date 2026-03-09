@@ -15,6 +15,46 @@ from method_diffusion.config import get_args_parser
 from method_diffusion.models.fut_model import DiffusionFut
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+UNIFIED_TEXT_LOG_DIR = PROJECT_ROOT / "checkpoints" / "log"
+
+
+def ensure_epoch_text_log(log_path: Path):
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if log_path.exists():
+        return
+    header = (
+        "epoch,train_loss,train_vel,train_vel_x,train_vel_y,train_pos,train_pos_x,train_pos_y,"
+        "eval_ratio,eval_loss,eval_ade_ft,eval_fde_ft,eval_ade_m,eval_fde_m,lr\n"
+    )
+    log_path.write_text(header, encoding="utf-8")
+
+
+def append_epoch_text_log(
+    log_path: Path,
+    epoch: int,
+    train_stats: dict,
+    eval_ratio: float,
+    eval_loss: float,
+    eval_ade: float,
+    eval_fde: float,
+    lr: float,
+):
+    line = (
+        f"{epoch},"
+        f"{train_stats['loss']:.6f},{train_stats['loss_vel']:.6f},{train_stats['loss_vel_x']:.6f},"
+        f"{train_stats['loss_vel_y']:.6f},{train_stats['loss_pos']:.6f},{train_stats['loss_pos_x']:.6f},"
+        f"{train_stats['loss_pos_y']:.6f},{eval_ratio:.2f},{eval_loss:.6f},{eval_ade:.6f},{eval_fde:.6f},"
+        f"{(eval_ade * 0.3048):.6f},{(eval_fde * 0.3048):.6f},{lr:.10f}\n"
+    )
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(line)
+
+
+TRAIN_BAR_FORMAT = "{desc}: {percentage:3.0f}%|{bar:6}| {n_fmt}/{total_fmt} {postfix}"
+EVAL_BAR_FORMAT = "{desc}: {percentage:3.0f}%|{bar:6}| {n_fmt}/{total_fmt} {postfix}"
+
+
 def setup_ddp():
     """初始化分布式训练环境"""
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -99,7 +139,13 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
 
     # 只有 Rank 0 显示进度条
     if rank == 0:
-        pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch}", ncols=220)
+        pbar = tqdm(
+            enumerate(dataloader),
+            total=len(dataloader),
+            desc=f"Ep{epoch} Train",
+            dynamic_ncols=True,
+            bar_format=TRAIN_BAR_FORMAT,
+        )
     else:
         pbar = enumerate(dataloader)
 
@@ -123,14 +169,11 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
         num_batches += 1
 
         if rank == 0:
-            pbar.set_postfix({
-                'loss': f'{loss.item():.6f}',
-                'avg_loss': f'{total_loss / num_batches:.6f}',
-                'vel': f'{total_vel_loss / num_batches:.6f}',
-                'vel_xy': f'{total_vel_x_loss / num_batches:.6f}/{total_vel_y_loss / num_batches:.6f}',
-                'pos': f'{total_pos_loss / num_batches:.6f}',
-                'pos_xy': f'{total_pos_x_loss / num_batches:.6f}/{total_pos_y_loss / num_batches:.6f}',
-            })
+            pbar.set_postfix_str(
+                f"loss/loss_avg={loss.item():.6f}/{(total_loss / num_batches):.6f} | "
+                f"vel/vel_x/vel_y={(total_vel_loss / num_batches):.6f}/{(total_vel_x_loss / num_batches):.6f}/{(total_vel_y_loss / num_batches):.6f} | "
+                f"pos/pos_x/pos_y={(total_pos_loss / num_batches):.6f}/{(total_pos_x_loss / num_batches):.6f}/{(total_pos_y_loss / num_batches):.6f}"
+            )
 
     # Aggregate metrics/count across all ranks for true global averages.
     loss_count = torch.tensor([
@@ -177,7 +220,13 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
     if max_batches > 0:
         target_batches = min(target_batches, int(max_batches))
 
-    pbar = tqdm(enumerate(dataloader), total=target_batches, desc=f"Eval(TestSet) Ep{epoch}", dynamic_ncols=True)
+    pbar = tqdm(
+        enumerate(dataloader),
+        total=target_batches,
+        desc=f"Ep{epoch} Eval",
+        dynamic_ncols=True,
+        bar_format=EVAL_BAR_FORMAT,
+    )
     for batch_idx, batch in pbar:
         if batch_idx >= target_batches:
             break
@@ -189,11 +238,10 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
         total_ade += float(eval_ade.item())
         total_fde += float(eval_fde.item())
         num_batches += 1
-        pbar.set_postfix({
-            'eval_loss': f'{eval_loss.item():.8f}',
-            'avg_ade_ft': f'{(total_ade / num_batches):.4f}',
-            'avg_fde_ft': f'{(total_fde / num_batches):.4f}',
-        })
+        pbar.set_postfix_str(
+            f"loss/loss_avg={eval_loss.item():.6f}/{(total_loss / num_batches):.6f} | "
+            f"ade/fde={(total_ade / num_batches):.6f}/{(total_fde / num_batches):.6f}"
+        )
 
     fut_model.train()
     if num_batches == 0:
@@ -236,13 +284,14 @@ def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, rank):
         # 使用 strict=False，因为可能存在新旧模型结构差异
         model.load_state_dict(new_state_dict, strict=False)
 
-        # 尝试加载 optimizer，如果参数不匹配可能会失败，建议在架构大改后重置 optimizer
+        # 架构变更后，优化器状态可能不兼容，此处静默跳过以避免无意义 warning。
         try:
-            optimizer.load_state_dict(state['optimizer_state_dict'])
-            scheduler.load_state_dict(state['scheduler_state_dict'])
-        except Exception as e:
-            if rank == 0:
-                print(f"Warning: Could not load optimizer state (expected due to architecture change): {e}")
+            if 'optimizer_state_dict' in state:
+                optimizer.load_state_dict(state['optimizer_state_dict'])
+            if 'scheduler_state_dict' in state:
+                scheduler.load_state_dict(state['scheduler_state_dict'])
+        except Exception:
+            pass
 
         start_epoch = state.get('epoch', 0)
         best_ade = state.get('best_ade', state.get('best_loss', best_ade))
@@ -265,15 +314,15 @@ def main():
         builtins.print = print_pass
 
     args = get_args_parser().parse_args()
+    epoch_text_log_path = UNIFIED_TEXT_LOG_DIR / "train_ddp_fut_epoch_metrics.txt"
 
     # Keep the same checkpoint layout as train_fut.py.
     args.checkpoint_dir = str(Path(args.checkpoint_dir) / 'fut')
 
     if rank == 0:
         Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-        fixed_eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
-        if fixed_eval_ratio <= 0.0:
-            fixed_eval_ratio = 0.1
+        ensure_epoch_text_log(epoch_text_log_path)
+        fixed_eval_ratio = 0.03
         print(
             f"[FutModel] Inference sampler: steps={args.num_inference_steps}, "
             f"spacing={args.inference_timestep_spacing}, eta={args.ddim_eta}, x0_clip={args.x0_clip}"
@@ -291,9 +340,7 @@ def main():
             f"eval_max_batches={args.eval_max_batches}"
         )
     else:
-        fixed_eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
-        if fixed_eval_ratio <= 0.0:
-            fixed_eval_ratio = 0.1
+        fixed_eval_ratio = 0.03
 
     # Use args.data_root
     data_root = Path(args.data_root)
@@ -381,7 +428,7 @@ def main():
         avg_loss = float(train_stats["loss"])
 
         if rank == 0:
-            print(f"Epoch [{epoch + 1}] Average Loss: {avg_loss:.4f}")
+            print(f"Epoch [{epoch + 1}] Average Loss: {avg_loss:.6f}")
             print(
                 f"Train Detail [{epoch + 1}] Vel: {train_stats['loss_vel']:.6f}, "
                 f"VelXY: {train_stats['loss_vel_x']:.6f}/{train_stats['loss_vel_y']:.6f}, "
@@ -393,9 +440,20 @@ def main():
                 eval_ratio=fixed_eval_ratio, max_batches=args.eval_max_batches
             )
             print(
-                f"TestSet Eval [{epoch + 1}] Loss: {eval_loss:.4f}, "
-                f"ADE: {eval_ade:.4f} ft ({eval_ade * 0.3048:.4f} m), "
-                f"FDE: {eval_fde:.4f} ft ({eval_fde * 0.3048:.4f} m)"
+                f"TestSet Eval@0.03 [{epoch + 1}] Loss: {eval_loss:.6f}, "
+                f"ADE: {eval_ade:.6f} ft ({eval_ade * 0.3048:.6f} m), "
+                f"FDE: {eval_fde:.6f} ft ({eval_fde * 0.3048:.6f} m)"
+            )
+            current_lr = optimizer.param_groups[0]["lr"]
+            append_epoch_text_log(
+                log_path=epoch_text_log_path,
+                epoch=epoch + 1,
+                train_stats=train_stats,
+                eval_ratio=fixed_eval_ratio,
+                eval_loss=eval_loss,
+                eval_ade=eval_ade,
+                eval_fde=eval_fde,
+                lr=current_lr,
             )
 
         scheduler.step()

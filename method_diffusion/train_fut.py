@@ -16,6 +16,46 @@ from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+UNIFIED_TEXT_LOG_DIR = PROJECT_ROOT / "checkpoints" / "log"
+
+
+def ensure_epoch_text_log(log_path: Path):
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if log_path.exists():
+        return
+    header = (
+        "epoch,train_loss,train_vel,train_vel_x,train_vel_y,train_pos,train_pos_x,train_pos_y,"
+        "eval_ratio,eval_loss,eval_ade_ft,eval_fde_ft,eval_ade_m,eval_fde_m,lr\n"
+    )
+    log_path.write_text(header, encoding="utf-8")
+
+
+def append_epoch_text_log(
+    log_path: Path,
+    epoch: int,
+    train_stats: dict,
+    eval_ratio: float,
+    eval_loss: float,
+    eval_ade: float,
+    eval_fde: float,
+    lr: float,
+):
+    line = (
+        f"{epoch},"
+        f"{train_stats['loss']:.6f},{train_stats['loss_vel']:.6f},{train_stats['loss_vel_x']:.6f},"
+        f"{train_stats['loss_vel_y']:.6f},{train_stats['loss_pos']:.6f},{train_stats['loss_pos_x']:.6f},"
+        f"{train_stats['loss_pos_y']:.6f},{eval_ratio:.2f},{eval_loss:.6f},{eval_ade:.6f},{eval_fde:.6f},"
+        f"{(eval_ade * 0.3048):.6f},{(eval_fde * 0.3048):.6f},{lr:.10f}\n"
+    )
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(line)
+
+
+TRAIN_BAR_FORMAT = "{desc}: {percentage:3.0f}%|{bar:6}| {n_fmt}/{total_fmt} {postfix}"
+EVAL_BAR_FORMAT = "{desc}: {percentage:3.0f}%|{bar:6}| {n_fmt}/{total_fmt} {postfix}"
+
+
 # 指数移动平均 (Exponential Moving Average) 包装器类
 # 用于平滑扩散模型在训练后期的参数高频震荡
 class EMAModel:
@@ -91,7 +131,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
         dataloader,
         total=len(dataloader),
         desc=f"Ep{epoch} Train",
-        ncols=220,
+        dynamic_ncols=True,
+        bar_format=TRAIN_BAR_FORMAT,
     )
 
     for batch in pbar:
@@ -120,14 +161,11 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
         total_pos_x_loss += float(loss_parts["loss_pos_x"].item())
         total_pos_y_loss += float(loss_parts["loss_pos_y"].item())
         num_batches += 1
-        pbar.set_postfix({
-            "loss": f"{loss.item():.6f}",
-            "avg_loss": f"{(total_loss / num_batches):.6f}",
-            "vel": f"{(total_vel_loss / num_batches):.6f}",
-            "vel_xy": f"{(total_vel_x_loss / num_batches):.6f}/{(total_vel_y_loss / num_batches):.6f}",
-            "pos": f"{(total_pos_loss / num_batches):.6f}",
-            "pos_xy": f"{(total_pos_x_loss / num_batches):.6f}/{(total_pos_y_loss / num_batches):.6f}",
-        })
+        pbar.set_postfix_str(
+            f"loss/loss_avg={loss.item():.6f}/{(total_loss / num_batches):.6f} | "
+            f"vel/vel_x/vel_y={(total_vel_loss / num_batches):.6f}/{(total_vel_x_loss / num_batches):.6f}/{(total_vel_y_loss / num_batches):.6f} | "
+            f"pos/pos_x/pos_y={(total_pos_loss / num_batches):.6f}/{(total_pos_x_loss / num_batches):.6f}/{(total_pos_y_loss / num_batches):.6f}"
+        )
 
     denom = max(num_batches, 1)
     return {
@@ -165,7 +203,13 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
     if max_batches > 0:
         target_batches = min(target_batches, int(max_batches))
 
-    pbar = tqdm(enumerate(dataloader), total=target_batches, desc=f"Epoch {epoch} Eval", ncols=120)
+    pbar = tqdm(
+        enumerate(dataloader),
+        total=target_batches,
+        desc=f"Ep{epoch} Eval",
+        dynamic_ncols=True,
+        bar_format=EVAL_BAR_FORMAT,
+    )
     for batch_idx, batch in pbar:
         if batch_idx >= target_batches:
             break
@@ -177,10 +221,10 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
         total_ade += float(eval_ade.item())
         total_fde += float(eval_fde.item())
         num_batches += 1
-        pbar.set_postfix({
-            "avg_ade_ft": f"{(total_ade / num_batches):.4f}",
-            "avg_fde_ft": f"{(total_fde / num_batches):.4f}",
-        })
+        pbar.set_postfix_str(
+            f"loss/loss_avg={eval_loss.item():.6f}/{(total_loss / num_batches):.6f} | "
+            f"ade/fde={(total_ade / num_batches):.6f}/{(total_fde / num_batches):.6f}"
+        )
 
     model.train()
     if num_batches == 0:
@@ -249,11 +293,11 @@ def main():
 
     log_dir = Path(args.checkpoint_dir) / "logs"
     writer = SummaryWriter(log_dir=str(log_dir))
+    epoch_text_log_path = UNIFIED_TEXT_LOG_DIR / "train_fut_epoch_metrics.txt"
+    ensure_epoch_text_log(epoch_text_log_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
-    if eval_ratio <= 0.0:
-        eval_ratio = 0.1
+    eval_ratio = 0.03
 
     print(
         f"[FutModel] Inference sampler: steps={args.num_inference_steps}, "
@@ -351,9 +395,21 @@ def main():
             f"PosXY: {train_stats['loss_pos_x']:.6f}/{train_stats['loss_pos_y']:.6f}"
         )
         print(
-            f"TestSet Eval [{epoch + 1}] Loss: {eval_loss:.6f}, "
-            f"ADE: {eval_ade:.4f} ft ({eval_ade * 0.3048:.4f} m), "
-            f"FDE: {eval_fde:.4f} ft ({eval_fde * 0.3048:.4f} m)"
+            f"TestSet Eval@0.03 [{epoch + 1}] Loss: {eval_loss:.6f}, "
+            f"ADE: {eval_ade:.6f} ft ({eval_ade * 0.3048:.6f} m), "
+            f"FDE: {eval_fde:.6f} ft ({eval_fde * 0.3048:.6f} m)"
+        )
+
+        current_lr = optimizer.param_groups[0]["lr"]
+        append_epoch_text_log(
+            log_path=epoch_text_log_path,
+            epoch=epoch + 1,
+            train_stats=train_stats,
+            eval_ratio=eval_ratio,
+            eval_loss=eval_loss,
+            eval_ade=eval_ade,
+            eval_fde=eval_fde,
+            lr=current_lr,
         )
 
         writer.add_scalar("Train/Loss", avg_loss, epoch + 1)
@@ -368,7 +424,7 @@ def main():
         writer.add_scalar("Eval/FDE_ft", eval_fde, epoch + 1)
         writer.add_scalar("Eval/ADE_m", eval_ade * 0.3048, epoch + 1)
         writer.add_scalar("Eval/FDE_m", eval_fde * 0.3048, epoch + 1)
-        writer.add_scalar("Train/LR", optimizer.param_groups[0]["lr"], epoch + 1)
+        writer.add_scalar("Train/LR", current_lr, epoch + 1)
 
         scheduler.step()
 
