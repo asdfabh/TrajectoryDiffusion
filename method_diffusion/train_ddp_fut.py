@@ -1,18 +1,41 @@
 import sys
 import os
+import math
+import copy
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
 from pathlib import Path
 from tqdm import tqdm
 import builtins
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.config import get_args_parser
-from method_diffusion.utils.mask_util import random_mask, continuous_mask
 from method_diffusion.models.fut_model import DiffusionFut
+
+
+class EMAModel:
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = copy.deepcopy(model.state_dict())
+        for param in self.shadow.values():
+            if isinstance(param, torch.Tensor):
+                param.requires_grad = False
+
+    def step(self, model):
+        with torch.no_grad():
+            for name, param in model.state_dict().items():
+                if name in self.shadow:
+                    if param.dtype.is_floating_point:
+                        self.shadow[name].mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
+                    else:
+                        self.shadow[name].copy_(param.data)
+
+    def apply_shadow(self, target_model):
+        target_model.load_state_dict(self.shadow)
 
 
 def setup_ddp():
@@ -32,7 +55,12 @@ def setup_ddp():
 
 
 def cleanup_ddp():
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
 
 
 def reduce_value(value, average=True):
@@ -49,19 +77,19 @@ def reduce_value(value, average=True):
         return value
 
 
-def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, device='cuda'):
+def prepare_input_data(batch, feature_dim, device='cuda'):
     hist = batch['hist']  # [B, T, 2]
     va = batch['va']  # [B, T, 2]
     lane = batch['lane']  # [B, T, 1]
     cclass = batch['cclass']  # [B, T, 1]
     fut = batch['fut']  # [B, T, 2]
+    op_mask = batch['op_mask']  # [B, T, 2]
     hist_nbrs = batch['nbrs']  # [B, N, T, 2]
     va_nbrs = batch['nbrs_va']  # [B, N, T, 2]
     lane_nbrs = batch['nbrs_lane']  # [B, N, T, 1]
     cclass_nbrs = batch['nbrs_class']
     mask = batch['mask']  # [B, 3, 13, h]
     temporal_mask = batch['temporal_mask']  # [B, 3, 13, dim]
-    target_mode_idx = batch['target_mode_idx'].to(device)
 
 
     # 根据 feature_dim 拼接特征
@@ -78,65 +106,135 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
         hist = hist.to(device)
         hist_nbrs = hist_nbrs.to(device)
     fut = fut.to(device)
+    op_mask = op_mask.to(device)
 
-    # 生成掩码并应用掩码
-    if mask_type == 'random':
-        hist_mask = random_mask(hist, p=mask_prob).to(device)
-    elif mask_type == 'block':
-        hist_mask = continuous_mask(hist, p=mask_prob).to(device)
-    else:
-        hist_mask = random_mask(hist, p=mask_prob).to(device)
-
-    hist_masked_val = hist_mask * hist
-    hist_masked = torch.cat([hist_masked_val, hist_mask], dim=-1) # [B, T, feature_dim+1]
-
-    hist_masked = hist_masked.to(device)
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
 
-    return hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask, target_mode_idx
+    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
 
-def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, mask_type='random', mask_prob=0.4):
+def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, ema):
     model.train()
     total_loss = 0.0
+    total_vel_loss = 0.0
+    total_vel_x_loss = 0.0
+    total_vel_y_loss = 0.0
+    total_pos_loss = 0.0
+    total_pos_x_loss = 0.0
+    total_pos_y_loss = 0.0
     num_batches = 0
 
     # 只有 Rank 0 显示进度条
     if rank == 0:
-        pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch}", dynamic_ncols=True)
+        pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch}", ncols=220)
     else:
         pbar = enumerate(dataloader)
 
     for batch_idx, batch in pbar:
-        hist, hist_masked, hist_mask, fut, hist_nbrs, mask, temporal_mask, target_mode_idx = prepare_input_data(
-            batch, feature_dim, mask_type=mask_type, mask_prob=mask_prob, device=device
-        )
-
-        loss, pred, ade, fde = model(hist, hist_nbrs, mask, temporal_mask, fut, device, target_mode_idx)
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
+        loss, loss_parts = model(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, return_components=True)
 
         # Backward
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        if ema is not None:
+            ema.step(unwrap_model(model))
 
         total_loss += loss.item()
+        total_vel_loss += float(loss_parts["loss_vel"].item())
+        total_vel_x_loss += float(loss_parts["loss_vel_x"].item())
+        total_vel_y_loss += float(loss_parts["loss_vel_y"].item())
+        total_pos_loss += float(loss_parts["loss_pos"].item())
+        total_pos_x_loss += float(loss_parts["loss_pos_x"].item())
+        total_pos_y_loss += float(loss_parts["loss_pos_y"].item())
         num_batches += 1
 
         if rank == 0:
             pbar.set_postfix({
-                'loss': f'{loss.item():.8f}',
-                'avg_loss': f'{total_loss / num_batches:.8f}',
-                'ade': f'{ade.mean().item():.4f}',
-                'fde': f'{fde.mean().item():.4f}',
+                'loss': f'{loss.item():.6f}',
+                'avg_loss': f'{total_loss / num_batches:.6f}',
+                'vel': f'{total_vel_loss / num_batches:.6f}',
+                'vel_xy': f'{total_vel_x_loss / num_batches:.6f}/{total_vel_y_loss / num_batches:.6f}',
+                'pos': f'{total_pos_loss / num_batches:.6f}',
+                'pos_xy': f'{total_pos_x_loss / num_batches:.6f}/{total_pos_y_loss / num_batches:.6f}',
             })
 
-    avg_loss = total_loss / num_batches
-    return avg_loss
+    # Aggregate metrics/count across all ranks for true global averages.
+    loss_count = torch.tensor([
+        total_loss,
+        total_vel_loss,
+        total_vel_x_loss,
+        total_vel_y_loss,
+        total_pos_loss,
+        total_pos_x_loss,
+        total_pos_y_loss,
+        float(num_batches)
+    ], device=device)
+    if dist.is_initialized():
+        dist.all_reduce(loss_count, op=dist.ReduceOp.SUM)
+    global_total_batches = max(float(loss_count[7].item()), 1.0)
+    return {
+        "loss": float(loss_count[0].item()) / global_total_batches,
+        "loss_vel": float(loss_count[1].item()) / global_total_batches,
+        "loss_vel_x": float(loss_count[2].item()) / global_total_batches,
+        "loss_vel_y": float(loss_count[3].item()) / global_total_batches,
+        "loss_pos": float(loss_count[4].item()) / global_total_batches,
+        "loss_pos_x": float(loss_count[5].item()) / global_total_batches,
+        "loss_pos_y": float(loss_count[6].item()) / global_total_batches,
+    }
 
-def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, rank):
+
+@torch.no_grad()
+def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_ratio=0.1, max_batches=0):
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+    fut_model = model.module if hasattr(model, "module") else model
+    fut_model.eval()
+    total_loss = 0.0
+    total_ade = 0.0
+    total_fde = 0.0
+    num_batches = 0
+
+    total_batches = len(dataloader)
+    if total_batches == 0:
+        fut_model.train()
+        return 0.0, 0.0, 0.0
+
+    target_batches = total_batches
+    if eval_ratio > 0:
+        target_batches = max(1, int(math.ceil(total_batches * float(eval_ratio))))
+    if max_batches > 0:
+        target_batches = min(target_batches, int(max_batches))
+
+    pbar = tqdm(enumerate(dataloader), total=target_batches, desc=f"Eval(TestSet) Ep{epoch}", dynamic_ncols=True)
+    for batch_idx, batch in pbar:
+        if batch_idx >= target_batches:
+            break
+
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
+        eval_loss, _, eval_ade, eval_fde = fut_model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+
+        total_loss += float(eval_loss.item())
+        total_ade += float(eval_ade.item())
+        total_fde += float(eval_fde.item())
+        num_batches += 1
+        pbar.set_postfix({
+            'eval_loss': f'{eval_loss.item():.8f}',
+            'avg_ade_ft': f'{(total_ade / num_batches):.4f}',
+            'avg_fde_ft': f'{(total_fde / num_batches):.4f}',
+        })
+
+    fut_model.train()
+    if num_batches == 0:
+        return 0.0, 0.0, 0.0
+    return total_loss / num_batches, total_ade / num_batches, total_fde / num_batches
+
+def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, rank, ema=None):
     start_epoch = 0
-    best_loss = float('inf')
+    best_ade = float('inf')
     ckpt_path = None
 
     if args.resume_fut == 'latest':
@@ -150,27 +248,38 @@ def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, rank):
     elif args.resume_fut.startswith('epoch'):
         try:
             epoch_num = int(args.resume_fut.replace('epoch', ''))
-            ckpt_path = Path(args.checkpoint_dir) / f'checkpoint_epoch_{epoch_num}.pth'
+            cand = Path(args.checkpoint_dir) / f'checkpoint_epoch_{epoch_num}.pth'
+            if cand.exists():
+                ckpt_path = cand
         except ValueError:
-            pass
+            ckpt_path = None
     elif args.resume_fut not in ('none', ''):
-        ckpt_path = Path(args.resume_fut)
+        cand = Path(args.resume_fut)
+        if cand.exists():
+            ckpt_path = cand
 
-    if ckpt_path and ckpt_path.exists():
+    if ckpt_path is not None:
         state = torch.load(ckpt_path, map_location=device)
+        base_model = unwrap_model(model)
 
-        model_dict = state['model_state_dict']
-        new_state_dict = {}
-        for k, v in model_dict.items():
-            if k.startswith('module.'):
-                new_state_dict[k[7:]] = v
+        def strip_module_prefix(state_dict):
+            return {(k[7:] if k.startswith('module.') else k): v for k, v in state_dict.items()}
+
+        # 若 checkpoint 同时包含 raw+ema，优先使用 raw 恢复训练状态。
+        if 'raw_model_state_dict' in state:
+            base_model.load_state_dict(strip_module_prefix(state['raw_model_state_dict']), strict=False)
+        else:
+            base_model.load_state_dict(strip_module_prefix(state['model_state_dict']), strict=False)
+
+        if ema is not None:
+            if 'model_state_dict' in state and 'raw_model_state_dict' in state:
+                ema.shadow = copy.deepcopy(strip_module_prefix(state['model_state_dict']))
             else:
-                new_state_dict[k] = v
+                ema.shadow = copy.deepcopy(base_model.state_dict())
+            for param in ema.shadow.values():
+                if isinstance(param, torch.Tensor):
+                    param.requires_grad = False
 
-        # 使用 strict=False，因为可能存在新旧模型结构差异
-        model.load_state_dict(new_state_dict, strict=False)
-
-        # 尝试加载 optimizer，如果参数不匹配可能会失败，建议在架构大改后重置 optimizer
         try:
             optimizer.load_state_dict(state['optimizer_state_dict'])
             scheduler.load_state_dict(state['scheduler_state_dict'])
@@ -178,13 +287,13 @@ def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, rank):
             if rank == 0:
                 print(f"Warning: Could not load optimizer state (expected due to architecture change): {e}")
 
-        start_epoch = state.get('epoch', 0)
-        best_loss = state.get('best_loss', best_loss)
+        start_epoch = int(state.get('epoch', 0))
+        best_ade = float(state.get('best_ade', state.get('best_loss', best_ade)))
 
         if rank == 0:
             print(f"Resumed from {ckpt_path} @ epoch {start_epoch}")
 
-    return start_epoch, best_loss
+    return start_epoch, best_ade
 
 
 def main():
@@ -200,16 +309,47 @@ def main():
 
     args = get_args_parser().parse_args()
 
+    # Keep the same checkpoint layout as train_fut.py.
+    args.checkpoint_dir = str(Path(args.checkpoint_dir) / 'fut')
+    writer = None
+
     if rank == 0:
         Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        log_dir = Path(args.checkpoint_dir) / 'logs'
+        writer = SummaryWriter(log_dir=str(log_dir))
+        fixed_eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
+        if fixed_eval_ratio <= 0.0:
+            fixed_eval_ratio = 0.1
+        print(
+            f"[FutModel] Inference sampler: steps={args.num_inference_steps}, "
+            f"spacing={args.inference_timestep_spacing}, eta={args.ddim_eta}, x0_clip={args.x0_clip}"
+        )
+        print(
+            f"[FutModel] Train strategy: self_condition_prob={args.self_condition_prob}, "
+            f"loss=vel_huber+integrated_pos_huber(no_time_decay,no_xy_weight), "
+            f"huber_delta={args.fut_huber_delta}"
+        )
+        print(
+            f"[FutModel] TestSet eval sampling: eval_ratio={fixed_eval_ratio}, "
+            f"eval_max_batches={args.eval_max_batches}"
+        )
+    else:
+        fixed_eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
+        if fixed_eval_ratio <= 0.0:
+            fixed_eval_ratio = 0.1
 
     # Use args.data_root
     data_root = Path(args.data_root)
     train_path = str(data_root / 'TrainSet.mat')
-    root_path = Path(__file__).resolve().parent / 'dataset'
-    index_file = root_path / 'best_anchor_indices_ngsim_dtw.npy'
 
-    train_dataset = NgsimDataset(train_path, t_h=30, t_f=50, d_s=2, index_file=index_file)
+    train_dataset = NgsimDataset(
+        train_path,
+        t_h=30,
+        t_f=50,
+        d_s=2,
+        enc_size=args.encoder_input_dim,
+        feature_dim=args.feature_dim
+    )
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
 
@@ -224,7 +364,31 @@ def main():
         drop_last=True
     )
 
+    test_loader = None
+    if rank == 0:
+        test_path = str(data_root / 'TestSet.mat')
+        test_dataset = NgsimDataset(
+            test_path,
+            t_h=30,
+            t_f=50,
+            d_s=2,
+            enc_size=args.encoder_input_dim,
+            feature_dim=args.feature_dim
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=test_dataset.collate_fn,
+            pin_memory=True,
+            drop_last=False
+        )
+
     model = DiffusionFut(args).to(device)
+    if rank == 0:
+        num_params = sum(p.numel() for p in model.parameters())
+        print(f"[FutModel] Parameters: {num_params / 1e6:.3f} M")
 
     # 仅在分布式环境下使用 DDP
     if dist.is_initialized():
@@ -242,8 +406,9 @@ def main():
         T_max=args.num_epochs
     )
 
-    start_epoch, best_loss = load_checkpoint_if_needed(
-        args, model, optimizer, scheduler, device, rank
+    ema = EMAModel(unwrap_model(model), decay=0.9999)
+    start_epoch, best_ade = load_checkpoint_if_needed(
+        args, model, optimizer, scheduler, device, rank, ema
     )
 
     for epoch in range(start_epoch, args.num_epochs):
@@ -253,27 +418,64 @@ def main():
         if rank == 0:
             print(f"\n========== Epoch {epoch + 1}/{args.num_epochs} ==========")
 
-        mask_type = 'random'
-        mask_prob = args.mask_prob
-
-        avg_loss = train_epoch(
+        train_stats = train_epoch(
             model, train_loader, optimizer, device, epoch + 1,
-            args.feature_dim, rank, mask_type=mask_type, mask_prob=mask_prob
+            args.feature_dim, rank, ema
         )
+        avg_loss = float(train_stats["loss"])
 
         if rank == 0:
-            print(f"Epoch [{epoch + 1}] Average Loss: {avg_loss:.4f}")
+            original_state = {k: v.clone() for k, v in unwrap_model(model).state_dict().items()}
+            ema.apply_shadow(unwrap_model(model))
+            print(f"Epoch [{epoch + 1}] Train Loss: {avg_loss:.6f}")
+            print(
+                f"Train Detail [{epoch + 1}] Vel: {train_stats['loss_vel']:.6f}, "
+                f"VelXY: {train_stats['loss_vel_x']:.6f}/{train_stats['loss_vel_y']:.6f}, "
+                f"Pos: {train_stats['loss_pos']:.6f}, "
+                f"PosXY: {train_stats['loss_pos_x']:.6f}/{train_stats['loss_pos_y']:.6f}"
+            )
+            eval_loss, eval_ade, eval_fde = evaluate_on_testset(
+                model, test_loader, device, epoch + 1, args.feature_dim,
+                eval_ratio=fixed_eval_ratio, max_batches=args.eval_max_batches
+            )
+            unwrap_model(model).load_state_dict(original_state)
+            print(
+                f"TestSet Eval [{epoch + 1}] Loss: {eval_loss:.6f}, "
+                f"ADE: {eval_ade:.4f} ft ({eval_ade * 0.3048:.4f} m), "
+                f"FDE: {eval_fde:.4f} ft ({eval_fde * 0.3048:.4f} m)"
+            )
+            writer.add_scalar("Train/Loss", avg_loss, epoch + 1)
+            writer.add_scalar("Train/Loss_vel", train_stats["loss_vel"], epoch + 1)
+            writer.add_scalar("Train/Loss_vel_x", train_stats["loss_vel_x"], epoch + 1)
+            writer.add_scalar("Train/Loss_vel_y", train_stats["loss_vel_y"], epoch + 1)
+            writer.add_scalar("Train/Loss_pos", train_stats["loss_pos"], epoch + 1)
+            writer.add_scalar("Train/Loss_pos_x", train_stats["loss_pos_x"], epoch + 1)
+            writer.add_scalar("Train/Loss_pos_y", train_stats["loss_pos_y"], epoch + 1)
+            writer.add_scalar("Eval/Loss", eval_loss, epoch + 1)
+            writer.add_scalar("Eval/ADE_ft", eval_ade, epoch + 1)
+            writer.add_scalar("Eval/FDE_ft", eval_fde, epoch + 1)
+            writer.add_scalar("Eval/ADE_m", eval_ade * 0.3048, epoch + 1)
+            writer.add_scalar("Eval/FDE_m", eval_fde * 0.3048, epoch + 1)
+            writer.add_scalar("Train/LR", optimizer.param_groups[0]["lr"], epoch + 1)
 
         scheduler.step()
 
+        if dist.is_initialized():
+            dist.barrier()
+
         if rank == 0:
+            base_model = unwrap_model(model)
             state = {
                 'epoch': epoch + 1,
-                'model_state_dict': model.module.state_dict(),
+                'model_state_dict': ema.shadow,
+                'raw_model_state_dict': base_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': avg_loss,
-                'best_loss': best_loss,
+                'eval_loss': eval_loss,
+                'eval_ade': eval_ade,
+                'eval_fde': eval_fde,
+                'best_ade': best_ade,
             }
 
             if (epoch + 1) % args.save_interval == 0:
@@ -281,16 +483,17 @@ def main():
                 torch.save(state, save_path)
                 print(f"Saved checkpoint to {save_path}")
 
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                state['best_loss'] = best_loss
+            if eval_ade < best_ade:
+                best_ade = eval_ade
+                state['best_ade'] = best_ade
                 save_path = Path(args.checkpoint_dir) / "checkpoint_best.pth"
                 torch.save(state, save_path)
-                print(f"Saved best model (Loss: {best_loss:.4f}) to {save_path}")
+                print(f"Saved best model (ADE: {best_ade:.4f} ft) to {save_path}")
 
+    if writer is not None:
+        writer.close()
     cleanup_ddp()
 
 
 if __name__ == '__main__':
     main()
-
