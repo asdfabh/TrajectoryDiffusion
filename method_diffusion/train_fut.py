@@ -311,8 +311,8 @@ def main():
     )
     print(
         f"[FutModel] Train strategy: self_condition_prob={args.self_condition_prob}, "
-        f"loss=vel_huber+pos_huber_physical_time_discount, y_weight={args.fut_y_loss_weight}, "
-        f"huber_delta={args.fut_huber_delta}, pos_weight={args.fut_pos_loss_weight}"
+        f"loss=vel_huber+integrated_pos_huber(no_time_decay,no_xy_weight), "
+        f"huber_delta={args.fut_huber_delta}"
     )
     print(
         f"[FutModel] TestSet eval sampling: eval_ratio={eval_ratio}, eval_max_batches={args.eval_max_batches}"

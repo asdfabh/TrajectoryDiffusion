@@ -28,44 +28,34 @@ class DiffusionFut(nn.Module):
         self.T = int(args.T_f)
 
         self.self_condition_prob = min(max(float(args.self_condition_prob), 0.0), 1.0)
-        self.y_loss_weight = max(1.0, float(args.fut_y_loss_weight))
         self.huber_delta = max(1e-4, float(args.fut_huber_delta))
-        self.pos_loss_weight = max(0.0, float(args.fut_pos_loss_weight))
-        self.fut_global_inject = int(getattr(args, "fut_global_inject", 1)) > 0
         x0_clip_val = float(args.x0_clip)
         self.x0_clip = x0_clip_val if x0_clip_val > 0 else None
 
         self.fut_enable_train_vis = int(args.fut_enable_train_vis) > 0
         self.fut_enable_eval_vis = int(args.fut_enable_eval_vis) > 0
-        self.fut_vis_every_n = max(1, int(args.fut_vis_every_n))
-        self.trainForwardCalls = 0
-        self.evalForwardCalls = 0
         self.meter_per_foot = 0.3048
         self.is_main_process = int(os.environ.get("RANK", "0")) == 0
 
         self.input_embedding = nn.Linear(self.output_dim * 2, self.hidden_dim)
         self.pos_embedding = SequentialPositionalEncoding(self.hidden_dim)
-        self.context_type_emb = nn.Parameter(torch.zeros(1, 1, self.hidden_dim))
-        self.noise_type_emb = nn.Parameter(torch.zeros(1, 1, self.hidden_dim))
-        if self.fut_global_inject:
-            self.global_inject_gate_logit = nn.Parameter(torch.tensor(0.0))
-        else:
-            # Keep an inert tensor for checkpoint compatibility; avoid unused trainable param in DDP.
-            self.register_buffer("global_inject_gate_logit", torch.tensor(0.0), persistent=False)
         self.hist_encoder = HistEncoder(args)
 
         context_dim = int(args.encoder_input_dim) * 2
-        self.enc_embedding = nn.Linear(context_dim, self.hidden_dim)
-        nn.init.xavier_uniform_(self.enc_embedding.weight)
-        nn.init.constant_(self.enc_embedding.bias, 0)
-
-        # 极其优雅的判定：同维度时省去参数与计算量
-        if context_dim == self.hidden_dim:
-            self.context_proj = nn.Identity()
-        else:
-            self.context_proj = nn.Linear(context_dim, self.hidden_dim)
-            nn.init.xavier_uniform_(self.context_proj.weight)
-            nn.init.constant_(self.context_proj.bias, 0)
+        if context_dim != self.hidden_dim:
+            raise ValueError(
+                f"Direct context path requires context_dim == hidden_dim_fut, got {context_dim} vs {self.hidden_dim}"
+            )
+        self.adaln_encoder = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        for m in self.adaln_encoder:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.constant_(m.bias, 0)
 
         self.timestep_embedder = dit.TimestepEmbedder(self.hidden_dim, self.time_embedding_size)
         self.diffusion_scheduler = DDIMScheduler(
@@ -93,170 +83,89 @@ class DiffusionFut(nn.Module):
         self.register_buffer("vel_mean", vel_mean, persistent=False)
         self.register_buffer("vel_std", vel_std, persistent=False)
 
-    @staticmethod
-    def toValidMask(op_mask, seq_len, batch_size, device):
-        if op_mask is None: return torch.ones((batch_size, seq_len), dtype=torch.float32, device=device)
-        if op_mask.dim() == 3:
-            valid = op_mask[..., 0]
-        elif op_mask.dim() == 2:
-            valid = op_mask
-        valid = (valid > 0.5).float()
-        if valid.size(1) > seq_len:
-            valid = valid[:, :seq_len]
-        elif valid.size(1) < seq_len:
-            pad = torch.ones((batch_size, seq_len - valid.size(1)), dtype=valid.dtype, device=valid.device)
-            valid = torch.cat([valid, pad], dim=1)
-        return valid.to(device)
-
-    def buildInferenceScheduler(self):
-        try:
-            scheduler = DDIMScheduler.from_config(self.diffusion_scheduler.config,
-                                                  timestep_spacing=self.inference_timestep_spacing)
-        except Exception:
-            scheduler = DDIMScheduler.from_config(self.diffusion_scheduler.config)
-        scheduler.set_timesteps(self.num_inference_steps)
-        return scheduler
-
-    def encodeGlobalCondition(self, context_tokens, context_valid):
-        valid_mask = context_valid.unsqueeze(-1).to(context_tokens.dtype)
-        pooled_context = (context_tokens * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1e-6)
-        return self.enc_embedding(pooled_context)
-
-    def encodeContext(self, hist, hist_nbrs, mask, temporal_mask):
-        hist_norm = self.norm(hist)
-        hist_nbrs_norm = self.norm(hist_nbrs)
-        context_tokens, _, context_valid = self.hist_encoder(hist_norm, hist_nbrs_norm, mask, temporal_mask)
-        context_aligned = self.context_proj(context_tokens)
-        enc_emb = self.encodeGlobalCondition(context_tokens, context_valid)
-        context_padding_mask = ~context_valid
-        return context_aligned, enc_emb, context_padding_mask
-
-    # 预测函数：此时模型吐出的是 归一化后的相对位移(速度)
-    def predictX0(self, x_t, timesteps, context_aligned, enc_emb, pred_x0_cond, context_padding_mask=None):
-        t_emb = self.timestep_embedder(timesteps)
-        y_cond = t_emb + enc_emb
-        combined_input = torch.cat([x_t, pred_x0_cond], dim=-1)
-        x_t_emb = self.input_embedding(combined_input) + self.pos_embedding(x_t)
-
-        if self.fut_global_inject:
-            inject_gain = torch.sigmoid(self.global_inject_gate_logit).to(dtype=x_t_emb.dtype)
-            x_t_emb = x_t_emb + inject_gain * enc_emb.unsqueeze(1)
-
-        context_aligned = context_aligned + self.context_type_emb
-        x_t_emb = x_t_emb + self.noise_type_emb
-        seq_concat = torch.cat([context_aligned, x_t_emb], dim=1)
-        fut_len = x_t_emb.size(1)
-
-        if context_padding_mask is not None:
-            noise_mask = torch.zeros((x_t_emb.size(0), fut_len), dtype=torch.bool, device=x_t.device)
-            attn_mask = torch.cat([context_padding_mask, noise_mask], dim=1)
-        else:
-            attn_mask = None
-        return self.dit(x=seq_concat, y=y_cond, fut_len=fut_len, attn_mask=attn_mask)
-
-    def computeLoss(self, pred_vel_norm, target_vel_norm, future_phys, anchor_phys, valid_mask, return_parts=False):
-        """双轨 Loss: vel_huber + pos_huber(physical, 1/sqrt(t))."""
-        vel_weights = [1.0] * self.output_dim
-        if self.output_dim >= 2:
-            vel_weights[1] = self.y_loss_weight
-        vel_axis_weight = torch.tensor(
-            vel_weights, device=pred_vel_norm.device, dtype=pred_vel_norm.dtype
-        ).view(1, 1, self.output_dim)
-
-        # 1. 速度域微观约束 (Huber Loss)：在归一化空间算，梯度极度稳定，防高频抖动
+    def computeLoss(self, pred_vel_norm, target_vel_norm, future_phys, anchor_phys, valid_mask, return_components=False):
+        # Loss 核心：仅针对 dim=2，先算速度 Huber，再把速度积分回位置后算位置 Huber，最终两者等权相加。
+        if pred_vel_norm.size(-1) != 2 or target_vel_norm.size(-1) != 2:
+            raise ValueError(f"computeLoss currently expects dim=2, got pred={pred_vel_norm.size(-1)}, target={target_vel_norm.size(-1)}")
         loss_vel = F.smooth_l1_loss(pred_vel_norm, target_vel_norm, reduction="none", beta=self.huber_delta)
-        loss_vel = loss_vel * vel_axis_weight
-
-        # 2. 积分回物理位置域 (宏观绝对约束)
         std_vel = self.vel_std.view(1, 1, 2).to(pred_vel_norm.device)
         mean_vel = self.vel_mean.view(1, 1, 2).to(pred_vel_norm.device)
-
-        pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
+        pred_vel_phys = pred_vel_norm * std_vel + mean_vel
         pred_pos_phys = torch.cumsum(pred_vel_phys, dim=1) + anchor_phys[..., :2]
-        t_len = pred_pos_phys.size(1)
-        pos_err = pred_pos_phys - future_phys[..., :2]
+        loss_pos = F.smooth_l1_loss(pred_pos_phys, future_phys[..., :2], reduction="none", beta=self.huber_delta)
 
-        # 3. 物理空间位置损失 + 1/sqrt(t) 时间折扣
-        loss_pos_raw = F.smooth_l1_loss(
-            pos_err, torch.zeros_like(pos_err), reduction="none", beta=self.huber_delta
-        )
-        t_seq = torch.arange(1, t_len + 1, device=pred_pos_phys.device, dtype=pred_pos_phys.dtype).view(1, t_len, 1)
-        time_weights = 1.0 / torch.sqrt(t_seq)
-        loss_pos = loss_pos_raw * time_weights
+        loss = self.maskedMean3d(loss_vel + loss_pos, valid_mask)
+        if not return_components:
+            return loss
+        loss_metrics = self.summarizeLossForLog(loss_vel, loss_pos, valid_mask)
+        return loss, loss_metrics
 
-        # 维度安全补齐 (应对 output_dim > 2 的情况)
-        if self.output_dim > 2:
-            pad = torch.zeros(loss_pos.shape[:-1] + (self.output_dim - 2,), device=loss_pos.device,
-                              dtype=loss_pos.dtype)
-            loss_pos = torch.cat([loss_pos, pad], dim=-1)
-
-        total_loss = loss_vel + self.pos_loss_weight * loss_pos
-
+    @staticmethod
+    def maskedMean3d(loss_tensor, valid_mask):
         valid = valid_mask.unsqueeze(-1)
-        numer = (total_loss * valid).sum(dim=(1, 2))
+        numer = (loss_tensor * valid).sum(dim=(1, 2))
         denom = valid.sum(dim=(1, 2)) + 1e-6
-        total_mean = (numer / denom).mean()
+        return (numer / denom).mean()
 
-        if not return_parts:
-            return total_mean
+    @staticmethod
+    def maskedMean2d(loss_tensor, valid_mask):
+        denom = valid_mask.sum(dim=1) + 1e-6
+        return ((loss_tensor * valid_mask).sum(dim=1) / denom).mean()
 
-        vel_mean = ((loss_vel * valid).sum(dim=(1, 2)) / denom).mean()
-        pos_mean = ((loss_pos * valid).sum(dim=(1, 2)) / denom).mean()
+    def summarizeLossForLog(self, loss_vel, loss_pos, valid_mask):
+        # 在不参与反传的前提下，分别统计总损失/速度损失/位置损失及 x,y 分量均值。
+        with torch.no_grad():
+            loss_vel_det = loss_vel.detach()
+            loss_pos_det = loss_pos.detach()
+            total_loss = loss_vel_det + loss_pos_det
 
-        valid_t = valid_mask
-        denom_t = valid_t.sum(dim=1) + 1e-6
-        vel_x_mean = ((loss_vel[..., 0] * valid_t).sum(dim=1) / denom_t).mean()
-        if self.output_dim >= 2:
-            vel_y_mean = ((loss_vel[..., 1] * valid_t).sum(dim=1) / denom_t).mean()
-        else:
-            vel_y_mean = vel_x_mean.new_tensor(0.0)
-        pos_x_mean = ((loss_pos[..., 0] * valid_t).sum(dim=1) / denom_t).mean()
-        pos_y_mean = ((loss_pos[..., 1] * valid_t).sum(dim=1) / denom_t).mean()
-
-        parts = {
-            "loss_total": total_mean.detach(),
-            "loss_vel": vel_mean.detach(),
-            "loss_vel_x": vel_x_mean.detach(),
-            "loss_vel_y": vel_y_mean.detach(),
-            "loss_pos": pos_mean.detach(),
-            "loss_pos_x": pos_x_mean.detach(),
-            "loss_pos_y": pos_y_mean.detach(),
-        }
-        return total_mean, parts
+            vel_x_mean = self.maskedMean2d(loss_vel_det[..., 0], valid_mask)
+            vel_y_mean = self.maskedMean2d(loss_vel_det[..., 1], valid_mask)
+            pos_x_mean = self.maskedMean2d(loss_pos_det[..., 0], valid_mask)
+            pos_y_mean = self.maskedMean2d(loss_pos_det[..., 1], valid_mask)
+            return {
+                "loss_total": self.maskedMean3d(total_loss, valid_mask),
+                "loss_vel": self.maskedMean3d(loss_vel_det, valid_mask),
+                "loss_vel_x": vel_x_mean,
+                "loss_vel_y": vel_y_mean,
+                "loss_pos": self.maskedMean3d(loss_pos_det, valid_mask),
+                "loss_pos_x": pos_x_mean,
+                "loss_pos_y": pos_y_mean,
+            }
 
     @staticmethod
     def computeAdeFde(pred, target, valid_mask):
         diff = pred[..., :2] - target[..., :2]
         dist = torch.norm(diff, dim=-1)
         ade = (dist * valid_mask).sum() / (valid_mask.sum() + 1e-6)
-        valid_counts = valid_mask.sum(dim=1).long()
-        has_valid = valid_counts > 0
-        last_idx = torch.clamp(valid_counts - 1, min=0)
-        final_dist = dist.gather(1, last_idx.unsqueeze(1)).squeeze(1)
+        t_idx = torch.arange(dist.size(1), device=dist.device).unsqueeze(0).expand_as(dist)
+        masked_idx = torch.where(valid_mask > 0, t_idx, t_idx.new_full(t_idx.shape, -1))
+        last_idx = masked_idx.max(dim=1).values
+        has_valid = last_idx >= 0
+        final_dist = dist.gather(1, last_idx.clamp(min=0).unsqueeze(1)).squeeze(1)
         fde = (final_dist * has_valid.float()).sum() / (has_valid.float().sum() + 1e-6)
         return ade, fde
 
-    @staticmethod
-    def computeSingleAdeFde(pred, target, valid_mask, batch_idx=0):
-        b_idx = min(max(int(batch_idx), 0), pred.size(0) - 1)
-        diff = pred[b_idx, :, :2] - target[b_idx, :, :2]
-        dist = torch.norm(diff, dim=-1)
-        vm = valid_mask[b_idx]
-        ade = (dist * vm).sum() / (vm.sum() + 1e-6)
-        valid_count = int(vm.sum().item())
-        fde = dist[valid_count - 1] if valid_count > 0 else dist.new_tensor(0.0)
-        return ade, fde
+    def predictX0(self, x_t, timesteps, context_aligned, enc_emb, pred_x0_cond):
+        # DiT 条件去噪核心：输入为当前噪声状态 x_t、时间步 timesteps、历史上下文 context_aligned 与全局条件 enc_emb（来自最后时刻context编码），自条件输入 pred_x0_cond。
+        # 结构上先将 [x_t, pred_x0_cond] 通过 input_embedding + 位置编码得到 token，再送入 DiT 块做时序建模。
+        # 最终输出与 x_t 同形状的 x0 估计（这里语义为归一化速度），供调度器执行一步反演更新。
+        t_emb = self.timestep_embedder(timesteps)
+        combined_input = torch.cat([x_t, pred_x0_cond], dim=-1)
+        input_embedded = self.input_embedding(combined_input) + self.pos_embedding(x_t)
+        return self.dit(x=input_embedded, y=t_emb + enc_emb, cross=context_aligned)
 
-    def rolloutFromXt(self, x_t, context_aligned, enc_emb, infer_scheduler, context_padding_mask=None):
+    def rolloutFromXt(self, x_t, context_aligned, enc_emb, infer_scheduler):
+        # 核心功能：从初始噪声 x_t 出发，按推理调度器逐步去噪，得到最终的归一化速度预测。
+        # 实现逻辑：每个时间步先用 predictX0 估计 x0（可选裁剪），再用 scheduler.step 反演到前一状态。
+        # 作用：统一 train/eval 采样路径，保证单模态与多模态推理都复用同一去噪过程。
         bsz, t_len, _ = x_t.shape
         pred_vel_cond = torch.zeros((bsz, t_len, self.output_dim), device=x_t.device, dtype=x_t.dtype)
         for t in infer_scheduler.timesteps:
             t_scalar = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
             timesteps = torch.full((bsz,), t_scalar, device=x_t.device, dtype=torch.long)
 
-            pred_vel_norm = self.predictX0(
-                x_t, timesteps, context_aligned, enc_emb, pred_vel_cond, context_padding_mask=context_padding_mask
-            )
+            pred_vel_norm = self.predictX0(x_t, timesteps, context_aligned, enc_emb, pred_vel_cond)
             if self.x0_clip is not None:
                 pred_vel_norm = torch.clamp(pred_vel_norm, -self.x0_clip, self.x0_clip)
 
@@ -271,35 +180,30 @@ class DiffusionFut(nn.Module):
                        pred_all=None, pred_best_idx=None):
         if not self.is_main_process: return
         if stage == "train":
-            self.trainForwardCalls += 1
-            if (not self.fut_enable_train_vis) or (self.trainForwardCalls % self.fut_vis_every_n != 0): return
+            if not self.fut_enable_train_vis: return
         else:
-            self.evalForwardCalls += 1
-            if (not self.fut_enable_eval_vis) or (self.evalForwardCalls % self.fut_vis_every_n != 0): return
+            if not self.fut_enable_eval_vis: return
 
         vis_batch_idx = 0
-        vis_ade, vis_fde = self.computeSingleAdeFde(pred, future, valid_mask, batch_idx=vis_batch_idx)
+        b_idx = min(max(int(vis_batch_idx), 0), pred.size(0) - 1)
+        diff = pred[b_idx, :, :2] - future[b_idx, :, :2]
+        dist = torch.norm(diff, dim=-1)
+        vm = valid_mask[b_idx]
+        vis_ade = (dist * vm).sum() / (vm.sum() + 1e-6)
+        valid_idx = torch.nonzero(vm > 0, as_tuple=False).squeeze(-1)
+        vis_fde = dist[valid_idx[-1]] if valid_idx.numel() > 0 else dist.new_tensor(0.0)
         metrics = {"ADE(vis traj)": {"ft": vis_ade.item(), "m": vis_ade.item() * self.meter_per_foot},
                    "FDE(vis traj)": {"ft": vis_fde.item(), "m": vis_fde.item() * self.meter_per_foot}}
         visualize_batch_trajectories(
-            hist=hist,
-            hist_nbrs=hist_nbrs,
-            temporal_mask=temporal_mask,
-            future=future,
-            pred=pred,
-            pred_all=pred_all,
-            pred_best_idx=pred_best_idx,
-            future_mask=valid_mask,
-            batch_idx=vis_batch_idx,
-            save_path=None,
-            metrics=metrics,
-            input_unit="ft",
-            show_plot=True,
+            hist=hist, hist_nbrs=hist_nbrs, temporal_mask=temporal_mask, future=future, pred=pred, pred_all=pred_all,
+            pred_best_idx=pred_best_idx, future_mask=valid_mask, batch_idx=vis_batch_idx, save_path=None, metrics=metrics,
+            input_unit="ft", show_plot=True,
         )
 
     def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, return_components=False):
         bsz, t_len, _ = future.shape
-        valid_mask = self.toValidMask(op_mask, t_len, bsz, device)
+        # op_mask 与 future 对齐，默认 [B, T_f, D]，当前 D=2 且通道等价，直接取第 0 通道作为有效位。
+        valid_mask = (op_mask[..., 0] > 0).float()
 
         anchor_phys = hist[..., -1:, :self.output_dim]
         future_phys = future[..., :self.output_dim]
@@ -320,33 +224,23 @@ class DiffusionFut(nn.Module):
         timesteps = torch.randint(0, self.num_train_timesteps, (bsz,), device=device).long()
         x_t = self.diffusion_scheduler.add_noise(target_vel_norm, noise, timesteps)
 
-        context_aligned, enc_emb, context_padding_mask = self.encodeContext(hist, hist_nbrs, mask, temporal_mask)
+        hist_norm = self.norm(hist)
+        context, _ = self.hist_encoder(hist_norm, self.norm(hist_nbrs), mask, temporal_mask)
+        # AdaLN 分路：最后时刻 context 经过轻量编码再注入；Cross-Attention 分路：全序列 context 直连。
+        enc_emb, context_aligned = self.adaln_encoder(context[:, -1, :]), context
 
         pred_vel_cond = torch.zeros_like(x_t)
         if self.self_condition_prob > 0.0:
             use_sc = (torch.rand(bsz, 1, 1, device=device) < self.self_condition_prob).float()
             if use_sc.any():
                 with torch.no_grad():
-                    prev_pred_vel = self.predictX0(
-                        x_t, timesteps, context_aligned, enc_emb, pred_vel_cond,
-                        context_padding_mask=context_padding_mask
-                    )
+                    prev_pred_vel = self.predictX0(x_t, timesteps, context_aligned, enc_emb, pred_vel_cond)
                 pred_vel_cond = prev_pred_vel.detach() * use_sc
 
         # 网络输出：预测的归一化速度
-        pred_vel_norm_t = self.predictX0(
-            x_t, timesteps, context_aligned, enc_emb, pred_vel_cond, context_padding_mask=context_padding_mask
-        )
+        pred_vel_norm_t = self.predictX0(x_t, timesteps, context_aligned, enc_emb, pred_vel_cond)
 
-        # 传入双轨 Loss 防累积漂移
-        loss, loss_parts = self.computeLoss(
-            pred_vel_norm_t,
-            target_vel_norm,
-            future_phys,
-            anchor_phys,
-            valid_mask,
-            return_parts=True,
-        )
+        loss, loss_metrics = self.computeLoss(pred_vel_norm_t, target_vel_norm, future_phys, anchor_phys, valid_mask, return_components=True)
 
         if self.fut_enable_train_vis:
             pred_vel_phys_t = pred_vel_norm_t[..., :2] * std_vel + mean_vel
@@ -355,37 +249,31 @@ class DiffusionFut(nn.Module):
             # 兼容多维度输出拼接
             pred_phys_abs = future_phys.clone()
             pred_phys_abs[..., :2] = pred_pos_phys
-            self.maybeVisualize(
-                hist=hist,
-                hist_nbrs=hist_nbrs,
-                temporal_mask=temporal_mask,
-                future=future,
-                pred=pred_phys_abs,
-                valid_mask=valid_mask,
-                stage="train",
-            )
+            self.maybeVisualize(hist=hist, hist_nbrs=hist_nbrs, temporal_mask=temporal_mask, future=future, pred=pred_phys_abs, valid_mask=valid_mask, stage="train")
 
         if return_components:
-            return loss, loss_parts
+            return loss, loss_metrics
         return loss
 
     @torch.no_grad()
     def forwardEval(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
         bsz, t_len, _ = future.shape
-        valid_mask = self.toValidMask(op_mask, t_len, bsz, device)
+        valid_mask = (op_mask[..., 0] > 0).float()
 
         anchor_phys = hist[..., -1:, :self.output_dim]
         future_phys = future[..., :self.output_dim]
 
-        context_aligned, enc_emb, context_padding_mask = self.encodeContext(hist, hist_nbrs, mask, temporal_mask)
+        hist_norm = self.norm(hist)
+        context, _ = self.hist_encoder(hist_norm, self.norm(hist_nbrs), mask, temporal_mask)
+        # AdaLN 分路：最后时刻 context 经过轻量编码再注入；Cross-Attention 分路：全序列 context 直连。
+        enc_emb, context_aligned = self.adaln_encoder(context[:, -1, :]), context
 
-        infer_scheduler = self.buildInferenceScheduler()
+        infer_scheduler = DDIMScheduler.from_config(self.diffusion_scheduler.config, timestep_spacing=self.inference_timestep_spacing)
+        infer_scheduler.set_timesteps(self.num_inference_steps)
 
         # 推断起点：一团关于速度的纯噪声
         x_t = torch.randn((bsz, t_len, self.output_dim), device=device)
-        pred_vel_norm = self.rolloutFromXt(
-            x_t, context_aligned, enc_emb, infer_scheduler, context_padding_mask=context_padding_mask
-        )
+        pred_vel_norm = self.rolloutFromXt(x_t, context_aligned, enc_emb, infer_scheduler)
 
         # 积分魔法还原：解归一化 -> 累加 -> 拼接绝对锚点
         std_vel = self.vel_std.view(1, 1, 2).to(device)
@@ -401,25 +289,10 @@ class DiffusionFut(nn.Module):
         shifted_future = torch.cat([anchor_phys, future_phys[:, :-1, :]], dim=1)
         target_vel_norm = future_phys.clone()
         target_vel_norm[..., :2] = ((future_phys[..., :2] - shifted_future[..., :2]) - mean_vel) / std_vel
-        loss = self.computeLoss(
-            pred_vel_norm,
-            torch.clamp(target_vel_norm, -10.0, 10.0),
-            future_phys,
-            anchor_phys,
-            valid_mask,
-            return_parts=False,
-        )
+        loss = self.computeLoss(pred_vel_norm, torch.clamp(target_vel_norm, -10.0, 10.0), future_phys, anchor_phys, valid_mask)
 
         ade, fde = self.computeAdeFde(pred_phys_abs, future, valid_mask)
-        self.maybeVisualize(
-            hist=hist,
-            hist_nbrs=hist_nbrs,
-            temporal_mask=temporal_mask,
-            future=future,
-            pred=pred_phys_abs,
-            valid_mask=valid_mask,
-            stage="eval",
-        )
+        self.maybeVisualize(hist=hist, hist_nbrs=hist_nbrs, temporal_mask=temporal_mask, future=future, pred=pred_phys_abs, valid_mask=valid_mask, stage="eval")
         return loss, pred_phys_abs, ade, fde
 
     @torch.no_grad()
@@ -429,18 +302,21 @@ class DiffusionFut(nn.Module):
         通过在 Batch 维度展开，消除 for 循环，推理速度提升 K 倍。
         """
         bsz, t_len, _ = future.shape
-        valid_mask = self.toValidMask(op_mask, t_len, bsz, device)
+        valid_mask = (op_mask[..., 0] > 0).float()
         anchor_phys = hist[..., -1:, :self.output_dim]
         future_phys = future[..., :self.output_dim]
 
-        context_aligned, enc_emb, context_padding_mask = self.encodeContext(hist, hist_nbrs, mask, temporal_mask)
+        hist_norm = self.norm(hist)
+        context, _ = self.hist_encoder(hist_norm, self.norm(hist_nbrs), mask, temporal_mask)
+        # AdaLN 分路：最后时刻 context 经过轻量编码再注入；Cross-Attention 分路：全序列 context 直连。
+        enc_emb, context_aligned = self.adaln_encoder(context[:, -1, :]), context
 
         # 核心提速优化：在 Batch 维度上并行展开 K 倍
         context_aligned_k = context_aligned.repeat_interleave(K, dim=0)
         enc_emb_k = enc_emb.repeat_interleave(K, dim=0)
-        context_padding_mask_k = context_padding_mask.repeat_interleave(K, dim=0)
 
-        infer_scheduler = self.buildInferenceScheduler()
+        infer_scheduler = DDIMScheduler.from_config(self.diffusion_scheduler.config, timestep_spacing=self.inference_timestep_spacing)
+        infer_scheduler.set_timesteps(self.num_inference_steps)
         std_vel = self.vel_std.view(1, 1, 2).to(device)
         mean_vel = self.vel_mean.view(1, 1, 2).to(device)
 
@@ -452,10 +328,7 @@ class DiffusionFut(nn.Module):
             t_scalar = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
             timesteps_k = torch.full((bsz * K,), t_scalar, device=device, dtype=torch.long)
 
-            pred_vel_norm_k = self.predictX0(
-                x_t_k, timesteps_k, context_aligned_k, enc_emb_k, pred_vel_cond_k,
-                context_padding_mask=context_padding_mask_k
-            )
+            pred_vel_norm_k = self.predictX0(x_t_k, timesteps_k, context_aligned_k, enc_emb_k, pred_vel_cond_k)
             if self.x0_clip is not None:
                 pred_vel_norm_k = torch.clamp(pred_vel_norm_k, -self.x0_clip, self.x0_clip)
 
@@ -499,15 +372,8 @@ class DiffusionFut(nn.Module):
         ade_batch, fde_batch = self.computeAdeFde(best_pred_phys, future, valid_mask)
         dummy_loss = torch.tensor(0.0, device=device)
         self.maybeVisualize(
-            hist=hist,
-            hist_nbrs=hist_nbrs,
-            temporal_mask=temporal_mask,
-            future=future,
-            pred=best_pred_phys,
-            valid_mask=valid_mask,
-            stage="eval",
-            pred_all=all_preds,
-            pred_best_idx=best_k_idx,
+            hist=hist, hist_nbrs=hist_nbrs, temporal_mask=temporal_mask, future=future, pred=best_pred_phys, valid_mask=valid_mask,
+            stage="eval", pred_all=all_preds, pred_best_idx=best_k_idx,
         )
 
         return dummy_loss, best_pred_phys, ade_batch, fde_batch

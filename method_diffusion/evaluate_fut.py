@@ -106,10 +106,11 @@ class MetricsCalculator:
         self.total_dist_sum += torch.sum(dist).item()
         self.total_valid_points += torch.sum(valid_mask).item()
 
-        valid_counts = torch.sum(valid_mask, dim=1).long()
-        has_valid = valid_counts > 0
-        last_idx = torch.clamp(valid_counts - 1, min=0)
-        final_dist = dist.gather(1, last_idx.unsqueeze(1)).squeeze(1)
+        t_idx = torch.arange(T, device=dist.device).unsqueeze(0).expand_as(dist)
+        masked_idx = torch.where(valid_mask > 0, t_idx, t_idx.new_full(t_idx.shape, -1))
+        last_idx = masked_idx.max(dim=1).values
+        has_valid = last_idx >= 0
+        final_dist = dist.gather(1, last_idx.clamp(min=0).unsqueeze(1)).squeeze(1)
 
         self.total_fde_sum += torch.sum(final_dist * has_valid.float()).item()
         self.total_fde_count += torch.sum(has_valid.float()).item()
@@ -276,10 +277,11 @@ def compute_batch_metrics(pred, target, op_mask, meter_per_unit=0.3048):
     ade_ft = (dist * valid_mask).sum() / (valid_mask.sum() + 1e-6)
     rmse_ft = torch.sqrt((dist_sq * valid_mask).sum() / (valid_mask.sum() + 1e-6))
 
-    valid_counts = torch.sum(valid_mask, dim=1).long()
-    has_valid = valid_counts > 0
-    last_idx = torch.clamp(valid_counts - 1, min=0)
-    final_dist = dist.gather(1, last_idx.unsqueeze(1)).squeeze(1)
+    t_idx = torch.arange(dist.size(1), device=dist.device).unsqueeze(0).expand_as(dist)
+    masked_idx = torch.where(valid_mask > 0, t_idx, t_idx.new_full(t_idx.shape, -1))
+    last_idx = masked_idx.max(dim=1).values
+    has_valid = last_idx >= 0
+    final_dist = dist.gather(1, last_idx.clamp(min=0).unsqueeze(1)).squeeze(1)
     fde_ft = (final_dist * has_valid.float()).sum() / (has_valid.float().sum() + 1e-6)
 
     return {

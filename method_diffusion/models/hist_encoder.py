@@ -38,8 +38,6 @@ class HistEncoder(nn.Module):
     def __init__(self, args):
         super(HistEncoder, self).__init__()
         self.args = args
-        self.cross_topk_nbr = max(0, int(getattr(args, "cross_topk_nbr", 12)))
-        self.context_dim = int(args.encoder_input_dim) * 2
 
         # Initalize embeddings and input projection.
         self.input_embedding = nn.Linear(args.feature_dim, args.encoder_input_dim)
@@ -64,42 +62,6 @@ class HistEncoder(nn.Module):
 
         # Initialize activation and regularization functions.
         self.leaky_relu = nn.LeakyReLU(0.1)
-
-        t_hist = int(args.hist_length)
-        d_enc = int(args.encoder_input_dim)
-        self.nbr_token_proj = nn.Sequential(
-            nn.LayerNorm(t_hist * d_enc),
-            nn.Linear(t_hist * d_enc, self.context_dim),
-        )
-
-    def _build_topk_neighbor_tokens(self, soc_enc, temporal_grid, social_occ):
-        batch_size, n_grid = soc_enc.size(1), soc_enc.size(2)
-        topk = min(self.cross_topk_nbr, n_grid)
-
-        if topk <= 0:
-            empty_tokens = soc_enc.new_zeros((batch_size, 0, self.context_dim))
-            empty_valid = torch.zeros((batch_size, 0), dtype=torch.bool, device=soc_enc.device)
-            return empty_tokens, empty_valid
-
-        nbr_feat = soc_enc.permute(1, 2, 0, 3).contiguous()  # [B, N_grid, T, D_enc]
-        _, _, t_hist, d_enc = nbr_feat.shape
-        nbr_feat = nbr_feat.view(batch_size, n_grid, t_hist * d_enc)  # [B, N_grid, T*D_enc]
-
-        nbr_xy_last = temporal_grid[-1, :, :, :2]
-        # We keep distance in normalized space on purpose.
-        # With anisotropic pos std (x/y), this behaves like an elliptical safety field for highway scenarios.
-        nbr_dist = torch.norm(nbr_xy_last, dim=-1)
-        nbr_dist = nbr_dist.masked_fill(~social_occ, float("inf"))
-        topk_idx = torch.topk(nbr_dist, k=topk, dim=1, largest=False).indices
-
-        gather_feat_idx = topk_idx.unsqueeze(-1).expand(-1, -1, nbr_feat.size(-1))
-        nbr_feat_topk = torch.gather(nbr_feat, dim=1, index=gather_feat_idx)
-        nbr_valid = torch.gather(social_occ, dim=1, index=topk_idx)
-
-        nbr_tokens = self.nbr_token_proj(nbr_feat_topk)
-        nbr_tokens = nbr_tokens * nbr_valid.unsqueeze(-1).to(nbr_tokens.dtype)
-        return nbr_tokens, nbr_valid
-
 
     # 输入：src, nbrs [B, T, D] and [N_total, T, D]
     def forward(self, src, nbrs, mask, temporal_mask):
@@ -131,7 +93,8 @@ class HistEncoder(nn.Module):
         temporal_attn_weights /= math.sqrt(head_dim)
         temporal_attn_weights = temporal_attn_weights.masked_fill(~temporal_attn_mask, -1e9)
         temporal_attn_weights = F.softmax(temporal_attn_weights, dim=-1)
-        temporal_attn_weights = temporal_attn_weights.masked_fill(~temporal_attn_mask, 0.0)
+        temporal_attn_weights = temporal_attn_weights * temporal_attn_mask.float()
+        temporal_attn_weights = temporal_attn_weights / (temporal_attn_weights.sum(dim=-1, keepdim=True) + 1e-6)
         temporal_value = torch.matmul(temporal_attn_weights, temporal_value) # [B, T*H, 1, D_attn]
         temporal_value = torch.cat(torch.split(temporal_value, int(T), dim=1), dim=-1).squeeze(2) # [B, T, H * D_attn]
         temporal_value = self.temporal_residual(self.input_embedding(src_t).permute(1, 0, 2), temporal_value) # [B, T, H * D_attn]
@@ -159,19 +122,15 @@ class HistEncoder(nn.Module):
         attn_weights /= math.sqrt(head_dim_social)
         attn_weights = attn_weights.masked_fill(~social_attn_mask, -1e9)
         attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = attn_weights.masked_fill(~social_attn_mask, 0.0)
+        attn_weights = attn_weights * social_attn_mask.float()
+        attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-6)
         value = torch.matmul(attn_weights, value) # [B, T*H, 1, D_attn]
         value = torch.cat(torch.split(value, int(T), dim=1), dim=-1).squeeze(2) # [B, T, H * D_attn]
 
         temporal_spatial_agg = self.leaky_relu(temporal_value + value) # [B, T, D_enc]
-        enc = torch.cat((temporal_spatial_agg, hist_enc), dim=-1) # [B, T, 2*D_enc]
+        enc = torch.cat((temporal_spatial_agg, hist_enc), dim=-1) # [B, T, D_enc]
 
-        nbr_tokens, nbr_valid = self._build_topk_neighbor_tokens(soc_enc, temporal_grid, social_occ)
-        enc_valid = torch.ones((B, T), dtype=torch.bool, device=enc.device)
-        context_tokens = torch.cat([enc, nbr_tokens], dim=1)
-        context_valid = torch.cat([enc_valid, nbr_valid], dim=1)
-
-        return context_tokens, enc, context_valid
+        return enc, hist_enc # [B, T, D_enc]
 
 
 # tame代码 维度转化说明

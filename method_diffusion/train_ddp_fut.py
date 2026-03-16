@@ -8,58 +8,13 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
 from pathlib import Path
 from tqdm import tqdm
 import builtins
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.config import get_args_parser
 from method_diffusion.models.fut_model import DiffusionFut
-
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-UNIFIED_TEXT_LOG_DIR = PROJECT_ROOT / "checkpoints" / "log"
-
-
-def ensure_epoch_text_log(log_path: Path):
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    if log_path.exists():
-        return
-    header = (
-        "epoch,train_loss,train_vel,train_vel_x,train_vel_y,train_pos,train_pos_x,train_pos_y,"
-        "eval_ratio,eval_loss,eval_ade_ft,eval_fde_ft,eval_ade_m,eval_fde_m,lr\n"
-    )
-    log_path.write_text(header, encoding="utf-8")
-
-
-def append_epoch_text_log(
-    log_path: Path,
-    epoch: int,
-    train_stats: dict,
-    eval_ratio: float,
-    eval_loss: float,
-    eval_ade: float,
-    eval_fde: float,
-    lr: float,
-):
-    line = (
-        f"{epoch},"
-        f"{train_stats['loss']:.6f},{train_stats['loss_vel']:.6f},{train_stats['loss_vel_x']:.6f},"
-        f"{train_stats['loss_vel_y']:.6f},{train_stats['loss_pos']:.6f},{train_stats['loss_pos_x']:.6f},"
-        f"{train_stats['loss_pos_y']:.6f},{eval_ratio:.2f},{eval_loss:.6f},{eval_ade:.6f},{eval_fde:.6f},"
-        f"{(eval_ade * 0.3048):.6f},{(eval_fde * 0.3048):.6f},{lr:.10f}\n"
-    )
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(line)
-
-
-TRAIN_BAR_FORMAT = (
-    "{desc}: {percentage:3.0f}%|{bar:6}| {n_fmt}/{total_fmt} "
-    "[{elapsed}<{remaining}, {rate_fmt}] {postfix}"
-)
-EVAL_BAR_FORMAT = (
-    "{desc}: {percentage:3.0f}%|{bar:6}| {n_fmt}/{total_fmt} "
-    "[{elapsed}<{remaining}, {rate_fmt}] {postfix}"
-)
 
 
 class EMAModel:
@@ -102,6 +57,10 @@ def setup_ddp():
 def cleanup_ddp():
     if dist.is_initialized():
         dist.destroy_process_group()
+
+
+def unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
 
 
 def reduce_value(value, average=True):
@@ -154,7 +113,7 @@ def prepare_input_data(batch, feature_dim, device='cuda'):
 
     return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
 
-def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, ema=None):
+def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, ema):
     model.train()
     total_loss = 0.0
     total_vel_loss = 0.0
@@ -167,13 +126,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, 
 
     # 只有 Rank 0 显示进度条
     if rank == 0:
-        pbar = tqdm(
-            enumerate(dataloader),
-            total=len(dataloader),
-            desc=f"Ep{epoch} Train",
-            dynamic_ncols=True,
-            bar_format=TRAIN_BAR_FORMAT,
-        )
+        pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch}", ncols=220)
     else:
         pbar = enumerate(dataloader)
 
@@ -187,8 +140,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         if ema is not None:
-            unwrapped_model = model.module if hasattr(model, "module") else model
-            ema.step(unwrapped_model)
+            ema.step(unwrap_model(model))
 
         total_loss += loss.item()
         total_vel_loss += float(loss_parts["loss_vel"].item())
@@ -200,11 +152,14 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, 
         num_batches += 1
 
         if rank == 0:
-            pbar.set_postfix_str(
-                f"loss/loss_avg={loss.item():.6f}/{(total_loss / num_batches):.6f} | "
-                f"vel/vel_x/vel_y={(total_vel_loss / num_batches):.6f}/{(total_vel_x_loss / num_batches):.6f}/{(total_vel_y_loss / num_batches):.6f} | "
-                f"pos/pos_x/pos_y={(total_pos_loss / num_batches):.6f}/{(total_pos_x_loss / num_batches):.6f}/{(total_pos_y_loss / num_batches):.6f}"
-            )
+            pbar.set_postfix({
+                'loss': f'{loss.item():.6f}',
+                'avg_loss': f'{total_loss / num_batches:.6f}',
+                'vel': f'{total_vel_loss / num_batches:.6f}',
+                'vel_xy': f'{total_vel_x_loss / num_batches:.6f}/{total_vel_y_loss / num_batches:.6f}',
+                'pos': f'{total_pos_loss / num_batches:.6f}',
+                'pos_xy': f'{total_pos_x_loss / num_batches:.6f}/{total_pos_y_loss / num_batches:.6f}',
+            })
 
     # Aggregate metrics/count across all ranks for true global averages.
     loss_count = torch.tensor([
@@ -236,7 +191,6 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
-
     fut_model = model.module if hasattr(model, "module") else model
     fut_model.eval()
     total_loss = 0.0
@@ -255,13 +209,7 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
     if max_batches > 0:
         target_batches = min(target_batches, int(max_batches))
 
-    pbar = tqdm(
-        enumerate(dataloader),
-        total=target_batches,
-        desc=f"Ep{epoch} Eval",
-        dynamic_ncols=True,
-        bar_format=EVAL_BAR_FORMAT,
-    )
+    pbar = tqdm(enumerate(dataloader), total=target_batches, desc=f"Eval(TestSet) Ep{epoch}", dynamic_ncols=True)
     for batch_idx, batch in pbar:
         if batch_idx >= target_batches:
             break
@@ -273,65 +221,77 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
         total_ade += float(eval_ade.item())
         total_fde += float(eval_fde.item())
         num_batches += 1
-        pbar.set_postfix_str(
-            f"loss/loss_avg={eval_loss.item():.6f}/{(total_loss / num_batches):.6f} | "
-            f"ade/fde={(total_ade / num_batches):.6f}/{(total_fde / num_batches):.6f}"
-        )
+        pbar.set_postfix({
+            'eval_loss': f'{eval_loss.item():.8f}',
+            'avg_ade_ft': f'{(total_ade / num_batches):.4f}',
+            'avg_fde_ft': f'{(total_fde / num_batches):.4f}',
+        })
 
     fut_model.train()
     if num_batches == 0:
         return 0.0, 0.0, 0.0
     return total_loss / num_batches, total_ade / num_batches, total_fde / num_batches
 
-def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, ema=None):
+def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, rank, ema=None):
     start_epoch = 0
-    best_ade = float("inf")
+    best_ade = float('inf')
     ckpt_path = None
 
-    if args.resume_fut == "latest":
-        ckpts = sorted(Path(args.checkpoint_dir).glob("checkpoint_epoch_*.pth"))
+    if args.resume_fut == 'latest':
+        ckpts = sorted(Path(args.checkpoint_dir).glob('checkpoint_epoch_*.pth'))
         if ckpts:
             ckpt_path = ckpts[-1]
-    elif args.resume_fut == "best":
-        best_candidate = Path(args.checkpoint_dir) / "checkpoint_best.pth"
+    elif args.resume_fut == 'best':
+        best_candidate = Path(args.checkpoint_dir) / 'checkpoint_best.pth'
         if best_candidate.exists():
             ckpt_path = best_candidate
-    elif args.resume_fut.startswith("epoch"):
+    elif args.resume_fut.startswith('epoch'):
         try:
-            epoch_num = int(args.resume_fut.replace("epoch", ""))
-            cand = Path(args.checkpoint_dir) / f"checkpoint_epoch_{epoch_num}.pth"
+            epoch_num = int(args.resume_fut.replace('epoch', ''))
+            cand = Path(args.checkpoint_dir) / f'checkpoint_epoch_{epoch_num}.pth'
             if cand.exists():
                 ckpt_path = cand
         except ValueError:
             ckpt_path = None
-    elif args.resume_fut not in ("none", ""):
+    elif args.resume_fut not in ('none', ''):
         cand = Path(args.resume_fut)
         if cand.exists():
             ckpt_path = cand
 
     if ckpt_path is not None:
         state = torch.load(ckpt_path, map_location=device)
+        base_model = unwrap_model(model)
 
-        if "raw_model_state_dict" in state:
-            model.load_state_dict(state["raw_model_state_dict"], strict=False)
+        def strip_module_prefix(state_dict):
+            return {(k[7:] if k.startswith('module.') else k): v for k, v in state_dict.items()}
+
+        # 若 checkpoint 同时包含 raw+ema，优先使用 raw 恢复训练状态。
+        if 'raw_model_state_dict' in state:
+            base_model.load_state_dict(strip_module_prefix(state['raw_model_state_dict']), strict=False)
         else:
-            model.load_state_dict(state["model_state_dict"], strict=False)
+            base_model.load_state_dict(strip_module_prefix(state['model_state_dict']), strict=False)
 
         if ema is not None:
-            if "model_state_dict" in state and "raw_model_state_dict" in state:
-                ema.shadow = copy.deepcopy(state["model_state_dict"])
+            if 'model_state_dict' in state and 'raw_model_state_dict' in state:
+                ema.shadow = copy.deepcopy(strip_module_prefix(state['model_state_dict']))
             else:
-                ema.shadow = copy.deepcopy(model.state_dict())
+                ema.shadow = copy.deepcopy(base_model.state_dict())
+            for param in ema.shadow.values():
+                if isinstance(param, torch.Tensor):
+                    param.requires_grad = False
 
         try:
-            optimizer.load_state_dict(state["optimizer_state_dict"])
-            scheduler.load_state_dict(state["scheduler_state_dict"])
-        except Exception:
-            pass
+            optimizer.load_state_dict(state['optimizer_state_dict'])
+            scheduler.load_state_dict(state['scheduler_state_dict'])
+        except Exception as e:
+            if rank == 0:
+                print(f"Warning: Could not load optimizer state (expected due to architecture change): {e}")
 
-        start_epoch = int(state.get("epoch", 0))
-        best_ade = float(state.get("best_ade", state.get("best_loss", best_ade)))
-        print(f"Resumed from {ckpt_path} @ epoch {start_epoch}")
+        start_epoch = int(state.get('epoch', 0))
+        best_ade = float(state.get('best_ade', state.get('best_loss', best_ade)))
+
+        if rank == 0:
+            print(f"Resumed from {ckpt_path} @ epoch {start_epoch}")
 
     return start_epoch, best_ade
 
@@ -348,33 +308,35 @@ def main():
         builtins.print = print_pass
 
     args = get_args_parser().parse_args()
-    epoch_text_log_path = UNIFIED_TEXT_LOG_DIR / "train_ddp_fut_epoch_metrics.txt"
 
     # Keep the same checkpoint layout as train_fut.py.
     args.checkpoint_dir = str(Path(args.checkpoint_dir) / 'fut')
+    writer = None
 
     if rank == 0:
         Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-        ensure_epoch_text_log(epoch_text_log_path)
-        fixed_eval_ratio = 0.03
+        log_dir = Path(args.checkpoint_dir) / 'logs'
+        writer = SummaryWriter(log_dir=str(log_dir))
+        fixed_eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
+        if fixed_eval_ratio <= 0.0:
+            fixed_eval_ratio = 0.1
         print(
             f"[FutModel] Inference sampler: steps={args.num_inference_steps}, "
             f"spacing={args.inference_timestep_spacing}, eta={args.ddim_eta}, x0_clip={args.x0_clip}"
         )
         print(
             f"[FutModel] Train strategy: self_condition_prob={args.self_condition_prob}, "
-            f"loss=vel_huber+pos_huber_physical_time_discount, y_weight={args.fut_y_loss_weight}, "
-            f"huber_delta={args.fut_huber_delta}, pos_weight={args.fut_pos_loss_weight}"
-        )
-        print(
-            f"[FutModel] Architecture: hidden_dim_fut={args.hidden_dim_fut}, depth_fut={args.depth_fut}"
+            f"loss=vel_huber+integrated_pos_huber(no_time_decay,no_xy_weight), "
+            f"huber_delta={args.fut_huber_delta}"
         )
         print(
             f"[FutModel] TestSet eval sampling: eval_ratio={fixed_eval_ratio}, "
             f"eval_max_batches={args.eval_max_batches}"
         )
     else:
-        fixed_eval_ratio = 0.03
+        fixed_eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
+        if fixed_eval_ratio <= 0.0:
+            fixed_eval_ratio = 0.1
 
     # Use args.data_root
     data_root = Path(args.data_root)
@@ -390,16 +352,10 @@ def main():
     )
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    actual_batch_size = max(1, args.batch_size // world_size)
-    if rank == 0:
-        print(
-            f"[FutModel] BatchSize(per-gpu/global): {actual_batch_size}/{actual_batch_size * world_size} "
-            f"(requested global target={args.batch_size})"
-        )
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=actual_batch_size,
+        batch_size=args.batch_size,  # 每个 GPU 的 batch size
         shuffle=False,  # Sampler 负责 shuffle
         num_workers=args.num_workers,
         collate_fn=train_dataset.collate_fn,
@@ -421,7 +377,7 @@ def main():
         )
         test_loader = DataLoader(
             test_dataset,
-            batch_size=actual_batch_size,
+            batch_size=args.batch_size,
             shuffle=False,
             num_workers=args.num_workers,
             collate_fn=test_dataset.collate_fn,
@@ -434,6 +390,12 @@ def main():
         num_params = sum(p.numel() for p in model.parameters())
         print(f"[FutModel] Parameters: {num_params / 1e6:.3f} M")
 
+    # 仅在分布式环境下使用 DDP
+    if dist.is_initialized():
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+    else:
+        print("Running in non-distributed mode (Single GPU/CPU)")
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -443,16 +405,11 @@ def main():
         optimizer,
         T_max=args.num_epochs
     )
-    ema = EMAModel(model, decay=0.9999)
-    start_epoch, best_ade = load_checkpoint_if_needed(
-        args, model, optimizer, scheduler, device, ema
-    )
 
-    # 仅在分布式环境下使用 DDP
-    if dist.is_initialized():
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
-    else:
-        print("Running in non-distributed mode (Single GPU/CPU)")
+    ema = EMAModel(unwrap_model(model), decay=0.9999)
+    start_epoch, best_ade = load_checkpoint_if_needed(
+        args, model, optimizer, scheduler, device, rank, ema
+    )
 
     for epoch in range(start_epoch, args.num_epochs):
         # 重要：设置 epoch 以保证每个 epoch 的 shuffle 不同
@@ -463,16 +420,14 @@ def main():
 
         train_stats = train_epoch(
             model, train_loader, optimizer, device, epoch + 1,
-            args.feature_dim, rank, ema=ema
+            args.feature_dim, rank, ema
         )
         avg_loss = float(train_stats["loss"])
 
         if rank == 0:
-            unwrapped_model = model.module if hasattr(model, "module") else model
-            original_state = {k: v.clone() for k, v in unwrapped_model.state_dict().items()}
-            ema.apply_shadow(unwrapped_model)
-
-            print(f"Epoch [{epoch + 1}] Average Loss: {avg_loss:.6f}")
+            original_state = {k: v.clone() for k, v in unwrap_model(model).state_dict().items()}
+            ema.apply_shadow(unwrap_model(model))
+            print(f"Epoch [{epoch + 1}] Train Loss: {avg_loss:.6f}")
             print(
                 f"Train Detail [{epoch + 1}] Vel: {train_stats['loss_vel']:.6f}, "
                 f"VelXY: {train_stats['loss_vel_x']:.6f}/{train_stats['loss_vel_y']:.6f}, "
@@ -483,24 +438,25 @@ def main():
                 model, test_loader, device, epoch + 1, args.feature_dim,
                 eval_ratio=fixed_eval_ratio, max_batches=args.eval_max_batches
             )
+            unwrap_model(model).load_state_dict(original_state)
             print(
-                f"TestSet Eval@0.03 [{epoch + 1}] Loss: {eval_loss:.6f}, "
-                f"ADE: {eval_ade:.6f} ft ({eval_ade * 0.3048:.6f} m), "
-                f"FDE: {eval_fde:.6f} ft ({eval_fde * 0.3048:.6f} m)"
+                f"TestSet Eval [{epoch + 1}] Loss: {eval_loss:.6f}, "
+                f"ADE: {eval_ade:.4f} ft ({eval_ade * 0.3048:.4f} m), "
+                f"FDE: {eval_fde:.4f} ft ({eval_fde * 0.3048:.4f} m)"
             )
-            unwrapped_model.load_state_dict(original_state)
-
-            current_lr = optimizer.param_groups[0]["lr"]
-            append_epoch_text_log(
-                log_path=epoch_text_log_path,
-                epoch=epoch + 1,
-                train_stats=train_stats,
-                eval_ratio=fixed_eval_ratio,
-                eval_loss=eval_loss,
-                eval_ade=eval_ade,
-                eval_fde=eval_fde,
-                lr=current_lr,
-            )
+            writer.add_scalar("Train/Loss", avg_loss, epoch + 1)
+            writer.add_scalar("Train/Loss_vel", train_stats["loss_vel"], epoch + 1)
+            writer.add_scalar("Train/Loss_vel_x", train_stats["loss_vel_x"], epoch + 1)
+            writer.add_scalar("Train/Loss_vel_y", train_stats["loss_vel_y"], epoch + 1)
+            writer.add_scalar("Train/Loss_pos", train_stats["loss_pos"], epoch + 1)
+            writer.add_scalar("Train/Loss_pos_x", train_stats["loss_pos_x"], epoch + 1)
+            writer.add_scalar("Train/Loss_pos_y", train_stats["loss_pos_y"], epoch + 1)
+            writer.add_scalar("Eval/Loss", eval_loss, epoch + 1)
+            writer.add_scalar("Eval/ADE_ft", eval_ade, epoch + 1)
+            writer.add_scalar("Eval/FDE_ft", eval_fde, epoch + 1)
+            writer.add_scalar("Eval/ADE_m", eval_ade * 0.3048, epoch + 1)
+            writer.add_scalar("Eval/FDE_m", eval_fde * 0.3048, epoch + 1)
+            writer.add_scalar("Train/LR", optimizer.param_groups[0]["lr"], epoch + 1)
 
         scheduler.step()
 
@@ -508,11 +464,11 @@ def main():
             dist.barrier()
 
         if rank == 0:
-            unwrapped_model = model.module if hasattr(model, "module") else model
+            base_model = unwrap_model(model)
             state = {
                 'epoch': epoch + 1,
                 'model_state_dict': ema.shadow,
-                'raw_model_state_dict': unwrapped_model.state_dict(),
+                'raw_model_state_dict': base_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': avg_loss,
@@ -534,6 +490,8 @@ def main():
                 torch.save(state, save_path)
                 print(f"Saved best model (ADE: {best_ade:.4f} ft) to {save_path}")
 
+    if writer is not None:
+        writer.close()
     cleanup_ddp()
 
 

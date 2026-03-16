@@ -14,7 +14,7 @@ def get_args_parser():
 
     # Train runtime
     parser.add_argument("--batch_size", default=512, type=int)
-    parser.add_argument("--num_epochs", default=100, type=int)
+    parser.add_argument("--num_epochs", default=30, type=int)
     parser.add_argument("--num_workers", default=10, type=int)
     parser.add_argument("--learning_rate", default=1e-4, type=float)
     parser.add_argument("--save_interval", default=5, type=int)
@@ -54,7 +54,6 @@ def get_args_parser():
     parser.add_argument("--nheads", default=8, type=int)
     parser.add_argument("--activation", default="relu", type=str)
     parser.add_argument("--network", default="highwaynet", type=str)
-    parser.add_argument("--cross_topk_nbr", default=12, type=int)
 
     # Fut diffusion model
     parser.add_argument("--input_dim_fut", default=128, type=int)
@@ -76,7 +75,6 @@ def get_args_parser():
 
     # Fut train strategy
     parser.add_argument("--self_condition_prob", default=0.5, type=float)
-    parser.add_argument("--fut_global_inject", default=1, type=int)
 
     # Fut loss
     parser.add_argument("--fut_y_loss_weight", default=2.0, type=float)
@@ -86,7 +84,6 @@ def get_args_parser():
     # Fut visualization
     parser.add_argument("--fut_enable_train_vis", default=0, type=int)
     parser.add_argument("--fut_enable_eval_vis", default=0, type=int)
-    parser.add_argument("--fut_vis_every_n", default=2, type=int)
 
     # Eval
     parser.add_argument("--eval_ratio", default=0.03, type=float)
