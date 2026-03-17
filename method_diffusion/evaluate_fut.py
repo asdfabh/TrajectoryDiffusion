@@ -16,7 +16,14 @@ from method_diffusion.config import get_args_parser
 from method_diffusion.utils.mask_util import random_mask, continuous_mask
 from method_diffusion.utils.visualization import visualize_batch_trajectories
 
-def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, device='cuda'):
+def prepare_input_data(
+    batch,
+    feature_dim,
+    mask_type='random',
+    mask_prob=0.4,
+    device='cuda',
+    use_unified_fut_hist=False,
+):
     """数据准备函数，与训练代码保持一致"""
     hist = batch['hist']
     va = batch['va']
@@ -31,7 +38,13 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, de
     mask = batch['mask']
     temporal_mask = batch['temporal_mask']
 
-    if feature_dim == 6:
+    if use_unified_fut_hist:
+        if int(feature_dim) != 4:
+            raise ValueError("evaluate_fut unified future mode requires feature_dim=4.")
+        # 与 train_fut 统一：future 分支只吃原始位置，统一状态在模型内构建。
+        hist = hist.to(device)
+        hist_nbrs = hist_nbrs.to(device)
+    elif feature_dim == 6:
         hist = torch.cat((hist, va, lane, cclass), dim=-1).to(device)
         hist_nbrs = torch.cat((hist_nbrs, va_nbrs, lane_nbrs, cclass_nbrs), dim=-1).to(device)
     elif feature_dim == 5:
@@ -391,7 +404,12 @@ def run_evaluation(args, device):
             if batch_idx >= target_test_batches:
                 break
             hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask = prepare_input_data(
-                batch, args.feature_dim, mask_type='random', mask_prob=args.mask_prob, device=device
+                batch,
+                args.feature_dim,
+                mask_type='random',
+                mask_prob=args.mask_prob,
+                device=device,
+                use_unified_fut_hist=(args.eval_mode == 'fut_only'),
             )
 
             current_hist_input = hist

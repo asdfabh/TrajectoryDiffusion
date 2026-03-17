@@ -38,6 +38,14 @@ class HistEncoder(nn.Module):
     def __init__(self, args):
         super(HistEncoder, self).__init__()
         self.args = args
+        if int(args.feature_dim) != 4:
+            raise ValueError(
+                "HistEncoder in unified future branch expects feature_dim=4: "
+                "[rel_x, rel_y, delta_x, delta_y]"
+            )
+        self.model_dim = int(args.encoder_input_dim)
+        self.hidden_dim = int(getattr(args, "hidden_dim_fut", self.model_dim * 2))
+        self.memory_topk = max(0, int(getattr(args, "hist_memory_topk", 4)))
 
         # Initalize embeddings and input projection.
         self.input_embedding = nn.Linear(args.feature_dim, args.encoder_input_dim)
@@ -62,6 +70,59 @@ class HistEncoder(nn.Module):
 
         # Initialize activation and regularization functions.
         self.leaky_relu = nn.LeakyReLU(0.1)
+        self.fusion_gate = nn.Sequential(
+            nn.LayerNorm(self.model_dim * 2),
+            nn.Linear(self.model_dim * 2, self.model_dim),
+            nn.Sigmoid(),
+        )
+        self.fusion_norm = nn.LayerNorm(self.model_dim)
+
+        self.fused_to_hidden = nn.Sequential(
+            nn.LayerNorm(self.model_dim),
+            nn.Linear(self.model_dim, self.hidden_dim),
+            nn.GELU(approximate="tanh"),
+        )
+        self.nbr_summary_to_hidden = nn.Sequential(
+            nn.LayerNorm(self.model_dim),
+            nn.Linear(self.model_dim, self.hidden_dim),
+            nn.GELU(approximate="tanh"),
+        )
+
+        intent_heads = max(1, int(getattr(args, "heads_fut", 4)))
+        if self.hidden_dim % intent_heads != 0:
+            intent_heads = 1
+        self.intent_cls = nn.Parameter(torch.randn(1, 2, self.hidden_dim) * 0.02)
+        self.intent_memory_norm = nn.LayerNorm(self.hidden_dim)
+        self.intent_attn = nn.MultiheadAttention(self.hidden_dim, intent_heads, dropout=0.1, batch_first=True)
+        self.intent_cls_norm = nn.LayerNorm(self.hidden_dim)
+        self.intent_fusion = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim * 2),
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+
+    def _topk_neighbor_tokens(self, soc_enc, social_occ):
+        # soc_enc: [T, B, N_grid, D_enc], social_occ: [B, N_grid]
+        bsz = soc_enc.size(1)
+        n_grid = soc_enc.size(2)
+        topk = min(self.memory_topk, n_grid)
+        if topk <= 0:
+            empty_tokens = soc_enc.new_zeros((bsz, 0, self.model_dim))
+            empty_valid = social_occ.new_zeros((bsz, 0))
+            return empty_tokens, empty_valid
+
+        nbr_tokens = soc_enc.permute(1, 2, 0, 3)  # [B, N_grid, T, D_enc]
+        nbr_summary = nbr_tokens.mean(dim=2)  # [B, N_grid, D_enc]
+        nbr_score = nbr_tokens.pow(2).mean(dim=(2, 3))  # [B, N_grid]
+        nbr_score = nbr_score.masked_fill(~social_occ, float("-inf"))
+
+        topk_score, topk_idx = torch.topk(nbr_score, k=topk, dim=1)
+        topk_valid = torch.isfinite(topk_score)
+        gather_idx = topk_idx.unsqueeze(-1).expand(-1, -1, nbr_summary.size(-1))
+        topk_summary = torch.gather(nbr_summary, 1, gather_idx)
+        topk_summary = topk_summary * topk_valid.unsqueeze(-1).to(topk_summary.dtype)
+        return topk_summary, topk_valid
 
     # 输入：src, nbrs [B, T, D] and [N_total, T, D]
     def forward(self, src, nbrs, mask, temporal_mask):
@@ -128,183 +189,40 @@ class HistEncoder(nn.Module):
         value = torch.cat(torch.split(value, int(T), dim=1), dim=-1).squeeze(2) # [B, T, H * D_attn]
 
         temporal_spatial_agg = self.leaky_relu(temporal_value + value) # [B, T, D_enc]
-        enc = torch.cat((temporal_spatial_agg, hist_enc), dim=-1) # [B, T, D_enc]
 
-        return enc, hist_enc # [B, T, D_enc]
+        # 共享主干融合：把时间建模与交互建模统一到同一语义 token。
+        gate = self.fusion_gate(torch.cat((hist_enc, temporal_spatial_agg), dim=-1))
+        fused_tokens = self.fusion_norm(hist_enc + gate * temporal_spatial_agg)  # [B, T, D_enc]
+
+        # Memory Head: ego 时间 token + Top-K 邻居摘要 token。
+        fused_hidden = self.fused_to_hidden(fused_tokens)  # [B, T, hidden]
+        topk_summary, topk_valid = self._topk_neighbor_tokens(soc_enc, social_occ)
+        if topk_summary.size(1) > 0:
+            nbr_hidden = self.nbr_summary_to_hidden(topk_summary)
+            memory_tokens = torch.cat((fused_hidden, nbr_hidden), dim=1)
+        else:
+            memory_tokens = fused_hidden
+
+        ego_mask = torch.zeros((B, T), dtype=torch.bool, device=src.device)
+        if topk_valid.size(1) > 0:
+            nbr_mask = ~topk_valid
+            memory_mask = torch.cat((ego_mask, nbr_mask), dim=1)
+        else:
+            memory_mask = ego_mask
+
+        # Intent Head: 两个 CLS 从同一个 memory 池聚合全局行为意图。
+        intent_query = self.intent_cls.expand(B, -1, -1)
+        memory_norm = self.intent_memory_norm(memory_tokens)
+        intent_tokens = self.intent_attn(
+            query=intent_query,
+            key=memory_norm,
+            value=memory_norm,
+            key_padding_mask=memory_mask
+        )[0]
+        intent_tokens = self.intent_cls_norm(intent_tokens + intent_query)
+        z_motion, z_maneuver = intent_tokens[:, 0, :], intent_tokens[:, 1, :]
+        z_intent = self.intent_fusion(torch.cat((z_motion, z_maneuver), dim=-1))
+
+        return memory_tokens, z_intent, memory_mask
 
 
-# tame代码 维度转化说明
-# def forward(self, hist, nbrs, mask, va, nbrsva, lane, nbrslane, cls, nbrscls, temporal_mask):
-#     # 1. 特征拼接 (Feature Concatenation)
-#     if self.args.input_dim == 2:
-#         src = hist
-#     elif self.args.input_dim == 5:
-#         # src: [T, B, 5]
-#         src = torch.cat((hist, cls, va), dim=-1)
-#         # nbrs: [T, N_total, 5]
-#         nbrs = torch.cat((nbrs, nbrscls, nbrsva), dim=-1)
-#     else:
-#         # src: [T, B, D_in] (例如 D_in=2+3+2+dims)
-#         src = torch.cat((hist, cls, va, lane), dim=-1)
-#         # nbrs: [T, N_total, D_in]
-#         nbrs = torch.cat((nbrs, nbrscls, nbrsva, nbrslane), dim=-1)
-#
-#     # 2. 时间注意力机制 (Temporal Attention Mechanism)
-#     # 将空间网格维度展平: [B, H, W, N] -> [B, H*W, N] -> [B, N_grid, N]
-#     temporal_mask = temporal_mask.view(temporal_mask.size(0), temporal_mask.size(1) * temporal_mask.size(2),
-#                                        temporal_mask.size(3))
-#     # 在时间维度复制: [B, N_grid, N] -> [T, B, N_grid, N]
-#     temporal_mask = repeat(temporal_mask, 'b c n -> t b c n', t=self.args.hist_length)
-#
-#     # 初始化网格容器，用于放置邻居特征
-#     temporal_grid = torch.zeros_like(temporal_mask).float()
-#     # 使用掩码将扁平化的邻居特征 scatter 到网格中
-#     # nbrs: [T, N_total, D_in] -> temporal_grid: [T, B, N_grid, D_in] (此处维度变换隐含了 N 的处理，假设 N_grid 维包含了邻居最大数)
-#     # 注意：这里的 scatter 操作根据 mask 将紧凑的 nbrs 映射回 [T, B, Grid_Locations, D_in] 的结构
-#     temporal_grid = temporal_grid.masked_scatter_(temporal_mask.bool(), nbrs)
-#
-#     # 计算 Query (从自身历史轨迹)
-#     # src: [T, B, D_in] -> temporal_query: [T, B, H * D_attn]
-#     temporal_query = self.temporal_q(src)
-#     # Multi-head 处理:
-#     # 1. Unsqueeze: [T, B, 1, H * D_attn]
-#     # 2. Split: List of H tensors, each [T, B, 1, D_attn]
-#     # 3. Cat dim=0 (Stack Time): [T * H, B, 1, D_attn]
-#     # 4. Permute: [B, T * H, 1, D_attn]
-#     temporal_query = torch.cat(torch.split(torch.unsqueeze(temporal_query, dim=2), int(self.args.attn_out), dim=-1),
-#                                dim=0).permute(1, 0, 2, 3)
-#
-#     # 计算 Key (从网格化邻居特征)
-#     # temporal_grid: [T, B, N_grid, D_in] -> temporal_key: [T, B, N_grid, H * D_attn]
-#     temporal_key = self.temporal_k(temporal_grid)
-#     # Multi-head 处理:
-#     # ... Split & Cat dim=0: [T * H, B, N_grid, D_attn]
-#     # Permute: [B, T * H, D_attn, N_grid] (转置最后两维以便矩阵乘法)
-#     temporal_key = torch.cat(torch.split(temporal_key, int(self.args.attn_out), dim=-1), dim=0).permute(1, 0, 3, 2)
-#
-#     # 计算 Value
-#     # temporal_value: [T, B, N_grid, H * D_attn]
-#     temporal_value = self.temporal_v(temporal_grid)
-#     # Permute: [B, T * H, N_grid, D_attn]
-#     temporal_value = torch.cat(torch.split(temporal_value, int(self.args.attn_out), dim=-1), dim=0).permute(1, 0, 2, 3)
-#
-#     # Attention Weights Calculation
-#     # Q * K^T: [B, T*H, 1, D_attn] * [B, T*H, D_attn, N_grid] -> [B, T*H, 1, N_grid]
-#     temporal_attn_weights = torch.matmul(temporal_query, temporal_key)
-#     temporal_attn_weights /= torch.math.sqrt(self.args.attn_out)
-#     temporal_attn_weights = F.softmax(temporal_attn_weights, dim=-1)
-#
-#     # Weighted Sum (Apply Attention)
-#     # Weights * V: [B, T*H, 1, N_grid] * [B, T*H, N_grid, D_attn] -> [B, T*H, 1, D_attn]
-#     temporal_value = torch.matmul(temporal_attn_weights, temporal_value)
-#
-#     # Merge Heads back
-#     # 1. Split dim=1 by T: List of H tensors, each [B, T, 1, D_attn]
-#     # 2. Cat dim=-1: [B, T, 1, H * D_attn]
-#     # 3. Squeeze: [B, T, H * D_attn]
-#     temporal_value = torch.cat(torch.split(temporal_value, int(self.args.hist_length), dim=1), dim=-1).squeeze(2)
-#
-#     # Residual Connection & Projection
-#     # input_embedding(src): [T, B, D_enc] -> Permute: [B, T, D_enc]
-#     # temporal_residual maps [B, T, H*D_attn] back to [B, T, D_enc] and adds input
-#     temporal_value = self.temporal_residual(self.input_embedding(src).permute(1, 0, 2), temporal_value)
-#
-#     # 3. 历史轨迹编码 (Transformer Encoder)
-#     # input_embedding(src): [T, B, D_in] -> [T, B, D_enc]
-#     # encoder output hist_enc: [T, B, D_enc]
-#     hist_enc = self.encoder(self.leaky_relu(self.input_embedding(src)), pos=self.position_encoding(src))
-#     # Permute: [B, T, D_enc]
-#     hist_enc = hist_enc.permute(1, 0, 2)
-#
-#     # 4. 社交注意力机制 (Social Attention Mechanism)
-#     # Process neighbors through encoder
-#     # nbrs: [T, N_total, D_in] -> nbrs_enc: [T, N_total, D_enc]
-#     nbrs_enc = self.encoder(self.leaky_relu(self.input_embedding(nbrs)), pos=self.position_encoding(nbrs))
-#
-#     # Prepare Social Mask (similar to temporal mask logic)
-#     mask = mask.view(mask.size(0), mask.size(1) * mask.size(2), mask.size(3))
-#     mask = repeat(mask, 'b c n -> t b c n', t=self.args.hist_length)  # [T, B, N_grid, N]
-#
-#     # Scatter embedded neighbors back to grid structure
-#     soc_enc = torch.zeros_like(mask).float()
-#     soc_enc = soc_enc.masked_scatter_(mask.bool(), nbrs_enc)  # [T, B, N_grid, D_enc]
-#
-#     # 计算 Q, K, V
-#     # Q (from history): hist_enc [B, T, D_enc] -> qf -> [B, T, H*D_attn]
-#     query = self.qf(hist_enc)
-#     _, _, embed_size = query.shape
-#
-#     # Split Heads for Q: [B, T, 1, H*D_attn] -> Split & Cat dim=1 -> [B, T*H, 1, D_attn]
-#     query = torch.cat(torch.split(torch.unsqueeze(query, dim=2), int(embed_size / self.args.attn_nhead), dim=-1), dim=1)
-#
-#     # Process K from neighbors: soc_enc [T, B, N_grid, D_enc]
-#     # kf(soc_enc) -> [T, B, N_grid, H*D_attn]
-#     # Split & Cat dim=0 (Stack Time): [T*H, B, N_grid, D_attn]
-#     # Permute: [B, T*H, D_attn, N_grid] (Transposed for K)
-#     key = torch.cat(torch.split(self.kf(soc_enc), int(embed_size / self.args.attn_nhead), dim=-1), dim=0).permute(1, 0,
-#                                                                                                                   3, 2)
-#
-#     # Process V from neighbors:
-#     # Permute: [B, T*H, N_grid, D_attn]
-#     value = torch.cat(torch.split(self.vf(soc_enc), int(embed_size / self.args.attn_nhead), dim=-1), dim=0).permute(1,
-#                                                                                                                     0,
-#                                                                                                                     2,
-#                                                                                                                     3)
-#
-#     # Attention
-#     # [B, T*H, 1, N_grid]
-#     attn_weights = torch.matmul(query, key)
-#     attn_weights /= torch.math.sqrt(self.args.encoder_input_dim)
-#     attn_weights = F.softmax(attn_weights, dim=-1)
-#
-#     # [B, T*H, 1, D_attn]
-#     value = torch.matmul(attn_weights, value)
-#
-#     # Merge Heads
-#     # Split T*H by T -> Cat dim=-1 -> [B, T, 1, H*D_attn] -> Squeeze -> [B, T, H*D_attn] (Assuming H*D_attn == D_enc here)
-#     value = torch.cat(torch.split(value, int(hist.shape[0]), dim=1), dim=-1).squeeze(2)
-#
-#     # 5. 聚合与解码 (Aggregation & Decoding)
-#     # Sum Temporal Attention + Social Attention: [B, T, D_enc]
-#     temporal_spatial_agg = self.leaky_relu(temporal_value + value)
-#
-#     # Feature Concatenation:
-#     # [B, T, D_enc] cat [B, T, D_enc] -> [B, T, 2*D_enc]
-#     # Permute for Decoder: [T, B, 2*D_enc]
-#     enc = torch.cat((temporal_spatial_agg, hist_enc), dim=-1).permute(1, 0, 2)
-#
-#     memory = enc
-#     # Query Position for Decoder: [1, B, 2*D_enc] (Assuming single query vector broadcasted)
-#     query_pos = self.query_position_ecoding.weight.unsqueeze(1).repeat(1, enc.shape[1], 1)
-#     tgt = torch.zeros_like(query_pos)
-#
-#     # Decoder Output:
-#     # hs: [Layer_Count/1, B, 2*D_enc] or [T_out, B, 2*D_enc] depending on config.
-#     # Assuming return_intermediate=True, hs is [Num_Layers, B, 2*D_enc]
-#     hs = self.decoder(tgt, memory, query_pos=query_pos)
-#
-#     # 6. 混合专家输出 (Mixture of Experts Output)
-#     # Taking the last layer output: hs[-1] shape [B, 2*D_enc] (or hidden_dim)
-#     # expert_output: [B, hidden_dim]
-#     expert_output = self.expert_gate(hs[-1])
-#
-#     # 7. 多任务输出投影 (Multi-task Projection)
-#     # output_lat: [B, lat_dim] (Softmax probabilities)
-#     output_lat = F.softmax(self.output_lateral(expert_output), dim=-1)
-#     # output_lon: [B, lon_dim] (Softmax probabilities)
-#     output_lon = F.softmax(self.output_longitudinal(expert_output), dim=-1)
-#
-#     # Feature Fusion for Trajectory Prediction
-#     # [B, hidden_dim + lat_dim + lon_dim]
-#     dec = torch.cat((expert_output, output_lat, output_lon), dim=-1)
-#
-#     # Trajectory Projection:
-#     # output_projection(dec) -> [B, L * 5]
-#     # view -> [B, L, 5] (Assuming hs.shape[1] is Batch size B)
-#     # Note: hs.shape[1:3] suggests hs might be [Layers, B, Hidden]. view(*hs.shape[1:3]...) might be aiming for [B, Hidden_Part, ...] but standard is [B, L, 5]
-#     output = self.output_projection(dec).view(*hs.shape[1:3], self.args.pred_length, 5)
-#
-#     # Final Activation (e.g., tanh/sigmoid based on implementation)
-#     output_traj = out_activation(output)
-#
-#     return output_traj, output_lat, output_lon

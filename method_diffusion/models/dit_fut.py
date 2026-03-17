@@ -41,75 +41,54 @@ class TimestepEmbedder(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    """
-    标准 Transformer Decoder 结构
-    Structure: Self-Attn -> Cross-Attn -> FFN
-    All modulated by adaLN (Time)
-    """
 
     def __init__(self, dim=128, heads=4, dropout=0.1, mlp_ratio=4.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
-
         self.norm2 = nn.LayerNorm(dim)
         self.cross_attn = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
-
         self.norm3 = nn.LayerNorm(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
-
+        self.mlp1 = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(dim, 9 * dim, bias=True)
         )
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-    def forward(self, x, y, cross, attn_mask=None):
+    def forward(self, x, y, cross=None, attn_mask=None, cross_attn_mask=None):
+
         shift_msa, scale_msa, gate_msa, shift_cross, scale_cross, gate_cross, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(9, dim=1)
 
-        # Self Attention
         modulated_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulated_x, modulated_x, modulated_x, key_padding_mask=attn_mask)[0]
 
-        # Cross Attention
-        modulated_x = modulate(self.norm2(x), shift_cross, scale_cross)
-        x = x + gate_cross.unsqueeze(1) * self.cross_attn(modulated_x, cross, cross)[0]
+        if cross is not None:
+            modulated_x = modulate(self.norm2(x), shift_cross, scale_cross)
+            x = x + gate_cross.unsqueeze(1) * self.cross_attn(modulated_x, cross, cross, key_padding_mask=cross_attn_mask)[0]
 
-        # FFN
         modulated_x = modulate(self.norm3(x), shift_mlp, scale_mlp)
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulated_x)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp1(modulated_x)
 
         return x
 
 
-class JointFinalLayer(nn.Module):
-    """
-    DiffusionDrive 风格的输出层:
-    Trajectory (x0): [B, T, output_dim]
-    Score (Confidence): [B, 1]
-    """
-
+class FinalLayer(nn.Module):
     def __init__(self, hidden_size, T=16, output_dim=2):
         super().__init__()
         self.T = T
         self.output_dim = output_dim
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm_final = nn.LayerNorm(hidden_size)
 
-        # 输入: [B, T, D] -> 输出: [B, T, 2]
-        self.traj_head = nn.Sequential(
+        self.proj = nn.Sequential(
             nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_size * 4, bias=True),
             nn.GELU(approximate="tanh"),
             nn.LayerNorm(hidden_size * 4),
             nn.Linear(hidden_size * 4, output_dim, bias=True)
-        )
-
-        # 输入: [B, T, D] -> Global Average Pooling -> [B, D] -> MLP -> [B, 1]
-        self.score_head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, 1)  # 输出标量 logit
         )
 
         self.adaLN_modulation = nn.Sequential(
@@ -118,38 +97,40 @@ class JointFinalLayer(nn.Module):
         )
 
     def forward(self, x, y):
-        """
-        x: [B, T, Hidden_Dim]
-        y: [B, Hidden_Dim] (Condition)
-        Returns:
-        pred_traj: [B, T, 2]
-        pred_score: [B, 1]
-        """
         shift, scale = self.adaLN_modulation(y).chunk(2, dim=1)
         x = modulate(self.norm_final(x), shift, scale)
-        pred_traj = self.traj_head(x)  # [B, T, 2]
-
-        # 对时间维度 T 进行平均池化，得到全局特征
-        x_global = x.mean(dim=1)  # [B, Hidden_Dim]
-        pred_score = self.score_head(x_global)  # [B, 1]
-
-        return pred_traj, pred_score
+        x = self.proj(x)
+        return x
 
 
 class DiT(nn.Module):
     def __init__(self, dit_block, final_layer, depth, model_type="x_start"):
         super().__init__()
+
         assert model_type in ["score", "x_start"], f"Unknown model type: {model_type}"
         self._model_type = model_type
+
         self.blocks = nn.ModuleList([copy.deepcopy(dit_block) for _ in range(depth)])
-        self.final_layer = final_layer  # 现在是 JointFinalLayer
+        self.final_layer = final_layer
 
-    def forward(self, x, y, cross):
-        for block in self.blocks:
-            x = block(x, y, cross)
+    @property
+    def model_type(self):
+        return self._model_type
 
-        pred_traj, pred_score = self.final_layer(x, y)
-        return pred_traj, pred_score
+    def forward(self, x, y, cross=None, attn_mask=None, cross_attn_mask=None):
+        if isinstance(y, (list, tuple)):
+            if len(y) != len(self.blocks):
+                raise ValueError(f"Per-layer condition length mismatch: expected {len(self.blocks)}, got {len(y)}")
+            for idx, block in enumerate(self.blocks):
+                x = block(x, y[idx], cross=cross, attn_mask=attn_mask, cross_attn_mask=cross_attn_mask)
+            y_final = y[-1]
+        else:
+            for block in self.blocks:
+                x = block(x, y, cross=cross, attn_mask=attn_mask, cross_attn_mask=cross_attn_mask)
+            y_final = y
+        x = self.final_layer(x, y_final)
+
+        return x
 
 
 

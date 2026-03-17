@@ -26,6 +26,7 @@ def ensure_epoch_text_log(log_path: Path):
         return
     header = (
         "epoch,train_loss,train_vel,train_vel_x,train_vel_y,train_pos,train_pos_x,train_pos_y,"
+        "train_end,train_intent,train_end_over_pos,train_intent_over_vel,"
         "eval_ratio,eval_loss,eval_ade_ft,eval_fde_ft,eval_ade_m,eval_fde_m,lr\n"
     )
     log_path.write_text(header, encoding="utf-8")
@@ -41,11 +42,15 @@ def append_epoch_text_log(
     eval_fde: float,
     lr: float,
 ):
+    end_over_pos = train_stats["loss_end"] / max(train_stats["loss_pos"], 1e-8)
+    intent_over_vel = train_stats["loss_intent"] / max(train_stats["loss_vel"], 1e-8)
     line = (
         f"{epoch},"
         f"{train_stats['loss']:.6f},{train_stats['loss_vel']:.6f},{train_stats['loss_vel_x']:.6f},"
         f"{train_stats['loss_vel_y']:.6f},{train_stats['loss_pos']:.6f},{train_stats['loss_pos_x']:.6f},"
-        f"{train_stats['loss_pos_y']:.6f},{eval_ratio:.2f},{eval_loss:.6f},{eval_ade:.6f},{eval_fde:.6f},"
+        f"{train_stats['loss_pos_y']:.6f},{train_stats['loss_end']:.6f},{train_stats['loss_intent']:.6f},"
+        f"{end_over_pos:.6f},{intent_over_vel:.6f},"
+        f"{eval_ratio:.2f},{eval_loss:.6f},{eval_ade:.6f},{eval_fde:.6f},"
         f"{(eval_ade * 0.3048):.6f},{(eval_fde * 0.3048):.6f},{lr:.10f}\n"
     )
     with log_path.open("a", encoding="utf-8") as f:
@@ -60,6 +65,83 @@ EVAL_BAR_FORMAT = (
     "{desc}: {percentage:3.0f}%|{bar:6}| {n_fmt}/{total_fmt} "
     "[{elapsed}<{remaining}, {rate_fmt}] {postfix}"
 )
+TIME_STEP_LABELS = [("1s", 4), ("2s", 9), ("3s", 14), ("4s", 19), ("5s", 24)]
+
+
+class QuickMetrics:
+    """训练内轻量评估统计器：单样本采样 + TAME-style 分时段指标。"""
+
+    def __init__(self, pred_len, meter_per_unit=0.3048):
+        self.pred_len = int(pred_len)
+        self.meter_per_unit = float(meter_per_unit)
+        self.total_se = torch.zeros(self.pred_len, dtype=torch.float64)
+        self.total_de = torch.zeros(self.pred_len, dtype=torch.float64)
+        self.total_counts = torch.zeros(self.pred_len, dtype=torch.float64)
+        self.total_dist_sum = 0.0
+        self.total_valid_points = 0.0
+        self.total_fde_sum = 0.0
+        self.total_fde_count = 0.0
+
+    def update(self, pred, target, op_mask):
+        pred = pred[:, :self.pred_len, :2]
+        target = target[:, :self.pred_len, :2]
+        valid_mask = op_mask[:, :self.pred_len, 0] if op_mask.dim() == 3 else op_mask[:, :self.pred_len]
+        valid_mask = (valid_mask > 0).float().to(pred.device)
+
+        diff = pred - target
+        se = torch.sum(diff ** 2, dim=-1)
+        dist = torch.sqrt(se)
+
+        self.total_se += torch.sum(se * valid_mask, dim=0).double().cpu()
+        self.total_de += torch.sum(dist * valid_mask, dim=0).double().cpu()
+        self.total_counts += torch.sum(valid_mask, dim=0).double().cpu()
+
+        self.total_dist_sum += float(torch.sum(dist * valid_mask).item())
+        self.total_valid_points += float(torch.sum(valid_mask).item())
+
+        t_idx = torch.arange(dist.size(1), device=dist.device).unsqueeze(0).expand_as(dist)
+        masked_idx = torch.where(valid_mask > 0, t_idx, t_idx.new_full(t_idx.shape, -1))
+        last_idx = masked_idx.max(dim=1).values
+        has_valid = last_idx >= 0
+        final_dist = dist.gather(1, last_idx.clamp(min=0).unsqueeze(1)).squeeze(1)
+        self.total_fde_sum += float(torch.sum(final_dist * has_valid.float()).item())
+        self.total_fde_count += float(torch.sum(has_valid.float()).item())
+
+    def summary(self):
+        counts = self.total_counts.clamp(min=1.0)
+        rmse_per_step_ft = torch.sqrt(self.total_se / counts)
+        fde_per_step_ft = self.total_de / counts
+
+        cumsum_de = torch.cumsum(self.total_de, dim=0)
+        cumsum_counts = torch.cumsum(self.total_counts, dim=0).clamp(min=1.0)
+        ade_prefix_ft = cumsum_de / cumsum_counts
+        if ade_prefix_ft.numel() > 1:
+            ade_prefix_ft[1:] = cumsum_de[:-1] / cumsum_counts[:-1]
+
+        overall_ade_ft = 0.0 if self.total_valid_points == 0 else self.total_dist_sum / self.total_valid_points
+        overall_fde_ft = 0.0 if self.total_fde_count == 0 else self.total_fde_sum / self.total_fde_count
+
+        return {
+            "rmse_per_step_ft": rmse_per_step_ft,
+            "rmse_per_step_m": rmse_per_step_ft * self.meter_per_unit,
+            "fde_per_step_ft": fde_per_step_ft,
+            "fde_per_step_m": fde_per_step_ft * self.meter_per_unit,
+            "ade_prefix_ft": ade_prefix_ft,
+            "ade_prefix_m": ade_prefix_ft * self.meter_per_unit,
+            "overall_ade_ft": overall_ade_ft,
+            "overall_fde_ft": overall_fde_ft,
+            "overall_ade_m": overall_ade_ft * self.meter_per_unit,
+            "overall_fde_m": overall_fde_ft * self.meter_per_unit,
+        }
+
+
+def format_timestep_metrics(metric_tensor, meter_per_unit=0.3048):
+    values = []
+    for label, t_idx in TIME_STEP_LABELS:
+        if t_idx < metric_tensor.numel():
+            val_ft = float(metric_tensor[t_idx].item())
+            values.append(f"{label}: {val_ft:.3f} ft ({val_ft * meter_per_unit:.3f} m)")
+    return " | ".join(values) if values else "no valid timestep"
 
 
 # 指数移动平均 (Exponential Moving Average) 包装器类
@@ -90,30 +172,18 @@ class EMAModel:
 
 def prepare_input_data(batch, feature_dim, device="cuda"):
     hist = batch["hist"]
-    va = batch["va"]
-    lane = batch["lane"]
-    cclass = batch["cclass"]
     fut = batch["fut"]
     op_mask = batch["op_mask"]
     hist_nbrs = batch["nbrs"]
-    va_nbrs = batch["nbrs_va"]
-    lane_nbrs = batch["nbrs_lane"]
-    cclass_nbrs = batch["nbrs_class"]
     mask = batch["mask"]
     temporal_mask = batch["temporal_mask"]
 
-    if feature_dim == 6:
-        hist = torch.cat((hist, va, lane, cclass), dim=-1).to(device)
-        hist_nbrs = torch.cat((hist_nbrs, va_nbrs, lane_nbrs, cclass_nbrs), dim=-1).to(device)
-    elif feature_dim == 5:
-        hist = torch.cat((hist, va, lane), dim=-1).to(device)
-        hist_nbrs = torch.cat((hist_nbrs, va_nbrs, lane_nbrs), dim=-1).to(device)
-    elif feature_dim == 4:
-        hist = torch.cat((hist, va), dim=-1).to(device)
-        hist_nbrs = torch.cat((hist_nbrs, va_nbrs), dim=-1).to(device)
-    else:
-        hist = hist.to(device)
-        hist_nbrs = hist_nbrs.to(device)
+    if int(feature_dim) != 4:
+        raise ValueError("train_fut unified future branch currently requires feature_dim=4.")
+    # unified state 在模型内部重建为 [rel_x, rel_y, delta_x, delta_y]，
+    # 这里仅传原始位置轨迹，避免 feature_dim=4 的双重语义混淆。
+    hist = hist.to(device)
+    hist_nbrs = hist_nbrs.to(device)
 
     fut = fut.to(device)
     op_mask = op_mask.to(device)
@@ -132,6 +202,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
     total_pos_loss = 0.0
     total_pos_x_loss = 0.0
     total_pos_y_loss = 0.0
+    total_end_loss = 0.0
+    total_intent_loss = 0.0
     num_batches = 0
     pbar = tqdm(
         dataloader,
@@ -166,11 +238,17 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
         total_pos_loss += float(loss_parts["loss_pos"].item())
         total_pos_x_loss += float(loss_parts["loss_pos_x"].item())
         total_pos_y_loss += float(loss_parts["loss_pos_y"].item())
+        total_end_loss += float(loss_parts["loss_end"].item())
+        total_intent_loss += float(loss_parts["loss_intent"].item())
         num_batches += 1
+        avg_loss = total_loss / num_batches
+        avg_vel = total_vel_loss / num_batches
+        avg_pos = total_pos_loss / num_batches
+        avg_end = total_end_loss / num_batches
+        avg_intent = total_intent_loss / num_batches
         pbar.set_postfix_str(
-            f"loss/loss_avg={loss.item():.6f}/{(total_loss / num_batches):.6f} | "
-            f"vel/vel_x/vel_y={(total_vel_loss / num_batches):.6f}/{(total_vel_x_loss / num_batches):.6f}/{(total_vel_y_loss / num_batches):.6f} | "
-            f"pos/pos_x/pos_y={(total_pos_loss / num_batches):.6f}/{(total_pos_x_loss / num_batches):.6f}/{(total_pos_y_loss / num_batches):.6f}"
+            f"loss={loss.item():.6f}({avg_loss:.6f}) | "
+            f"v={avg_vel:.6f} p={avg_pos:.6f} e={avg_end:.6f} i={avg_intent:.6f}"
         )
 
     denom = max(num_batches, 1)
@@ -182,6 +260,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
         "loss_pos": total_pos_loss / denom,
         "loss_pos_x": total_pos_x_loss / denom,
         "loss_pos_y": total_pos_y_loss / denom,
+        "loss_end": total_end_loss / denom,
+        "loss_intent": total_intent_loss / denom,
     }
 
 
@@ -197,11 +277,12 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
     total_ade = 0.0
     total_fde = 0.0
     num_batches = 0
+    quick_metrics = QuickMetrics(pred_len=int(getattr(model, "T", 25)))
 
     total_batches = len(dataloader)
     if total_batches == 0:
         model.train()
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, quick_metrics.summary()
 
     target_batches = total_batches
     if eval_ratio > 0:
@@ -221,11 +302,14 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
             break
 
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        eval_loss, _, eval_ade, eval_fde = model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+        eval_loss, pred_fut, eval_ade, eval_fde = model.forwardEval(
+            hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device
+        )
 
         total_loss += float(eval_loss.item())
         total_ade += float(eval_ade.item())
         total_fde += float(eval_fde.item())
+        quick_metrics.update(pred_fut, fut, op_mask)
         num_batches += 1
         pbar.set_postfix_str(
             f"loss/loss_avg={eval_loss.item():.6f}/{(total_loss / num_batches):.6f} | "
@@ -234,8 +318,8 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
 
     model.train()
     if num_batches == 0:
-        return 0.0, 0.0, 0.0
-    return total_loss / num_batches, total_ade / num_batches, total_fde / num_batches
+        return 0.0, 0.0, 0.0, quick_metrics.summary()
+    return total_loss / num_batches, total_ade / num_batches, total_fde / num_batches, quick_metrics.summary()
 
 
 def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, ema=None):
@@ -294,6 +378,8 @@ def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, ema=Non
 
 def main():
     args = get_args_parser().parse_args()
+    if int(args.feature_dim) != 4:
+        raise ValueError("train_fut currently supports feature_dim=4 only.")
     args.checkpoint_dir = str(Path(args.checkpoint_dir) / "fut")
     Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
@@ -371,16 +457,24 @@ def main():
 
     for epoch in range(start_epoch, args.num_epochs):
         print(f"\n========== Epoch {epoch + 1}/{args.num_epochs} ==========")
+        train_peak_mem_mb = None
+        eval_ema_peak_mem_mb = None
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(device)
 
         # 训练阶段：传入 ema 参与权重影子步进
         train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim, ema)
+        if torch.cuda.is_available():
+            train_peak_mem_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
         avg_loss = float(train_stats["loss"])
 
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(device)
         # 评估阶段：为了不破坏正在训练的原始权重，先深拷贝备份，再套用 EMA 权重
         original_state = {k: v.clone() for k, v in model.state_dict().items()}
         ema.apply_shadow(model)
 
-        eval_loss, eval_ade, eval_fde = evaluate_on_testset(
+        eval_loss, eval_ade, eval_fde, quick_eval = evaluate_on_testset(
             model,
             test_loader,
             device,
@@ -392,19 +486,43 @@ def main():
 
         # 评估结束，将原始训练权重覆盖回来，继续下一轮训练
         model.load_state_dict(original_state)
+        if torch.cuda.is_available():
+            eval_ema_peak_mem_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+
+        end_over_pos = train_stats["loss_end"] / max(train_stats["loss_pos"], 1e-8)
+        intent_over_vel = train_stats["loss_intent"] / max(train_stats["loss_vel"], 1e-8)
 
         print(f"Epoch [{epoch + 1}] Train Loss: {avg_loss:.6f}")
         print(
             f"Train Detail [{epoch + 1}] Vel: {train_stats['loss_vel']:.6f}, "
             f"VelXY: {train_stats['loss_vel_x']:.6f}/{train_stats['loss_vel_y']:.6f}, "
             f"Pos: {train_stats['loss_pos']:.6f}, "
-            f"PosXY: {train_stats['loss_pos_x']:.6f}/{train_stats['loss_pos_y']:.6f}"
+            f"PosXY: {train_stats['loss_pos_x']:.6f}/{train_stats['loss_pos_y']:.6f}, "
+            f"End: {train_stats['loss_end']:.6f}, Intent: {train_stats['loss_intent']:.6f}, "
+            f"End/Pos: {end_over_pos:.4f}, Intent/Vel: {intent_over_vel:.4f}"
         )
         print(
             f"TestSet Eval@0.03 [{epoch + 1}] Loss: {eval_loss:.6f}, "
             f"ADE: {eval_ade:.6f} ft ({eval_ade * 0.3048:.6f} m), "
             f"FDE: {eval_fde:.6f} ft ({eval_fde * 0.3048:.6f} m)"
         )
+        print(
+            f"[QuickEval TAME-style][Ep{epoch + 1}] RMSE: "
+            f"{format_timestep_metrics(quick_eval['rmse_per_step_ft'])}"
+        )
+        print(
+            f"[QuickEval TAME-style][Ep{epoch + 1}] FDE: "
+            f"{format_timestep_metrics(quick_eval['fde_per_step_ft'])}"
+        )
+        print(
+            f"[QuickEval TAME-style][Ep{epoch + 1}] ADE: "
+            f"{format_timestep_metrics(quick_eval['ade_prefix_ft'])}"
+        )
+        if train_peak_mem_mb is not None and eval_ema_peak_mem_mb is not None:
+            print(
+                f"[GPU PeakMem][Ep{epoch + 1}] train_step={train_peak_mem_mb:.2f} MB, "
+                f"eval_ema={eval_ema_peak_mem_mb:.2f} MB"
+            )
 
         current_lr = optimizer.param_groups[0]["lr"]
         append_epoch_text_log(
@@ -425,11 +543,23 @@ def main():
         writer.add_scalar("Train/Loss_pos", train_stats["loss_pos"], epoch + 1)
         writer.add_scalar("Train/Loss_pos_x", train_stats["loss_pos_x"], epoch + 1)
         writer.add_scalar("Train/Loss_pos_y", train_stats["loss_pos_y"], epoch + 1)
+        writer.add_scalar("Train/Loss_end", train_stats["loss_end"], epoch + 1)
+        writer.add_scalar("Train/Loss_intent", train_stats["loss_intent"], epoch + 1)
+        writer.add_scalar("Train/Loss_end_over_pos", end_over_pos, epoch + 1)
+        writer.add_scalar("Train/Loss_intent_over_vel", intent_over_vel, epoch + 1)
         writer.add_scalar("Eval/Loss", eval_loss, epoch + 1)
         writer.add_scalar("Eval/ADE_ft", eval_ade, epoch + 1)
         writer.add_scalar("Eval/FDE_ft", eval_fde, epoch + 1)
         writer.add_scalar("Eval/ADE_m", eval_ade * 0.3048, epoch + 1)
         writer.add_scalar("Eval/FDE_m", eval_fde * 0.3048, epoch + 1)
+        for label, idx in TIME_STEP_LABELS:
+            if idx < quick_eval["rmse_per_step_ft"].numel():
+                writer.add_scalar(f"EvalQuick/RMSE_ft_{label}", quick_eval["rmse_per_step_ft"][idx].item(), epoch + 1)
+                writer.add_scalar(f"EvalQuick/FDE_ft_{label}", quick_eval["fde_per_step_ft"][idx].item(), epoch + 1)
+                writer.add_scalar(f"EvalQuick/ADE_ft_{label}", quick_eval["ade_prefix_ft"][idx].item(), epoch + 1)
+        if train_peak_mem_mb is not None and eval_ema_peak_mem_mb is not None:
+            writer.add_scalar("Resource/PeakMemTrain_MB", train_peak_mem_mb, epoch + 1)
+            writer.add_scalar("Resource/PeakMemEvalEMA_MB", eval_ema_peak_mem_mb, epoch + 1)
         writer.add_scalar("Train/LR", current_lr, epoch + 1)
 
         scheduler.step()
