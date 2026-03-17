@@ -2,11 +2,12 @@ import sys
 import os
 import math
 import copy
+import inspect
+from datetime import datetime
 from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -16,18 +17,14 @@ from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-UNIFIED_TEXT_LOG_DIR = PROJECT_ROOT / "checkpoints" / "log"
-
-
 def ensure_epoch_text_log(log_path: Path):
     log_path.parent.mkdir(parents=True, exist_ok=True)
     if log_path.exists():
         return
     header = (
-        "epoch,train_loss,train_vel,train_vel_x,train_vel_y,train_pos,train_pos_x,train_pos_y,"
-        "train_end,train_intent,train_end_over_pos,train_intent_over_vel,"
-        "eval_ratio,eval_loss,eval_ade_ft,eval_fde_ft,eval_ade_m,eval_fde_m,lr\n"
+        "epoch,train_loss_cur,train_loss_avg,train_vel_avg,train_pos_avg,train_end_avg,"
+        "eval_ratio,eval_loss,eval_ade_ft,eval_fde_ft,eval_rmse_ft,"
+        "eval_ade_m,eval_fde_m,eval_rmse_m\n"
     )
     log_path.write_text(header, encoding="utf-8")
 
@@ -40,21 +37,54 @@ def append_epoch_text_log(
     eval_loss: float,
     eval_ade: float,
     eval_fde: float,
-    lr: float,
+    eval_rmse: float,
 ):
-    end_over_pos = train_stats["loss_end"] / max(train_stats["loss_pos"], 1e-8)
-    intent_over_vel = train_stats["loss_intent"] / max(train_stats["loss_vel"], 1e-8)
     line = (
         f"{epoch},"
-        f"{train_stats['loss']:.6f},{train_stats['loss_vel']:.6f},{train_stats['loss_vel_x']:.6f},"
-        f"{train_stats['loss_vel_y']:.6f},{train_stats['loss_pos']:.6f},{train_stats['loss_pos_x']:.6f},"
-        f"{train_stats['loss_pos_y']:.6f},{train_stats['loss_end']:.6f},{train_stats['loss_intent']:.6f},"
-        f"{end_over_pos:.6f},{intent_over_vel:.6f},"
-        f"{eval_ratio:.2f},{eval_loss:.6f},{eval_ade:.6f},{eval_fde:.6f},"
-        f"{(eval_ade * 0.3048):.6f},{(eval_fde * 0.3048):.6f},{lr:.10f}\n"
+        f"{train_stats['loss_last']:.6f},{train_stats['loss_avg']:.6f},"
+        f"{train_stats['loss_vel_avg']:.6f},{train_stats['loss_pos_avg']:.6f},{train_stats['loss_end_avg']:.6f},"
+        f"{eval_ratio:.2f},{eval_loss:.6f},{eval_ade:.6f},{eval_fde:.6f},{eval_rmse:.6f},"
+        f"{(eval_ade * 0.3048):.6f},{(eval_fde * 0.3048):.6f},{(eval_rmse * 0.3048):.6f}\n"
     )
     with log_path.open("a", encoding="utf-8") as f:
         f.write(line)
+        # 每个 epoch 结束后立即落盘，避免异常中断丢失最后一轮日志
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def build_epoch_text_log_path(checkpoint_dir: Path, prefix: str) -> Path:
+    timestamp = datetime.now().strftime("%m-%d-%H:%M")
+    log_dir = checkpoint_dir / "log"
+    log_path = log_dir / f"{prefix}_{timestamp}.txt"
+    if not log_path.exists():
+        return log_path
+    suffix = 1
+    while True:
+        candidate = log_dir / f"{prefix}_{timestamp}_{suffix}.txt"
+        if not candidate.exists():
+            return candidate
+        suffix += 1
+
+
+def print_epoch_eval_summary(
+    epoch: int,
+    train_stats: dict,
+    eval_ratio: float,
+    eval_loss: float,
+    eval_ade: float,
+    eval_fde: float,
+    eval_rmse: float,
+):
+    print(
+        f"[Epoch {epoch}] "
+        f"train_loss={train_stats['loss_avg']:.6f} | "
+        f"eval_ratio={eval_ratio:.2f} | "
+        f"eval_loss={eval_loss:.6f} | "
+        f"ADE={eval_ade:.6f} ft ({eval_ade * 0.3048:.6f} m) | "
+        f"FDE={eval_fde:.6f} ft ({eval_fde * 0.3048:.6f} m) | "
+        f"RMSE={eval_rmse:.6f} ft ({eval_rmse * 0.3048:.6f} m)"
+    )
 
 
 TRAIN_BAR_FORMAT = (
@@ -120,6 +150,7 @@ class QuickMetrics:
 
         overall_ade_ft = 0.0 if self.total_valid_points == 0 else self.total_dist_sum / self.total_valid_points
         overall_fde_ft = 0.0 if self.total_fde_count == 0 else self.total_fde_sum / self.total_fde_count
+        overall_rmse_ft = 0.0 if self.total_valid_points == 0 else float(torch.sqrt(self.total_se.sum() / self.total_counts.sum().clamp(min=1.0)).item())
 
         return {
             "rmse_per_step_ft": rmse_per_step_ft,
@@ -130,8 +161,10 @@ class QuickMetrics:
             "ade_prefix_m": ade_prefix_ft * self.meter_per_unit,
             "overall_ade_ft": overall_ade_ft,
             "overall_fde_ft": overall_fde_ft,
+            "overall_rmse_ft": overall_rmse_ft,
             "overall_ade_m": overall_ade_ft * self.meter_per_unit,
             "overall_fde_m": overall_fde_ft * self.meter_per_unit,
+            "overall_rmse_m": overall_rmse_ft * self.meter_per_unit,
         }
 
 
@@ -150,6 +183,7 @@ class EMAModel:
     def __init__(self, model, decay=0.999):
         self.decay = decay
         self.shadow = copy.deepcopy(model.state_dict())
+        self._shadow_on_model = False
         # 影子参数仅做记录，不参与反向传播和梯度计算
         for param in self.shadow.values():
             if isinstance(param, torch.Tensor):
@@ -165,25 +199,39 @@ class EMAModel:
                     else:
                         self.shadow[name].copy_(param.data)
 
-    def apply_shadow(self, target_model):
-        # 将当前的影子权重加载到目标模型中，用于评估或推理
-        target_model.load_state_dict(self.shadow)
+    def swap_shadow(self, target_model):
+        # 通过参数引用交换进行 EMA 切换，避免 clone 整个 state_dict 造成显存峰值。
+        model_state = target_model.state_dict(keep_vars=True)
+        for name, tensor in model_state.items():
+            if name not in self.shadow:
+                continue
+            shadow_tensor = self.shadow[name]
+            if tensor.device != shadow_tensor.device or tensor.dtype != shadow_tensor.dtype:
+                tmp = tensor.data.detach().clone()
+                tensor.data.copy_(shadow_tensor.to(device=tensor.device, dtype=tensor.dtype))
+                self.shadow[name] = tmp
+            else:
+                tmp = tensor.data
+                tensor.data = shadow_tensor
+                self.shadow[name] = tmp
+        self._shadow_on_model = not self._shadow_on_model
 
 
 def prepare_input_data(batch, feature_dim, device="cuda"):
     hist = batch["hist"]
+    va = batch["va"]
     fut = batch["fut"]
     op_mask = batch["op_mask"]
     hist_nbrs = batch["nbrs"]
+    va_nbrs = batch["nbrs_va"]
     mask = batch["mask"]
     temporal_mask = batch["temporal_mask"]
 
     if int(feature_dim) != 4:
-        raise ValueError("train_fut unified future branch currently requires feature_dim=4.")
-    # unified state 在模型内部重建为 [rel_x, rel_y, delta_x, delta_y]，
-    # 这里仅传原始位置轨迹，避免 feature_dim=4 的双重语义混淆。
-    hist = hist.to(device)
-    hist_nbrs = hist_nbrs.to(device)
+        raise ValueError("train_fut currently supports feature_dim=4: [rel_x, rel_y, v, a].")
+    # future 分支输入恢复为 [rel_x, rel_y, v, a]
+    hist = torch.cat((hist, va), dim=-1).to(device)
+    hist_nbrs = torch.cat((hist_nbrs, va_nbrs), dim=-1).to(device)
 
     fut = fut.to(device)
     op_mask = op_mask.to(device)
@@ -192,18 +240,31 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
 
 
+def build_ngsim_dataset(mat_path, args):
+    # 兼容不同 NgsimDataset 版本，按签名过滤可用参数，避免 unexpected keyword 异常。
+    dataset_kwargs = {
+        "t_h": 30,
+        "t_f": 50,
+        "d_s": 2,
+        "enc_size": args.encoder_input_dim,
+        "feature_dim": args.feature_dim,
+    }
+    sig = inspect.signature(NgsimDataset.__init__)
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    if has_var_kw:
+        return NgsimDataset(mat_path, **dataset_kwargs)
+    filtered = {k: v for k, v in dataset_kwargs.items() if k in sig.parameters}
+    return NgsimDataset(mat_path, **filtered)
+
+
 # 训练函数新增 ema 参数，在反向传播后进行滑动平均更新
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
     model.train()
     total_loss = 0.0
-    total_vel_loss = 0.0
-    total_vel_x_loss = 0.0
-    total_vel_y_loss = 0.0
-    total_pos_loss = 0.0
-    total_pos_x_loss = 0.0
-    total_pos_y_loss = 0.0
-    total_end_loss = 0.0
-    total_intent_loss = 0.0
+    total_vel = 0.0
+    total_pos = 0.0
+    total_end = 0.0
+    last_loss = 0.0
     num_batches = 0
     pbar = tqdm(
         dataloader,
@@ -218,9 +279,6 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
         loss, loss_parts = model.forwardTrain(
             hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, return_components=True
         )
-        # _, pred_fut, _, _ = model.forwardEval_minADE(
-        #     hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, K=6
-        # )
 
         optimizer.zero_grad()
         loss.backward()
@@ -232,36 +290,29 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
             ema.step(model)
 
         total_loss += float(loss.item())
-        total_vel_loss += float(loss_parts["loss_vel"].item())
-        total_vel_x_loss += float(loss_parts["loss_vel_x"].item())
-        total_vel_y_loss += float(loss_parts["loss_vel_y"].item())
-        total_pos_loss += float(loss_parts["loss_pos"].item())
-        total_pos_x_loss += float(loss_parts["loss_pos_x"].item())
-        total_pos_y_loss += float(loss_parts["loss_pos_y"].item())
-        total_end_loss += float(loss_parts["loss_end"].item())
-        total_intent_loss += float(loss_parts["loss_intent"].item())
+        total_vel += float(loss_parts["loss_vel"].item())
+        total_pos += float(loss_parts["loss_pos"].item())
+        total_end += float(loss_parts["loss_end"].item())
+        last_loss = float(loss.item())
         num_batches += 1
         avg_loss = total_loss / num_batches
-        avg_vel = total_vel_loss / num_batches
-        avg_pos = total_pos_loss / num_batches
-        avg_end = total_end_loss / num_batches
-        avg_intent = total_intent_loss / num_batches
+        avg_vel = total_vel / num_batches
+        avg_pos = total_pos / num_batches
+        avg_end = total_end / num_batches
         pbar.set_postfix_str(
-            f"loss={loss.item():.6f}({avg_loss:.6f}) | "
-            f"v={avg_vel:.6f} p={avg_pos:.6f} e={avg_end:.6f} i={avg_intent:.6f}"
+            f"loss={last_loss:.6f}(avg={avg_loss:.6f}) | "
+            f"vel={avg_vel:.6f} | "
+            f"pos={avg_pos:.6f} | "
+            f"end={avg_end:.6f}"
         )
 
     denom = max(num_batches, 1)
     return {
-        "loss": total_loss / denom,
-        "loss_vel": total_vel_loss / denom,
-        "loss_vel_x": total_vel_x_loss / denom,
-        "loss_vel_y": total_vel_y_loss / denom,
-        "loss_pos": total_pos_loss / denom,
-        "loss_pos_x": total_pos_x_loss / denom,
-        "loss_pos_y": total_pos_y_loss / denom,
-        "loss_end": total_end_loss / denom,
-        "loss_intent": total_intent_loss / denom,
+        "loss_avg": total_loss / denom,
+        "loss_last": last_loss,
+        "loss_vel_avg": total_vel / denom,
+        "loss_pos_avg": total_pos / denom,
+        "loss_end_avg": total_end / denom,
     }
 
 
@@ -312,8 +363,8 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
         quick_metrics.update(pred_fut, fut, op_mask)
         num_batches += 1
         pbar.set_postfix_str(
-            f"loss/loss_avg={eval_loss.item():.6f}/{(total_loss / num_batches):.6f} | "
-            f"ade/fde={(total_ade / num_batches):.6f}/{(total_fde / num_batches):.6f}"
+            f"loss={eval_loss.item():.6f}(avg={(total_loss / num_batches):.6f}) | "
+            f"ade={(total_ade / num_batches):.6f} | fde={(total_fde / num_batches):.6f}"
         )
 
     model.train()
@@ -363,6 +414,7 @@ def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, ema=Non
                 ema.shadow = copy.deepcopy(state["model_state_dict"])
             else:
                 ema.shadow = copy.deepcopy(model.state_dict())
+            ema._shadow_on_model = False
 
         try:
             optimizer.load_state_dict(state["optimizer_state_dict"])
@@ -380,50 +432,29 @@ def main():
     args = get_args_parser().parse_args()
     if int(args.feature_dim) != 4:
         raise ValueError("train_fut currently supports feature_dim=4 only.")
-    args.checkpoint_dir = str(Path(args.checkpoint_dir) / "fut")
-    Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    script_dir = Path(__file__).resolve().parent
+    checkpoint_root = Path(args.checkpoint_dir)
+    if not checkpoint_root.is_absolute():
+        checkpoint_root = script_dir / checkpoint_root
+    fut_ckpt_dir = checkpoint_root / "fut"
+    fut_ckpt_dir.mkdir(parents=True, exist_ok=True)
+    args.checkpoint_dir = str(fut_ckpt_dir)
 
-    log_dir = Path(args.checkpoint_dir) / "logs"
-    writer = SummaryWriter(log_dir=str(log_dir))
-    epoch_text_log_path = UNIFIED_TEXT_LOG_DIR / "train_fut_epoch_metrics.txt"
+    epoch_text_log_path = build_epoch_text_log_path(fut_ckpt_dir, "train_fut_epoch_metrics")
     ensure_epoch_text_log(epoch_text_log_path)
+    print(f"[Log] Epoch metrics file: {epoch_text_log_path}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     eval_ratio = 0.03
 
-    print(
-        f"[FutModel] Inference sampler: steps={args.num_inference_steps}, "
-        f"spacing={args.inference_timestep_spacing}, eta={args.ddim_eta}, x0_clip={args.x0_clip}"
-    )
-    print(
-        f"[FutModel] Train strategy: self_condition_prob={args.self_condition_prob}, "
-        f"loss=vel_huber+integrated_pos_huber(no_time_decay,no_xy_weight), "
-        f"huber_delta={args.fut_huber_delta}"
-    )
-    print(
-        f"[FutModel] TestSet eval sampling: eval_ratio={eval_ratio}, eval_max_batches={args.eval_max_batches}"
-    )
+    print(f"[FutModel] self_condition_prob={args.self_condition_prob}, eval_ratio={eval_ratio}")
 
     data_root = Path(args.data_root)
     train_path = str(data_root / "TrainSet.mat")
     test_path = str(data_root / "TestSet.mat")
 
-    train_dataset = NgsimDataset(
-        train_path,
-        t_h=30,
-        t_f=50,
-        d_s=2,
-        enc_size=args.encoder_input_dim,
-        feature_dim=args.feature_dim,
-    )
-    test_dataset = NgsimDataset(
-        test_path,
-        t_h=30,
-        t_f=50,
-        d_s=2,
-        enc_size=args.encoder_input_dim,
-        feature_dim=args.feature_dim,
-    )
+    train_dataset = build_ngsim_dataset(train_path, args)
+    test_dataset = build_ngsim_dataset(test_path, args)
 
     train_loader = DataLoader(
         train_dataset,
@@ -454,26 +485,13 @@ def main():
     ema = EMAModel(model, decay=0.9999)
 
     start_epoch, best_ade = load_checkpoint_if_needed(args, model, optimizer, scheduler, device, ema)
+    last_eval = None
 
     for epoch in range(start_epoch, args.num_epochs):
-        print(f"\n========== Epoch {epoch + 1}/{args.num_epochs} ==========")
-        train_peak_mem_mb = None
-        eval_ema_peak_mem_mb = None
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats(device)
-
-        # 训练阶段：传入 ema 参与权重影子步进
         train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim, ema)
-        if torch.cuda.is_available():
-            train_peak_mem_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-        avg_loss = float(train_stats["loss"])
+        avg_loss = float(train_stats["loss_avg"])
 
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats(device)
-        # 评估阶段：为了不破坏正在训练的原始权重，先深拷贝备份，再套用 EMA 权重
-        original_state = {k: v.clone() for k, v in model.state_dict().items()}
-        ema.apply_shadow(model)
-
+        ema.swap_shadow(model)
         eval_loss, eval_ade, eval_fde, quick_eval = evaluate_on_testset(
             model,
             test_loader,
@@ -483,48 +501,10 @@ def main():
             eval_ratio=eval_ratio,
             max_batches=args.eval_max_batches,
         )
+        ema.swap_shadow(model)
+        eval_rmse = float(quick_eval["overall_rmse_ft"])
+        last_eval = (eval_loss, eval_ade, eval_fde, quick_eval)
 
-        # 评估结束，将原始训练权重覆盖回来，继续下一轮训练
-        model.load_state_dict(original_state)
-        if torch.cuda.is_available():
-            eval_ema_peak_mem_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-
-        end_over_pos = train_stats["loss_end"] / max(train_stats["loss_pos"], 1e-8)
-        intent_over_vel = train_stats["loss_intent"] / max(train_stats["loss_vel"], 1e-8)
-
-        print(f"Epoch [{epoch + 1}] Train Loss: {avg_loss:.6f}")
-        print(
-            f"Train Detail [{epoch + 1}] Vel: {train_stats['loss_vel']:.6f}, "
-            f"VelXY: {train_stats['loss_vel_x']:.6f}/{train_stats['loss_vel_y']:.6f}, "
-            f"Pos: {train_stats['loss_pos']:.6f}, "
-            f"PosXY: {train_stats['loss_pos_x']:.6f}/{train_stats['loss_pos_y']:.6f}, "
-            f"End: {train_stats['loss_end']:.6f}, Intent: {train_stats['loss_intent']:.6f}, "
-            f"End/Pos: {end_over_pos:.4f}, Intent/Vel: {intent_over_vel:.4f}"
-        )
-        print(
-            f"TestSet Eval@0.03 [{epoch + 1}] Loss: {eval_loss:.6f}, "
-            f"ADE: {eval_ade:.6f} ft ({eval_ade * 0.3048:.6f} m), "
-            f"FDE: {eval_fde:.6f} ft ({eval_fde * 0.3048:.6f} m)"
-        )
-        print(
-            f"[QuickEval TAME-style][Ep{epoch + 1}] RMSE: "
-            f"{format_timestep_metrics(quick_eval['rmse_per_step_ft'])}"
-        )
-        print(
-            f"[QuickEval TAME-style][Ep{epoch + 1}] FDE: "
-            f"{format_timestep_metrics(quick_eval['fde_per_step_ft'])}"
-        )
-        print(
-            f"[QuickEval TAME-style][Ep{epoch + 1}] ADE: "
-            f"{format_timestep_metrics(quick_eval['ade_prefix_ft'])}"
-        )
-        if train_peak_mem_mb is not None and eval_ema_peak_mem_mb is not None:
-            print(
-                f"[GPU PeakMem][Ep{epoch + 1}] train_step={train_peak_mem_mb:.2f} MB, "
-                f"eval_ema={eval_ema_peak_mem_mb:.2f} MB"
-            )
-
-        current_lr = optimizer.param_groups[0]["lr"]
         append_epoch_text_log(
             log_path=epoch_text_log_path,
             epoch=epoch + 1,
@@ -533,34 +513,17 @@ def main():
             eval_loss=eval_loss,
             eval_ade=eval_ade,
             eval_fde=eval_fde,
-            lr=current_lr,
+            eval_rmse=eval_rmse,
         )
-
-        writer.add_scalar("Train/Loss", avg_loss, epoch + 1)
-        writer.add_scalar("Train/Loss_vel", train_stats["loss_vel"], epoch + 1)
-        writer.add_scalar("Train/Loss_vel_x", train_stats["loss_vel_x"], epoch + 1)
-        writer.add_scalar("Train/Loss_vel_y", train_stats["loss_vel_y"], epoch + 1)
-        writer.add_scalar("Train/Loss_pos", train_stats["loss_pos"], epoch + 1)
-        writer.add_scalar("Train/Loss_pos_x", train_stats["loss_pos_x"], epoch + 1)
-        writer.add_scalar("Train/Loss_pos_y", train_stats["loss_pos_y"], epoch + 1)
-        writer.add_scalar("Train/Loss_end", train_stats["loss_end"], epoch + 1)
-        writer.add_scalar("Train/Loss_intent", train_stats["loss_intent"], epoch + 1)
-        writer.add_scalar("Train/Loss_end_over_pos", end_over_pos, epoch + 1)
-        writer.add_scalar("Train/Loss_intent_over_vel", intent_over_vel, epoch + 1)
-        writer.add_scalar("Eval/Loss", eval_loss, epoch + 1)
-        writer.add_scalar("Eval/ADE_ft", eval_ade, epoch + 1)
-        writer.add_scalar("Eval/FDE_ft", eval_fde, epoch + 1)
-        writer.add_scalar("Eval/ADE_m", eval_ade * 0.3048, epoch + 1)
-        writer.add_scalar("Eval/FDE_m", eval_fde * 0.3048, epoch + 1)
-        for label, idx in TIME_STEP_LABELS:
-            if idx < quick_eval["rmse_per_step_ft"].numel():
-                writer.add_scalar(f"EvalQuick/RMSE_ft_{label}", quick_eval["rmse_per_step_ft"][idx].item(), epoch + 1)
-                writer.add_scalar(f"EvalQuick/FDE_ft_{label}", quick_eval["fde_per_step_ft"][idx].item(), epoch + 1)
-                writer.add_scalar(f"EvalQuick/ADE_ft_{label}", quick_eval["ade_prefix_ft"][idx].item(), epoch + 1)
-        if train_peak_mem_mb is not None and eval_ema_peak_mem_mb is not None:
-            writer.add_scalar("Resource/PeakMemTrain_MB", train_peak_mem_mb, epoch + 1)
-            writer.add_scalar("Resource/PeakMemEvalEMA_MB", eval_ema_peak_mem_mb, epoch + 1)
-        writer.add_scalar("Train/LR", current_lr, epoch + 1)
+        print_epoch_eval_summary(
+            epoch=epoch + 1,
+            train_stats=train_stats,
+            eval_ratio=eval_ratio,
+            eval_loss=eval_loss,
+            eval_ade=eval_ade,
+            eval_fde=eval_fde,
+            eval_rmse=eval_rmse,
+        )
 
         scheduler.step()
 
@@ -578,6 +541,7 @@ def main():
             "eval_loss": eval_loss,
             "eval_ade": eval_ade,
             "eval_fde": eval_fde,
+            "eval_rmse": eval_rmse,
             "best_ade": best_ade,
         }
 
@@ -588,7 +552,30 @@ def main():
             state["best_ade"] = best_ade
             torch.save(state, Path(args.checkpoint_dir) / "checkpoint_best.pth")
 
-    writer.close()
+    # 训练结束后输出一次最终评估汇总
+    if last_eval is None:
+        ema.swap_shadow(model)
+        last_eval = evaluate_on_testset(
+            model,
+            test_loader,
+            device,
+            args.num_epochs,
+            args.feature_dim,
+            eval_ratio=eval_ratio,
+            max_batches=args.eval_max_batches,
+        )
+        ema.swap_shadow(model)
+
+    final_loss, final_ade, final_fde, final_quick = last_eval
+    print("\n========== Final Eval (EMA, Single-Modal, TestSet@0.03) ==========")
+    print(
+        f"Avg ADE: {final_ade:.6f} ft ({final_ade * 0.3048:.6f} m) | "
+        f"Avg FDE: {final_fde:.6f} ft ({final_fde * 0.3048:.6f} m) | "
+        f"Avg RMSE: {final_quick['overall_rmse_ft']:.6f} ft ({final_quick['overall_rmse_m']:.6f} m)"
+    )
+    print(f"RMSE per-second: {format_timestep_metrics(final_quick['rmse_per_step_ft'])}")
+    print(f"FDE per-second:  {format_timestep_metrics(final_quick['fde_per_step_ft'])}")
+    print(f"ADE per-second:  {format_timestep_metrics(final_quick['ade_prefix_ft'])}")
 
 
 if __name__ == "__main__":

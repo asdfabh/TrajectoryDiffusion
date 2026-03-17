@@ -41,7 +41,7 @@ class HistEncoder(nn.Module):
         if int(args.feature_dim) != 4:
             raise ValueError(
                 "HistEncoder in unified future branch expects feature_dim=4: "
-                "[rel_x, rel_y, delta_x, delta_y]"
+                "[rel_x, rel_y, v, a]"
             )
         self.model_dim = int(args.encoder_input_dim)
         self.hidden_dim = int(getattr(args, "hidden_dim_fut", self.model_dim * 2))
@@ -221,8 +221,7 @@ class HistEncoder(nn.Module):
         )[0]
         intent_tokens = self.intent_cls_norm(intent_tokens + intent_query)
         z_motion, z_maneuver = intent_tokens[:, 0, :], intent_tokens[:, 1, :]
-        z_intent = self.intent_fusion(torch.cat((z_motion, z_maneuver), dim=-1))
+        z_global = self.intent_fusion(torch.cat((z_motion, z_maneuver), dim=-1))
 
-        return memory_tokens, z_intent, memory_mask
-
+        return memory_tokens, z_global, memory_mask
 

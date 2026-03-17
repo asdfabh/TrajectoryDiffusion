@@ -2,6 +2,7 @@ import sys
 import os
 import torch
 import math
+import inspect
 from torch.utils.data import DataLoader
 from pathlib import Path
 from tqdm import tqdm
@@ -22,40 +23,21 @@ def prepare_input_data(
     mask_type='random',
     mask_prob=0.4,
     device='cuda',
-    use_unified_fut_hist=False,
 ):
     """数据准备函数，与训练代码保持一致"""
     hist = batch['hist']
     va = batch['va']
-    lane = batch['lane']
-    cclass = batch['cclass']
     fut = batch['fut']
     op_mask = batch['op_mask']
     hist_nbrs = batch['nbrs']
     va_nbrs = batch['nbrs_va']
-    lane_nbrs = batch['nbrs_lane']
-    cclass_nbrs = batch['nbrs_class']
     mask = batch['mask']
     temporal_mask = batch['temporal_mask']
 
-    if use_unified_fut_hist:
-        if int(feature_dim) != 4:
-            raise ValueError("evaluate_fut unified future mode requires feature_dim=4.")
-        # 与 train_fut 统一：future 分支只吃原始位置，统一状态在模型内构建。
-        hist = hist.to(device)
-        hist_nbrs = hist_nbrs.to(device)
-    elif feature_dim == 6:
-        hist = torch.cat((hist, va, lane, cclass), dim=-1).to(device)
-        hist_nbrs = torch.cat((hist_nbrs, va_nbrs, lane_nbrs, cclass_nbrs), dim=-1).to(device)
-    elif feature_dim == 5:
-        hist = torch.cat((hist, va, lane), dim=-1).to(device)
-        hist_nbrs = torch.cat((hist_nbrs, va_nbrs, lane_nbrs), dim=-1).to(device)
-    elif feature_dim == 4:
-        hist = torch.cat((hist, va), dim=-1).to(device)
-        hist_nbrs = torch.cat((hist_nbrs, va_nbrs), dim=-1).to(device)
-    else:
-        hist = hist.to(device)
-        hist_nbrs = hist_nbrs.to(device)
+    if int(feature_dim) != 4:
+        raise ValueError("evaluate_fut currently supports feature_dim=4: [rel_x, rel_y, v, a].")
+    hist = torch.cat((hist, va), dim=-1).to(device)
+    hist_nbrs = torch.cat((hist_nbrs, va_nbrs), dim=-1).to(device)
     fut = fut.to(device)
     op_mask = op_mask.to(device)
 
@@ -74,6 +56,23 @@ def prepare_input_data(
     temporal_mask = temporal_mask.to(device)
 
     return hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask
+
+
+def build_ngsim_dataset(mat_path, args):
+    # 兼容不同 NgsimDataset 版本，按签名过滤参数。
+    dataset_kwargs = {
+        "t_h": 30,
+        "t_f": 50,
+        "d_s": 2,
+        "enc_size": args.encoder_input_dim,
+        "feature_dim": args.feature_dim,
+    }
+    sig = inspect.signature(NgsimDataset.__init__)
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    if has_var_kw:
+        return NgsimDataset(mat_path, **dataset_kwargs)
+    filtered = {k: v for k, v in dataset_kwargs.items() if k in sig.parameters}
+    return NgsimDataset(mat_path, **filtered)
 
 
 class MetricsCalculator:
@@ -224,14 +223,7 @@ def get_test_loader(args):
 
     print(f"Loading test data from: {test_path}")
 
-    test_dataset = NgsimDataset(
-        test_path,
-        t_h=30,
-        t_f=50,
-        d_s=2,
-        enc_size=args.encoder_input_dim,
-        feature_dim=args.feature_dim
-    )
+    test_dataset = build_ngsim_dataset(test_path, args)
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
@@ -409,7 +401,6 @@ def run_evaluation(args, device):
                 mask_type='random',
                 mask_prob=args.mask_prob,
                 device=device,
-                use_unified_fut_hist=(args.eval_mode == 'fut_only'),
             )
 
             current_hist_input = hist

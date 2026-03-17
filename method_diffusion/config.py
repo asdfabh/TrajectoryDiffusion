@@ -77,11 +77,9 @@ def get_args_parser():
     parser.add_argument("--self_condition_prob", default=0.5, type=float)
 
     # Fut loss
-    parser.add_argument("--fut_y_loss_weight", default=1.0, type=float)
     parser.add_argument("--fut_huber_delta", default=1.0, type=float)
     parser.add_argument("--fut_pos_loss_weight", default=0.5, type=float)
     parser.add_argument("--fut_end_loss_weight", default=0.5, type=float)
-    parser.add_argument("--fut_intent_loss_weight", default=0.2, type=float)
 
     # Hist context memory
     parser.add_argument("--hist_memory_topk", default=4, type=int)

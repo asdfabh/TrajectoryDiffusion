@@ -15,8 +15,8 @@ class DiffusionFut(nn.Module):
         self.args = args
         if int(args.feature_dim) != 4:
             raise ValueError(
-                "Current unified future branch requires feature_dim=4: "
-                "[rel_x, rel_y, delta_x, delta_y]"
+                "Current future branch requires feature_dim=4: "
+                "[rel_x, rel_y, v, a]"
             )
 
         self.hidden_dim = int(args.hidden_dim_fut)
@@ -50,19 +50,9 @@ class DiffusionFut(nn.Module):
                 f"HistEncoder hidden_dim must match hidden_dim_fut, got {getattr(self.hist_encoder, 'hidden_dim', None)} vs {self.hidden_dim}"
             )
         self.cond_projs = nn.ModuleList([nn.Linear(self.hidden_dim, self.hidden_dim) for _ in range(self.depth)])
-        self.intent_endpoint_head = nn.Sequential(
-            nn.LayerNorm(self.hidden_dim),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim, self.output_dim),
-        )
         for proj in self.cond_projs:
             nn.init.xavier_uniform_(proj.weight)
             nn.init.constant_(proj.bias, 0)
-        for m in self.intent_endpoint_head:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.constant_(m.bias, 0)
 
         self.timestep_embedder = dit.TimestepEmbedder(self.hidden_dim, self.time_embedding_size)
         self.diffusion_scheduler = DDIMScheduler(
@@ -76,28 +66,19 @@ class DiffusionFut(nn.Module):
         final_layer = dit.FinalLayer(self.hidden_dim, self.T, self.output_dim)
         self.dit = dit.DiT(dit_block=dit_block, final_layer=final_layer, depth=self.depth, model_type="x_start")
 
-        # ================= 双空间归一化参数 =================
-        # 保留坐标归一化参数 (给历史轨迹编码和宏观位置 Loss 使用)
-        self.register_buffer("pos_mean", torch.tensor([0.0330, -15.9150]).float(), persistent=False)
-        self.register_buffer("pos_std", torch.tensor([8.8866, 68.8105]).float(), persistent=False)
-        self.register_buffer("va_mean", torch.tensor([21.1503, 0.0060]).float(), persistent=False)
-        self.register_buffer("va_std", torch.tensor([13.5983, 4.5057]).float(), persistent=False)
-        # unified history 使用 anchor-relative 位置，均值按 0 处理。
-        # std 先沿用位置尺度，后续可按新分布重统计。
-        self.register_buffer("rel_pos_mean", torch.zeros(2, dtype=torch.float32), persistent=False)
-        self.register_buffer("rel_pos_std", torch.tensor([8.8866, 68.8105], dtype=torch.float32), persistent=False)
+        # history encoder 输入归一化：[rel_x, rel_y, v, a]
+        self.register_buffer("hist_pos_mean", torch.tensor([0.05130798, -35.39044909], dtype=torch.float32), persistent=False)
+        self.register_buffer("hist_pos_std", torch.tensor([9.63184438, 60.19290744], dtype=torch.float32), persistent=False)
+        self.register_buffer("hist_va_mean", torch.tensor([23.92449619, 0.04203195], dtype=torch.float32), persistent=False)
+        self.register_buffer("hist_va_std", torch.tensor([13.34587118, 4.61229342], dtype=torch.float32), persistent=False)
 
-        # 针对帧间相对位移 (Velocity) 的归一化参数
-        vel_mean = torch.tensor([-0.004182, 5.041937], dtype=torch.float32)
-        vel_std = torch.tensor([0.150222, 2.951254], dtype=torch.float32)
+        # future diffusion 输出目标归一化：[delta_x, delta_y]
+        self.register_buffer("fut_delta_mean", torch.tensor([-0.00407632, 5.53086274], dtype=torch.float32), persistent=False)
+        self.register_buffer("fut_delta_std", torch.tensor([0.15694872, 2.88311335], dtype=torch.float32), persistent=False)
 
-        self.register_buffer("vel_mean", vel_mean, persistent=False)
-        self.register_buffer("vel_std", vel_std, persistent=False)
-
-        self.loss_w_vel = max(0.0, float(args.fut_y_loss_weight))
+        self.loss_w_vel = 1.0
         self.loss_w_pos = max(0.0, float(args.fut_pos_loss_weight))
         self.loss_w_end = max(0.0, float(getattr(args, "fut_end_loss_weight", 0.5)))
-        self.loss_w_intent = max(0.0, float(getattr(args, "fut_intent_loss_weight", 0.2)))
 
     def computeLoss(
         self,
@@ -106,17 +87,16 @@ class DiffusionFut(nn.Module):
         future_phys,
         anchor_phys,
         valid_mask,
-        pred_intent_disp=None,
         return_components=False,
     ):
-        # 统一损失：L_vel + lambda_pos * L_pos + lambda_end * L_end + lambda_intent * L_intent
+        # 统一损失：L_vel + lambda_pos * L_pos + lambda_end * L_end
         if pred_vel_norm.size(-1) != 2 or target_vel_norm.size(-1) != 2:
             raise ValueError(f"computeLoss currently expects dim=2, got pred={pred_vel_norm.size(-1)}, target={target_vel_norm.size(-1)}")
 
         loss_vel = F.smooth_l1_loss(pred_vel_norm, target_vel_norm, reduction="none", beta=self.huber_delta)
 
-        std_vel = self.vel_std.view(1, 1, 2).to(pred_vel_norm.device)
-        mean_vel = self.vel_mean.view(1, 1, 2).to(pred_vel_norm.device)
+        std_vel = self.fut_delta_std.view(1, 1, 2).to(pred_vel_norm.device)
+        mean_vel = self.fut_delta_mean.view(1, 1, 2).to(pred_vel_norm.device)
         pred_vel_phys = pred_vel_norm * std_vel + mean_vel
         pred_pos_phys = torch.cumsum(pred_vel_phys, dim=1) + anchor_phys[..., :2]
         gt_pos_phys = future_phys[..., :2]
@@ -127,20 +107,12 @@ class DiffusionFut(nn.Module):
         loss_end_vec = F.smooth_l1_loss(pred_end, gt_end, reduction="none", beta=self.huber_delta)
         loss_end = self.maskedMean1d(loss_end_vec.mean(dim=-1), has_valid.float())
 
-        target_intent_disp = gt_end - anchor_phys[..., :2].squeeze(1)
-        if pred_intent_disp is None:
-            loss_intent = torch.zeros_like(loss_end)
-        else:
-            loss_intent_vec = F.smooth_l1_loss(pred_intent_disp, target_intent_disp, reduction="none", beta=self.huber_delta)
-            loss_intent = self.maskedMean1d(loss_intent_vec.mean(dim=-1), has_valid.float())
-
         loss_vel_mean = self.maskedMean3d(loss_vel, valid_mask)
         loss_pos_mean = self.maskedMean3d(loss_pos, valid_mask)
         loss = (
             self.loss_w_vel * loss_vel_mean
             + self.loss_w_pos * loss_pos_mean
             + self.loss_w_end * loss_end
-            + self.loss_w_intent * loss_intent
         )
         if not return_components:
             return loss
@@ -149,7 +121,6 @@ class DiffusionFut(nn.Module):
             loss_vel=loss_vel,
             loss_pos=loss_pos,
             loss_end=loss_end,
-            loss_intent=loss_intent,
             valid_mask=valid_mask,
             total_loss=loss.detach(),
         )
@@ -161,11 +132,6 @@ class DiffusionFut(nn.Module):
         numer = (loss_tensor * valid).sum(dim=(1, 2))
         denom = valid.sum(dim=(1, 2)) + 1e-6
         return (numer / denom).mean()
-
-    @staticmethod
-    def maskedMean2d(loss_tensor, valid_mask):
-        denom = valid_mask.sum(dim=1) + 1e-6
-        return ((loss_tensor * valid_mask).sum(dim=1) / denom).mean()
 
     @staticmethod
     def maskedMean1d(loss_tensor, valid_mask):
@@ -185,26 +151,16 @@ class DiffusionFut(nn.Module):
         gathered = seq.gather(1, gather_idx).squeeze(1)
         return gathered, has_valid
 
-    def summarizeLossForLog(self, loss_vel, loss_pos, loss_end, loss_intent, valid_mask, total_loss):
-        # 在不参与反传的前提下，分别统计总损失/速度损失/位置损失及分量均值。
+    def summarizeLossForLog(self, loss_vel, loss_pos, loss_end, valid_mask, total_loss):
+        # 在不参与反传的前提下，统计训练日志所需的核心损失项。
         with torch.no_grad():
             loss_vel_det = loss_vel.detach()
             loss_pos_det = loss_pos.detach()
-
-            vel_x_mean = self.maskedMean2d(loss_vel_det[..., 0], valid_mask)
-            vel_y_mean = self.maskedMean2d(loss_vel_det[..., 1], valid_mask)
-            pos_x_mean = self.maskedMean2d(loss_pos_det[..., 0], valid_mask)
-            pos_y_mean = self.maskedMean2d(loss_pos_det[..., 1], valid_mask)
             return {
                 "loss_total": total_loss,
                 "loss_vel": self.maskedMean3d(loss_vel_det, valid_mask),
-                "loss_vel_x": vel_x_mean,
-                "loss_vel_y": vel_y_mean,
                 "loss_pos": self.maskedMean3d(loss_pos_det, valid_mask),
-                "loss_pos_x": pos_x_mean,
-                "loss_pos_y": pos_y_mean,
                 "loss_end": loss_end.detach(),
-                "loss_intent": loss_intent.detach(),
             }
 
     @staticmethod
@@ -220,61 +176,32 @@ class DiffusionFut(nn.Module):
         fde = (final_dist * has_valid.float()).sum() / (has_valid.float().sum() + 1e-6)
         return ade, fde
 
-    def buildUnifiedHistoryState(self, hist, hist_nbrs, temporal_mask):
-        # 输入统一为 [rel_x, rel_y, delta_x, delta_y]
-        # 先对 ego 做 anchor-relative；邻居轨迹按所属 ego 的 anchor 对齐。
-        anchor = hist[:, -1:, :2]
-        hist_pos = hist[..., :2] - anchor
-        hist_prev = torch.cat((hist_pos[:, :1, :], hist_pos[:, :-1, :]), dim=1)
-        hist_delta = hist_pos - hist_prev
-        hist_state = torch.cat((hist_pos, hist_delta), dim=-1)
-
-        nbr_pos = hist_nbrs[..., :2]
-        if nbr_pos.size(0) > 0:
-            temporal_occ = temporal_mask.view(
-                temporal_mask.size(0),
-                temporal_mask.size(1) * temporal_mask.size(2),
-                temporal_mask.size(3),
-            ).any(dim=-1)
-            nbr_owner = temporal_occ.nonzero(as_tuple=False)[:, 0]
-            if nbr_owner.numel() != nbr_pos.size(0):
-                raise RuntimeError(
-                    f"Neighbor count mismatch: owners={nbr_owner.numel()} vs nbr_tokens={nbr_pos.size(0)}"
-                )
-            nbr_anchor = anchor.index_select(0, nbr_owner)
-            nbr_pos = nbr_pos - nbr_anchor
-        nbr_prev = torch.cat((nbr_pos[:, :1, :], nbr_pos[:, :-1, :]), dim=1)
-        nbr_delta = nbr_pos - nbr_prev
-        nbr_state = torch.cat((nbr_pos, nbr_delta), dim=-1)
-        return hist_state, nbr_state
-
-    def normUnifiedState(self, x):
+    def normHistoryInput(self, x):
+        # x: [B, T, 4] or [N_total, T, 4], feature = [rel_x, rel_y, v, a]
         x_norm = x.clone()
-        x_norm[..., 0:2] = (x[..., 0:2] - self.rel_pos_mean) / self.rel_pos_std
-        x_norm[..., 2:4] = (x[..., 2:4] - self.vel_mean) / self.vel_std
+        x_norm[..., 0:2] = (x[..., 0:2] - self.hist_pos_mean) / self.hist_pos_std
+        x_norm[..., 2:4] = (x[..., 2:4] - self.hist_va_mean) / self.hist_va_std
         x_norm = torch.clamp(x_norm, -10.0, 10.0)
         return x_norm
 
     def encodeHistoryCondition(self, hist, hist_nbrs, mask, temporal_mask):
-        hist_state, nbr_state = self.buildUnifiedHistoryState(hist, hist_nbrs, temporal_mask)
-        hist_state_norm = self.normUnifiedState(hist_state)
-        nbr_state_norm = self.normUnifiedState(nbr_state)
-        memory_tokens, z_intent, memory_mask = self.hist_encoder(hist_state_norm, nbr_state_norm, mask, temporal_mask)
-        pred_intent_disp = self.intent_endpoint_head(z_intent)
-        return memory_tokens, z_intent, memory_mask, pred_intent_disp
+        hist_state_norm = self.normHistoryInput(hist)
+        nbr_state_norm = self.normHistoryInput(hist_nbrs)
+        memory_tokens, z_global, memory_mask = self.hist_encoder(hist_state_norm, nbr_state_norm, mask, temporal_mask)
+        return memory_tokens, z_global, memory_mask
 
-    def buildLayerCondition(self, timesteps, z_intent):
+    def buildLayerCondition(self, timesteps, z_global):
         t_emb = self.timestep_embedder(timesteps)
-        return [t_emb + proj(z_intent) for proj in self.cond_projs]
+        return [t_emb + proj(z_global) for proj in self.cond_projs]
 
-    def predictX0(self, x_t, timesteps, memory_tokens, z_intent, memory_mask, pred_x0_cond):
-        # 条件去噪：cross 读 memory token，AdaLN 读 z_intent 的逐层投影。
-        y_layers = self.buildLayerCondition(timesteps, z_intent)
+    def predictX0(self, x_t, timesteps, memory_tokens, z_global, memory_mask, pred_x0_cond):
+        # 条件去噪：cross 读 memory token，AdaLN 读 z_global 的逐层投影。
+        y_layers = self.buildLayerCondition(timesteps, z_global)
         combined_input = torch.cat([x_t, pred_x0_cond], dim=-1)
         input_embedded = self.input_embedding(combined_input) + self.pos_embedding(x_t)
         return self.dit(x=input_embedded, y=y_layers, cross=memory_tokens, cross_attn_mask=memory_mask)
 
-    def rolloutFromXt(self, x_t, memory_tokens, z_intent, memory_mask, infer_scheduler):
+    def rolloutFromXt(self, x_t, memory_tokens, z_global, memory_mask, infer_scheduler):
         # 核心功能：从初始噪声 x_t 出发，按推理调度器逐步去噪，得到最终的归一化速度预测。
         # 实现逻辑：每个时间步先用 predictX0 估计 x0（可选裁剪），再用 scheduler.step 反演到前一状态。
         # 作用：统一 train/eval 采样路径，保证单模态与多模态推理都复用同一去噪过程。
@@ -284,7 +211,7 @@ class DiffusionFut(nn.Module):
             t_scalar = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
             timesteps = torch.full((bsz,), t_scalar, device=x_t.device, dtype=torch.long)
 
-            pred_vel_norm = self.predictX0(x_t, timesteps, memory_tokens, z_intent, memory_mask, pred_vel_cond)
+            pred_vel_norm = self.predictX0(x_t, timesteps, memory_tokens, z_global, memory_mask, pred_vel_cond)
             if self.x0_clip is not None:
                 pred_vel_norm = torch.clamp(pred_vel_norm, -self.x0_clip, self.x0_clip)
 
@@ -332,8 +259,8 @@ class DiffusionFut(nn.Module):
         target_vel_phys = future_phys - shifted_future_phys
 
         # 独立归一化：将物理速度变为完美的正态分布
-        std_vel = self.vel_std.view(1, 1, 2).to(device)
-        mean_vel = self.vel_mean.view(1, 1, 2).to(device)
+        std_vel = self.fut_delta_std.view(1, 1, 2).to(device)
+        mean_vel = self.fut_delta_mean.view(1, 1, 2).to(device)
         target_vel_norm = target_vel_phys.clone()
         target_vel_norm[..., :2] = (target_vel_phys[..., :2] - mean_vel) / std_vel
         target_vel_norm[..., :2] = torch.clamp(target_vel_norm[..., :2], -10.0, 10.0)
@@ -343,7 +270,7 @@ class DiffusionFut(nn.Module):
         timesteps = torch.randint(0, self.num_train_timesteps, (bsz,), device=device).long()
         x_t = self.diffusion_scheduler.add_noise(target_vel_norm, noise, timesteps)
 
-        memory_tokens, z_intent, memory_mask, pred_intent_disp = self.encodeHistoryCondition(
+        memory_tokens, z_global, memory_mask = self.encodeHistoryCondition(
             hist, hist_nbrs, mask, temporal_mask
         )
 
@@ -353,12 +280,12 @@ class DiffusionFut(nn.Module):
             if use_sc.any():
                 with torch.no_grad():
                     prev_pred_vel = self.predictX0(
-                        x_t, timesteps, memory_tokens, z_intent, memory_mask, pred_vel_cond
+                        x_t, timesteps, memory_tokens, z_global, memory_mask, pred_vel_cond
                     )
                 pred_vel_cond = prev_pred_vel.detach() * use_sc
 
         # 网络输出：预测的归一化速度
-        pred_vel_norm_t = self.predictX0(x_t, timesteps, memory_tokens, z_intent, memory_mask, pred_vel_cond)
+        pred_vel_norm_t = self.predictX0(x_t, timesteps, memory_tokens, z_global, memory_mask, pred_vel_cond)
 
         loss, loss_metrics = self.computeLoss(
             pred_vel_norm_t,
@@ -366,7 +293,6 @@ class DiffusionFut(nn.Module):
             future_phys,
             anchor_phys,
             valid_mask,
-            pred_intent_disp=pred_intent_disp,
             return_components=True,
         )
 
@@ -391,7 +317,7 @@ class DiffusionFut(nn.Module):
         anchor_phys = hist[..., -1:, :self.output_dim]
         future_phys = future[..., :self.output_dim]
 
-        memory_tokens, z_intent, memory_mask, pred_intent_disp = self.encodeHistoryCondition(
+        memory_tokens, z_global, memory_mask = self.encodeHistoryCondition(
             hist, hist_nbrs, mask, temporal_mask
         )
 
@@ -400,11 +326,11 @@ class DiffusionFut(nn.Module):
 
         # 推断起点：一团关于速度的纯噪声
         x_t = torch.randn((bsz, t_len, self.output_dim), device=device)
-        pred_vel_norm = self.rolloutFromXt(x_t, memory_tokens, z_intent, memory_mask, infer_scheduler)
+        pred_vel_norm = self.rolloutFromXt(x_t, memory_tokens, z_global, memory_mask, infer_scheduler)
 
         # 积分魔法还原：解归一化 -> 累加 -> 拼接绝对锚点
-        std_vel = self.vel_std.view(1, 1, 2).to(device)
-        mean_vel = self.vel_mean.view(1, 1, 2).to(device)
+        std_vel = self.fut_delta_std.view(1, 1, 2).to(device)
+        mean_vel = self.fut_delta_mean.view(1, 1, 2).to(device)
 
         pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
         pred_pos_phys = torch.cumsum(pred_vel_phys, dim=1) + anchor_phys[..., :2]
@@ -422,7 +348,6 @@ class DiffusionFut(nn.Module):
             future_phys,
             anchor_phys,
             valid_mask,
-            pred_intent_disp=pred_intent_disp,
         )
 
         ade, fde = self.computeAdeFde(pred_phys_abs, future, valid_mask)
@@ -440,17 +365,17 @@ class DiffusionFut(nn.Module):
         anchor_phys = hist[..., -1:, :self.output_dim]
         future_phys = future[..., :self.output_dim]
 
-        memory_tokens, z_intent, memory_mask, _ = self.encodeHistoryCondition(hist, hist_nbrs, mask, temporal_mask)
+        memory_tokens, z_global, memory_mask = self.encodeHistoryCondition(hist, hist_nbrs, mask, temporal_mask)
 
         # 核心提速优化：在 Batch 维度上并行展开 K 倍
         memory_tokens_k = memory_tokens.repeat_interleave(K, dim=0)
-        z_intent_k = z_intent.repeat_interleave(K, dim=0)
+        z_global_k = z_global.repeat_interleave(K, dim=0)
         memory_mask_k = memory_mask.repeat_interleave(K, dim=0)
 
         infer_scheduler = DDIMScheduler.from_config(self.diffusion_scheduler.config, timestep_spacing=self.inference_timestep_spacing)
         infer_scheduler.set_timesteps(self.num_inference_steps)
-        std_vel = self.vel_std.view(1, 1, 2).to(device)
-        mean_vel = self.vel_mean.view(1, 1, 2).to(device)
+        std_vel = self.fut_delta_std.view(1, 1, 2).to(device)
+        mean_vel = self.fut_delta_mean.view(1, 1, 2).to(device)
 
         # 一次性生成 bsz * K 份随机噪声，并行执行完整的去噪过程
         x_t_k = torch.randn((bsz * K, t_len, self.output_dim), device=device)
@@ -461,7 +386,7 @@ class DiffusionFut(nn.Module):
             timesteps_k = torch.full((bsz * K,), t_scalar, device=device, dtype=torch.long)
 
             pred_vel_norm_k = self.predictX0(
-                x_t_k, timesteps_k, memory_tokens_k, z_intent_k, memory_mask_k, pred_vel_cond_k
+                x_t_k, timesteps_k, memory_tokens_k, z_global_k, memory_mask_k, pred_vel_cond_k
             )
             if self.x0_clip is not None:
                 pred_vel_norm_k = torch.clamp(pred_vel_norm_k, -self.x0_clip, self.x0_clip)
@@ -519,18 +444,18 @@ class DiffusionFut(nn.Module):
 
     def norm(self, x):
         x_norm = x.clone()
-        x_norm[..., 0:2] = (x[..., 0:2] - self.pos_mean) / self.pos_std
+        x_norm[..., 0:2] = (x[..., 0:2] - self.hist_pos_mean) / self.hist_pos_std
         x_norm[..., 0:2] = torch.clamp(x_norm[..., 0:2], -10.0, 10.0)
         channels = x_norm.shape[-1]
         if channels >= 4:
-            x_norm[..., 2:4] = (x[..., 2:4] - self.va_mean) / self.va_std
+            x_norm[..., 2:4] = (x[..., 2:4] - self.hist_va_mean) / self.hist_va_std
             x_norm[..., 2:4] = torch.clamp(x_norm[..., 2:4], -10.0, 10.0)
         return x_norm
 
     def denorm(self, x):
         x_denorm = x.clone()
-        x_denorm[..., 0:2] = x[..., 0:2] * self.pos_std + self.pos_mean
+        x_denorm[..., 0:2] = x[..., 0:2] * self.hist_pos_std + self.hist_pos_mean
         channels = x.shape[-1]
         if channels >= 4:
-            x_denorm[..., 2:4] = x[..., 2:4] * self.va_std + self.va_mean
+            x_denorm[..., 2:4] = x[..., 2:4] * self.hist_va_std + self.hist_va_mean
         return x_denorm

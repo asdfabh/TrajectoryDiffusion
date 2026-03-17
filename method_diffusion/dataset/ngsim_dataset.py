@@ -7,7 +7,19 @@ import scipy.io as scp
 # Dataset class for the dataset
 class NgsimDataset(Dataset):
 
-    def __init__(self, mat_file, t_h=30, t_f=50, d_s=2, enc_size=64, grid_size=(13, 3), index_file=None, feature_dim=4):
+    def __init__(
+        self,
+        mat_file,
+        t_h=30,
+        t_f=50,
+        d_s=2,
+        enc_size=64,
+        grid_size=(13, 3),
+        index_file=None,
+        feature_dim=4,
+        stats_mode=False,
+        silent=False,
+    ):
         self.D = scp.loadmat(mat_file)['traj']
         self.T = scp.loadmat(mat_file)['tracks']
         self.t_h = t_h  #
@@ -16,12 +28,16 @@ class NgsimDataset(Dataset):
         self.enc_size = enc_size  # size of the grid cell
         self.feature_dim = int(feature_dim)
         self.grid_size = grid_size  # size of social context grid
+        self.stats_mode = bool(stats_mode)
+        self.silent = bool(silent)
         self.alltime = 0
         if index_file is not None:
-            print(f'loading best index, path = {index_file}')
+            if not self.silent:
+                print(f"Loading best index file: {index_file}")
             self.best_indices = np.load(index_file) if index_file else None
         else:
-            print('unfind best index, Use None')
+            if not self.silent:
+                print("No best index file provided. Falling back to default target_idx=0.")
             self.best_indices = None
         # self.count = 0
 
@@ -46,25 +62,34 @@ class NgsimDataset(Dataset):
         refdistance = refdistance.reshape(len(refdistance), 1)
         fut = self.getFuture(vehId, t, dsId)
         va = self.getVA(vehId, t, vehId, dsId)
-        lane = self.getLane(vehId, t, vehId, dsId)
-        cclass = self.getClass(vehId, t, vehId, dsId)
+        if self.stats_mode:
+            lane = np.empty([0, 1])
+            cclass = np.empty([0, 1])
+        else:
+            lane = self.getLane(vehId, t, vehId, dsId)
+            cclass = self.getClass(vehId, t, vehId, dsId)
 
         # Get track histories of all neighbours 'neighbors' = [ndarray,[],ndarray,ndarray]
         for i in grid:
             nbrsdis = self.getHistory(i.astype(int), t, vehId, dsId)
-            if nbrsdis.shape != (0, 2):
-                uu = np.power(hist - nbrsdis, 2)
-                distancexxx = np.sqrt(uu[:, 0] + uu[:, 1])
-                distancexxx = distancexxx.reshape(len(distancexxx), 1)
-            else:
-                distancexxx = np.empty([0, 1])
             neighbors.append(nbrsdis)
             neighborsva.append(self.getVA(i.astype(int), t, vehId, dsId))
-            neighborslane.append(self.getLane(
-                i.astype(int), t, vehId, dsId).reshape(-1, 1))
-            neighborsclass.append(self.getClass(
-                i.astype(int), t, vehId, dsId).reshape(-1, 1))
-            neighborsdistance.append(distancexxx)
+            if self.stats_mode:
+                neighborslane.append(np.empty([0, 1]))
+                neighborsclass.append(np.empty([0, 1]))
+                neighborsdistance.append(np.empty([0, 1]))
+            else:
+                if nbrsdis.shape != (0, 2):
+                    uu = np.power(hist - nbrsdis, 2)
+                    distancexxx = np.sqrt(uu[:, 0] + uu[:, 1])
+                    distancexxx = distancexxx.reshape(len(distancexxx), 1)
+                else:
+                    distancexxx = np.empty([0, 1])
+                neighborslane.append(self.getLane(
+                    i.astype(int), t, vehId, dsId).reshape(-1, 1))
+                neighborsclass.append(self.getClass(
+                    i.astype(int), t, vehId, dsId).reshape(-1, 1))
+                neighborsdistance.append(distancexxx)
         lon_enc = np.zeros([3])
         lon_enc[int(self.D[idx, 10] - 1)] = 1
         lat_enc = np.zeros([3])
