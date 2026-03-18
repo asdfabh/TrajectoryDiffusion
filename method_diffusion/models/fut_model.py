@@ -132,7 +132,6 @@ class DiffusionFut(nn.Module):
         default = {
             "ego_lane": torch.zeros(batch_size, hist_len, 1, device=device, dtype=hist.dtype),
             "nbr_lane": torch.zeros(nbr_total, hist_len, 1, device=device, dtype=hist.dtype),
-            "nbr_dist": torch.zeros(nbr_total, hist_len, 1, device=device, dtype=hist.dtype),
             "lat_gt": None,
             "lon_gt": None,
         }
@@ -182,19 +181,35 @@ class DiffusionFut(nn.Module):
         target_vel_norm[..., :2] = torch.clamp(target_vel_norm[..., :2], -10.0, 10.0)
         return target_vel_norm, target_vel_phys
 
-    def buildIntentCondition(self, lat_logits, lon_logits):
-        """构造训练阶段使用的连续意图条件。
+    def buildIntentCondition(self, lat_logits, lon_logits, lat_gt=None, lon_gt=None, epoch=None, training=False):
+        """构造训练或推理阶段使用的离散意图条件。
 
         Args:
             lat_logits: 横向意图 logits。
             lon_logits: 纵向意图 logits。
+            lat_gt: 可选横向真实标签。
+            lon_gt: 可选纵向真实标签。
+            epoch: 当前训练轮次。
+            training: 是否处于训练阶段。
 
         Returns:
-            注入 DiT AdaLN 的连续条件向量。
+            注入 DiT AdaLN 的离散意图条件向量。
         """
-        lat_prob = torch.softmax(lat_logits, dim=-1)
-        lon_prob = torch.softmax(lon_logits, dim=-1)
-        return self.intent_fuse(lat_prob @ self.lat_emb.weight + lon_prob @ self.lon_emb.weight)
+        if training and lat_gt is not None and lon_gt is not None:
+            tf_epochs = int(getattr(self.args, "intent_teacher_forcing_epochs", 10))
+            if tf_epochs <= 0:
+                use_gt = torch.zeros(lat_logits.size(0), dtype=torch.bool, device=lat_logits.device)
+            else:
+                p_gt = max(0.0, 1.0 - float(epoch or 1) / float(tf_epochs))
+                use_gt = torch.rand(lat_logits.size(0), device=lat_logits.device) < p_gt
+            lat_pred = lat_logits.argmax(dim=-1)
+            lon_pred = lon_logits.argmax(dim=-1)
+            lat_idx = torch.where(use_gt, lat_gt, lat_pred)
+            lon_idx = torch.where(use_gt, lon_gt, lon_pred)
+        else:
+            lat_idx = lat_logits.argmax(dim=-1)
+            lon_idx = lon_logits.argmax(dim=-1)
+        return self.intent_fuse(self.lat_emb(lat_idx) + self.lon_emb(lon_idx))
 
     def computeLoss(
         self,
@@ -361,13 +376,14 @@ class DiffusionFut(nn.Module):
         x_norm = torch.clamp(x_norm, -10.0, 10.0)
         return x_norm
 
-    def encodeHistoryCondition(self, hist, hist_nbrs, mask, extras):
+    def encodeHistoryCondition(self, hist, hist_nbrs, mask, temporal_mask, extras):
         """编码历史交互上下文并输出显式意图 logits。
 
         Args:
             hist: ego 历史状态。
             hist_nbrs: 邻车历史状态。
             mask: 邻车存在性掩码。
+            temporal_mask: temporal 分支使用的邻车掩码。
             extras: 车道、距离和监督标签字典。
 
         Returns:
@@ -383,9 +399,9 @@ class DiffusionFut(nn.Module):
             hist_state_norm,
             nbr_state_norm,
             mask,
+            temporal_mask,
             extras["ego_lane"],
             extras["nbr_lane"],
-            extras["nbr_dist"],
             ego_state_raw=hist,
             nbr_state_raw=hist_nbrs,
         )
@@ -505,14 +521,13 @@ class DiffusionFut(nn.Module):
             op_mask: 未来有效位掩码。
             extras: 车道、距离与意图标签字典。
             device: 目标设备。
-            epoch: 保留的兼容参数，当前不参与逻辑。
+            epoch: 当前训练轮次，用于意图 teacher forcing 调度。
             return_components: 是否返回日志分量。
 
         Returns:
             当 `return_components=False` 时返回总损失；
             否则返回 `(loss, loss_metrics)`。
         """
-        del epoch
         extras, device = self.resolveForwardInputs(hist, hist_nbrs, extras, device)
         batch_size = future.shape[0]
         valid_mask = (op_mask[..., 0] > 0).float()
@@ -528,9 +543,17 @@ class DiffusionFut(nn.Module):
             hist,
             hist_nbrs,
             mask,
+            temporal_mask,
             extras,
         )
-        intent_cond = self.buildIntentCondition(lat_logits, lon_logits)
+        intent_cond = self.buildIntentCondition(
+            lat_logits,
+            lon_logits,
+            lat_gt=extras.get("lat_gt"),
+            lon_gt=extras.get("lon_gt"),
+            epoch=epoch,
+            training=True,
+        )
 
         pred_vel_cond = torch.zeros_like(x_t)
         if self.self_condition_prob > 0.0:
@@ -613,30 +636,21 @@ class DiffusionFut(nn.Module):
             hist,
             hist_nbrs,
             mask,
+            temporal_mask,
             extras,
         )
-        lat_prob = torch.softmax(lat_logits, dim=-1)
-        lon_prob = torch.softmax(lon_logits, dim=-1)
-        flat_joint = (lat_prob.unsqueeze(-1) * lon_prob.unsqueeze(-2)).reshape(lat_prob.size(0), -1)
-        k_eff = min(max(1, int(K)), flat_joint.size(-1))
-        topk_prob, topk_idx = torch.topk(flat_joint, k=k_eff, dim=-1)
-        lon_classes = lon_prob.size(-1)
-        lat_idx = topk_idx // lon_classes
-        lon_idx = topk_idx % lon_classes
-        k_eff = lat_idx.size(1)
-
-        memory_tokens_k = memory_tokens.repeat_interleave(k_eff, dim=0)
-        memory_mask_k = memory_mask.repeat_interleave(k_eff, dim=0)
-        intent_cond_k = self.intent_fuse(self.lat_emb(lat_idx.reshape(-1)) + self.lon_emb(lon_idx.reshape(-1)))
+        intent_cond = self.buildIntentCondition(lat_logits, lon_logits, training=False)
         infer_scheduler = DDIMScheduler.from_config(
             self.diffusion_scheduler.config,
             timestep_spacing=self.inference_timestep_spacing,
         )
         infer_scheduler.set_timesteps(self.num_inference_steps)
-        x_t_k = torch.randn((batch_size * k_eff, t_len, self.output_dim), device=device)
-        pred_vel_norm_k = self.rolloutFromXt(x_t_k, memory_tokens_k, intent_cond_k, memory_mask_k, infer_scheduler)
-
-        pred_vel_norm = pred_vel_norm_k.view(batch_size, k_eff, t_len, self.output_dim)
+        k_eff = max(1, int(K))
+        pred_vel_norm_list = []
+        for _ in range(k_eff):
+            x_t = torch.randn((batch_size, t_len, self.output_dim), device=device)
+            pred_vel_norm_list.append(self.rolloutFromXt(x_t, memory_tokens, intent_cond, memory_mask, infer_scheduler))
+        pred_vel_norm = torch.stack(pred_vel_norm_list, dim=1)
         std_vel = self.fut_delta_std.view(1, 1, 1, 2).to(device)
         mean_vel = self.fut_delta_mean.view(1, 1, 1, 2).to(device)
         pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
@@ -668,8 +682,8 @@ class DiffusionFut(nn.Module):
 
         self.last_minade_all_preds = all_preds.detach()
         self.last_minade_best_idx = best_k_idx.detach()
-        self.last_minade_intent_pairs = torch.stack((lat_idx, lon_idx), dim=-1).detach()
-        self.last_minade_intent_prob = topk_prob.detach()
+        self.last_minade_intent_pairs = None
+        self.last_minade_intent_prob = None
 
         ade_batch, fde_batch = self.computeAdeFde(best_pred_phys, future, valid_mask)
         self.maybeVisualize(

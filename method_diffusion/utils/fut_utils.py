@@ -51,7 +51,6 @@ def prepare_fut_batch(batch, feature_dim, device="cuda", include_hist_mask=False
         "extras": {
             "ego_lane": batch["lane"].to(device),
             "nbr_lane": batch["nbrs_lane"].to(device),
-            "nbr_dist": batch["nbrs_distance"].to(device),
             "lat_gt": batch["lat_enc"].argmax(dim=-1).long().to(device),
             "lon_gt": batch["lon_enc"].argmax(dim=-1).long().to(device),
         },

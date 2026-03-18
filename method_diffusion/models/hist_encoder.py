@@ -7,7 +7,7 @@ from method_diffusion.models.transformer import TransformerEncoder, TransformerE
 
 
 class PositionalEncodingSine(nn.Module):
-    """为 ego 历史轨迹构造二维正弦位置编码。"""
+    """为 ego / 邻车历史轨迹构造二维正弦位置编码。"""
 
     def __init__(self, num_pos_feats=128, temperature=10000):
         """初始化位置编码超参数。
@@ -40,71 +40,65 @@ class PositionalEncodingSine(nn.Module):
         pos_y = torch.stack((pos_y[:, :, 0::2].sin(), pos_y[:, :, 1::2].cos()), dim=3).flatten(2)
         return torch.cat((pos_y, pos_x), dim=2)
 
+
 class HistEncoder(nn.Module):
-    """将 ego 历史和关键邻车编码为 memory token 与显式意图预测。"""
+    """TAME-style 历史交互编码器，输出 fused ego tokens 与显式意图 logits。"""
 
     def __init__(self, args):
-        """构建 ego 编码器、邻车筛选器和意图分类头。
+        """构建 temporal / social 双分支和显式意图头。
 
         Args:
-            args: 模型配置对象，包含历史长度、隐藏维度、TopK 等超参数。
+            args: 模型配置对象，包含历史长度、编码维度与注意力头数等超参数。
         """
         super(HistEncoder, self).__init__()
-        self.args = args
         if int(args.feature_dim) != 4:
-            raise ValueError(
-                "HistEncoder in unified future branch expects feature_dim=4: [rel_x, rel_y, v, a]"
-            )
+            raise ValueError("HistEncoder expects feature_dim=4: [rel_x, rel_y, v, a]")
 
         self.model_dim = int(args.encoder_input_dim)
         self.hidden_dim = int(getattr(args, "hidden_dim_fut", self.model_dim * 2))
         self.hist_length = int(getattr(args, "T", 16))
-        self.interaction_topk = max(
-            0,
-            int(getattr(args, "interaction_topk", 6)),
-        )
-        self.interaction_dist_thresh = max(1.0, float(getattr(args, "interaction_dist_thresh", 120.0)))
-        self.lane_emb_dim = max(1, int(getattr(args, "lane_emb_dim", 8)))
         self.max_lane_index = 8
+        self.use_relative_lane_delta = int(getattr(args, "use_relative_lane_delta", 1)) > 0
 
-        self.ego_input_embedding = nn.Linear(args.feature_dim, self.model_dim)
+        self.ego_input_embedding = nn.Linear(4, self.model_dim)
+        self.nbr_input_embedding = nn.Linear(4, self.model_dim)
+        self.ego_lane_embedding = nn.Embedding(self.max_lane_index, self.model_dim)
+        self.lane_delta_embedding = nn.Embedding(self.max_lane_index * 2 + 1, self.model_dim)
+
         # 原 `build_position_encoding(args)` 的核心功能：
-        # 按 `encoder_input_dim // 2` 构造 ego 历史轨迹使用的二维正弦位置编码。
+        # 按 `encoder_input_dim // 2` 构造二维正弦位置编码。
         self.position_encoding = PositionalEncodingSine(args.encoder_input_dim // 2, temperature=10000)
+
         encoder_layer = TransformerEncoderLayer(
-            args.encoder_input_dim,
+            self.model_dim,
             args.nheads,
             dim_feedforward=args.dim_feedforward,
             dropout=0.1,
             activation=args.activation,
         )
         self.ego_encoder = TransformerEncoder(encoder_layer=encoder_layer, num_layers=args.enc_layers)
-        self.ego_lane_embedding = nn.Embedding(self.max_lane_index, self.lane_emb_dim)
-        self.ego_meta_proj = nn.Sequential(
-            nn.LayerNorm(self.lane_emb_dim),
-            nn.Linear(self.lane_emb_dim, self.model_dim),
-            nn.GELU(approximate="tanh"),
-        )
-        self.ego_to_hidden = nn.Sequential(
-            nn.LayerNorm(self.model_dim),
-            nn.Linear(self.model_dim, self.hidden_dim),
-            nn.GELU(approximate="tanh"),
-        )
+        self.nbr_encoder = TransformerEncoder(encoder_layer=encoder_layer, num_layers=args.enc_layers)
 
-        relation_heads = max(1, int(getattr(args, "heads_fut", 4)))
-        if self.hidden_dim % relation_heads != 0:
-            relation_heads = 1
-        self.relation_mlp = nn.Sequential(
-            nn.LayerNorm(9),
-            nn.Linear(9, self.hidden_dim),
-            nn.SiLU(),
+        self.temporal_q = nn.Linear(self.model_dim, self.model_dim)
+        self.temporal_k = nn.Linear(self.model_dim, self.model_dim)
+        self.temporal_v = nn.Linear(self.model_dim, self.model_dim)
+        self.social_q = nn.Linear(self.model_dim, self.model_dim)
+        self.social_k = nn.Linear(self.model_dim, self.model_dim)
+        self.social_v = nn.Linear(self.model_dim, self.model_dim)
+
+        self.fusion_mlp = nn.Sequential(
+            nn.LayerNorm(self.model_dim * 3),
+            nn.Linear(self.model_dim * 3, self.hidden_dim),
+            nn.GELU(approximate="tanh"),
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
 
+        intent_heads = max(1, int(getattr(args, "heads_fut", 4)))
+        if self.hidden_dim % intent_heads != 0:
+            intent_heads = 1
         self.lat_cls = nn.Parameter(torch.randn(1, 1, self.hidden_dim) * 0.02)
         self.lon_cls = nn.Parameter(torch.randn(1, 1, self.hidden_dim) * 0.02)
-        self.intent_memory_norm = nn.LayerNorm(self.hidden_dim)
-        self.intent_attn = nn.MultiheadAttention(self.hidden_dim, relation_heads, dropout=0.1, batch_first=True)
+        self.intent_attn = nn.MultiheadAttention(self.hidden_dim, intent_heads, dropout=0.1, batch_first=True)
         self.intent_cls_norm = nn.LayerNorm(self.hidden_dim)
         self.lat_head = nn.Sequential(
             nn.LayerNorm(self.hidden_dim),
@@ -134,7 +128,7 @@ class HistEncoder(nn.Module):
 
     @staticmethod
     def scatterNeighbors(stacked_tensor, social_occ):
-        """按样本内的占位顺序将邻车张量恢复到固定网格布局。
+        """按样本内占位顺序将邻车张量恢复到固定网格布局。
 
         Args:
             stacked_tensor: 按有效邻车顺序堆叠的邻车张量。
@@ -154,191 +148,106 @@ class HistEncoder(nn.Module):
         grid_tensor[social_occ.reshape(-1)] = stacked_tensor
         return grid_tensor.view(batch_size, n_grid, seq_len, feat_dim)
 
-    def selectNeighborIndices(self, social_occ, ego_state_raw, nbr_state_raw_grid, ego_lane, nbr_lane_grid, nbr_dist_grid):
-        """按物理影响分数前置选择 TopK 关键邻车。
-
-        Args:
-            social_occ: 每个样本的邻车存在性布尔矩阵。
-            ego_state_raw: ego 原始历史状态，形状为 `[B, T, 4]`。
-            nbr_state_raw_grid: 恢复到固定网格的邻车原始状态。
-            ego_lane: ego 车道序列。
-            nbr_lane_grid: 恢复到固定网格的邻车车道序列。
-            nbr_dist_grid: 恢复到固定网格的邻车距离序列。
-
-        Returns:
-            一个二元组：
-            - selected_idx: 每个样本选中的邻车索引。
-            - selected_valid: 每个索引位置是否有效。
-        """
-        batch_size, n_grid = social_occ.shape
-        topk = min(self.interaction_topk, n_grid)
-        if topk <= 0:
-            empty_idx = social_occ.new_zeros((batch_size, 0), dtype=torch.long)
-            empty_valid = social_occ.new_zeros((batch_size, 0), dtype=torch.bool)
-            return empty_idx, empty_valid
-
-        ego_last = ego_state_raw[:, -1, :]
-        nbr_last = nbr_state_raw_grid[:, :, -1, :]
-        lane_delta_last = nbr_lane_grid[:, :, -1, 0] - ego_lane[:, None, -1, 0]
-        same_lane = (lane_delta_last.abs() < 0.5).to(ego_state_raw.dtype)
-        adjacent_lane = ((lane_delta_last.abs() - 1.0).abs() < 0.5).to(ego_state_raw.dtype)
-
-        dx_last = (nbr_last[..., 0] - ego_last[:, None, 0]).abs()
-        dy_last = (nbr_last[..., 1] - ego_last[:, None, 1]).abs()
-        dist_last = nbr_dist_grid[:, :, -1, 0]
-        closing_speed = torch.relu(ego_last[:, None, 2] - nbr_last[..., 2])
-
-        inv_dy = 1.0 / (dy_last + 1.0)
-        inv_dist = 1.0 / (dist_last + 1.0)
-        inv_dx = 1.0 / (dx_last + 1.0)
-        score = (
-            1.25 * inv_dy
-            + 0.75 * inv_dist
-            + 0.25 * torch.clamp(closing_speed / 10.0, 0.0, 2.0)
-            + 0.20 * same_lane
-            + 0.10 * adjacent_lane
-            + 0.15 * inv_dx
-        )
-        score = score.masked_fill(~social_occ, float("-inf"))
-
-        close_enough = dist_last <= self.interaction_dist_thresh
-        has_close = (social_occ & close_enough).any(dim=1, keepdim=True)
-        available = social_occ & ((~has_close) | close_enough)
-        topk_score, selected_idx = torch.topk(score.masked_fill(~available, float("-inf")), k=topk, dim=-1)
-        selected_valid = torch.isfinite(topk_score)
-        return selected_idx, selected_valid
-
-    def buildRelationSummaryFeatures(self, ego_state_raw, selected_nbr_state_raw, ego_lane, selected_nbr_lane, selected_nbr_dist):
-        """为每辆邻车提取一个紧凑的关系摘要特征。
-
-        Args:
-            ego_state_raw: ego 原始历史状态。
-            selected_nbr_state_raw: 选中邻车的原始历史状态。
-            ego_lane: ego 车道序列。
-            selected_nbr_lane: 选中邻车的车道序列。
-            selected_nbr_dist: 选中邻车的距离序列。
-
-        Returns:
-            形状为 `[B, K, 9]` 的关系摘要特征张量。
-        """
-        ego_last = ego_state_raw[:, -1, :].unsqueeze(1)
-        nbr_last = selected_nbr_state_raw[:, :, -1, :]
-        lane_delta_last = selected_nbr_lane[:, :, -1, 0] - ego_lane[:, -1, 0].unsqueeze(1)
-        dist_last = selected_nbr_dist[:, :, -1, 0]
-
-        dx_last = nbr_last[..., 0:1] - ego_last[..., 0:1]
-        dy_last = nbr_last[..., 1:2] - ego_last[..., 1:2]
-        dv_last = nbr_last[..., 2:3] - ego_last[..., 2:3]
-        da_last = nbr_last[..., 3:4] - ego_last[..., 3:4]
-        same_lane = (lane_delta_last.abs() < 0.5).to(dx_last.dtype).unsqueeze(-1)
-        adjacent_lane = ((lane_delta_last.abs() - 1.0).abs() < 0.5).to(dx_last.dtype).unsqueeze(-1)
-        closing_speed = torch.clamp((ego_last[..., 2:3] - nbr_last[..., 2:3]) / 10.0, -2.0, 2.0)
-
-        return torch.cat(
-            (
-                torch.clamp(dx_last / 20.0, -10.0, 10.0),
-                torch.clamp(dy_last / 80.0, -10.0, 10.0),
-                torch.clamp(dv_last / 15.0, -10.0, 10.0),
-                torch.clamp(da_last / 5.0, -10.0, 10.0),
-                torch.clamp(dist_last.unsqueeze(-1) / self.interaction_dist_thresh, 0.0, 2.0),
-                torch.clamp(lane_delta_last.unsqueeze(-1) / 2.0, -2.0, 2.0),
-                same_lane,
-                adjacent_lane,
-                closing_speed,
-            ),
-            dim=-1,
-        )
-
     def forward(
         self,
         ego_state_norm,
         nbr_state_norm,
         mask,
+        temporal_mask,
         ego_lane,
         nbr_lane,
-        nbr_dist,
         ego_state_raw=None,
         nbr_state_raw=None,
     ):
-        """输出供 DiT cross-attn 使用的 memory token 与意图 logits。
+        """输出 fused ego memory tokens 与显式意图 logits。
 
         Args:
             ego_state_norm: 标准化后的 ego 历史状态，形状为 `[B, T, 4]`。
-            nbr_state_norm: 标准化后的邻车历史状态。
-            mask: 邻车网格存在性掩码。
-            ego_lane: ego 车道序列。
-            nbr_lane: 邻车车道序列。
-            nbr_dist: 邻车距离序列。
+            nbr_state_norm: 标准化后的邻车历史状态，形状为 `[N_total, T, 4]`。
+            mask: 邻车空间存在性掩码，形状为 `[B, 3, 13, enc_size]`。
+            temporal_mask: 邻车 temporal 分支掩码，形状为 `[B, 3, 13, feature_dim]`。
+            ego_lane: ego 车道序列，形状为 `[B, T, 1]`。
+            nbr_lane: 邻车车道序列，形状为 `[N_total, T, 1]`。
             ego_state_raw: 可选的 ego 原始历史状态。
             nbr_state_raw: 可选的邻车原始历史状态。
 
         Returns:
             一个四元组：
-            - memory_tokens: 提供给 future DiT cross-attn 的上下文 token。
-            - memory_mask: `memory_tokens` 的 padding mask。
-            - lat_logits: 横向意图分类 logits。
-            - lon_logits: 纵向意图分类 logits。
+            - memory_tokens: 形状为 `[B, T, H]` 的 fused ego tokens。
+            - memory_mask: 形状为 `[B, T]` 的 memory mask。
+            - lat_logits: 横向意图 logits。
+            - lon_logits: 纵向意图 logits。
         """
+        del ego_state_raw, nbr_state_raw
 
         batch_size, seq_len, _ = ego_state_norm.shape
         if seq_len > self.hist_length:
             raise ValueError(f"History length {seq_len} exceeds configured hist_length {self.hist_length}")
 
-        ego_tokens = self.ego_encoder(
-            self.ego_input_embedding(ego_state_norm.permute(1, 0, 2).contiguous()),
-            pos=self.position_encoding(ego_state_norm.permute(1, 0, 2).contiguous()),
-        )
-        ego_tokens = ego_tokens.permute(1, 0, 2)
+        ego_embed = self.ego_input_embedding(ego_state_norm)
         ego_lane_idx = self.sanitizeIndex(ego_lane, self.max_lane_index)
-        ego_tokens = ego_tokens + self.ego_meta_proj(self.ego_lane_embedding(ego_lane_idx))
-        ego_hidden = self.ego_to_hidden(ego_tokens)
+        ego_embed = ego_embed + self.ego_lane_embedding(ego_lane_idx)
 
-        social_occ = mask.view(mask.size(0), mask.size(1) * mask.size(2), mask.size(3)).any(dim=-1)
+        ego_src = ego_embed.permute(1, 0, 2).contiguous()
+        ego_pos = self.position_encoding(ego_state_norm.permute(1, 0, 2).contiguous())
+        ego_enc = self.ego_encoder(ego_src, pos=ego_pos).permute(1, 0, 2)
+
+        social_occ = mask.view(batch_size, mask.size(1) * mask.size(2), mask.size(3)).any(dim=-1)
+        temporal_occ = temporal_mask.view(batch_size, temporal_mask.size(1) * temporal_mask.size(2), temporal_mask.size(3)).any(dim=-1)
         n_grid = social_occ.size(1)
-        if ego_state_raw is None:
-            ego_state_raw = ego_state_norm
-        if nbr_state_raw is None:
-            nbr_state_raw = nbr_state_norm
-
         device = ego_state_norm.device
+
         if nbr_state_norm.size(0) > 0:
+            nbr_embed = self.nbr_input_embedding(nbr_state_norm)
+            nbr_src = nbr_embed.permute(1, 0, 2).contiguous()
+            nbr_pos = self.position_encoding(nbr_state_norm.permute(1, 0, 2).contiguous())
+            nbr_enc = self.nbr_encoder(nbr_src, pos=nbr_pos).permute(1, 0, 2)
+
+            nbr_temporal_grid = self.scatterNeighbors(nbr_embed, temporal_occ)
+            nbr_social_grid = self.scatterNeighbors(nbr_enc, social_occ)
             nbr_lane_grid = self.scatterNeighbors(nbr_lane, social_occ)
-            nbr_dist_grid = self.scatterNeighbors(nbr_dist, social_occ)
-            nbr_state_raw_grid = self.scatterNeighbors(nbr_state_raw, social_occ)
+            if temporal_occ.equal(social_occ):
+                nbr_lane_temporal_grid = nbr_lane_grid
+            else:
+                nbr_lane_temporal_grid = self.scatterNeighbors(nbr_lane, temporal_occ)
         else:
+            nbr_temporal_grid = torch.zeros(batch_size, n_grid, seq_len, self.model_dim, device=device, dtype=ego_embed.dtype)
+            nbr_social_grid = torch.zeros(batch_size, n_grid, seq_len, self.model_dim, device=device, dtype=ego_enc.dtype)
             nbr_lane_grid = torch.zeros(batch_size, n_grid, seq_len, 1, device=device, dtype=ego_lane.dtype)
-            nbr_dist_grid = torch.zeros(batch_size, n_grid, seq_len, 1, device=device, dtype=ego_state_norm.dtype)
-            nbr_state_raw_grid = torch.zeros(batch_size, n_grid, seq_len, ego_state_raw.size(-1), device=device, dtype=ego_state_raw.dtype)
+            nbr_lane_temporal_grid = torch.zeros(batch_size, n_grid, seq_len, 1, device=device, dtype=ego_lane.dtype)
 
-        selected_idx, selected_valid = self.selectNeighborIndices(
-            social_occ=social_occ,
-            ego_state_raw=ego_state_raw,
-            nbr_state_raw_grid=nbr_state_raw_grid,
-            ego_lane=ego_lane,
-            nbr_lane_grid=nbr_lane_grid,
-            nbr_dist_grid=nbr_dist_grid,
-        )
+        if self.use_relative_lane_delta:
+            lane_delta_temporal = (nbr_lane_temporal_grid - ego_lane.unsqueeze(1)).squeeze(-1).round().long() + self.max_lane_index
+            lane_delta_temporal = lane_delta_temporal.clamp_(0, self.max_lane_index * 2)
+            lane_delta_social = (nbr_lane_grid - ego_lane.unsqueeze(1)).squeeze(-1).round().long() + self.max_lane_index
+            lane_delta_social = lane_delta_social.clamp_(0, self.max_lane_index * 2)
+            nbr_temporal_grid = nbr_temporal_grid + self.lane_delta_embedding(lane_delta_temporal)
+            nbr_social_grid = nbr_social_grid + self.lane_delta_embedding(lane_delta_social)
 
-        if selected_idx.size(1) > 0:
-            safe_idx = selected_idx.clamp(min=0)
-            batch_index = torch.arange(batch_size, device=device).unsqueeze(1)
-            selected_nbr_state_raw = nbr_state_raw_grid[batch_index, safe_idx]
-            selected_nbr_lane = nbr_lane_grid[batch_index, safe_idx]
-            selected_nbr_dist = nbr_dist_grid[batch_index, safe_idx]
-            relation_feat = self.buildRelationSummaryFeatures(
-                ego_state_raw,
-                selected_nbr_state_raw,
-                ego_lane,
-                selected_nbr_lane,
-                selected_nbr_dist,
-            )
-            relation_tokens = self.relation_mlp(relation_feat) * selected_valid.unsqueeze(-1).to(ego_hidden.dtype)
-            memory_tokens = torch.cat((ego_hidden, relation_tokens), dim=1)
-            ego_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=device)
-            memory_mask = torch.cat((ego_mask, ~selected_valid), dim=1)
-        else:
-            memory_tokens = ego_hidden
-            memory_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=device)
+        temporal_q = self.temporal_q(ego_embed)
+        temporal_k = self.temporal_k(nbr_temporal_grid).permute(0, 2, 1, 3)
+        temporal_v = self.temporal_v(nbr_temporal_grid).permute(0, 2, 1, 3)
+        temporal_scores = (temporal_q.unsqueeze(2) * temporal_k).sum(dim=-1) / math.sqrt(self.model_dim)
+        temporal_valid = temporal_occ.unsqueeze(1).expand(-1, seq_len, -1)
+        temporal_scores = temporal_scores.masked_fill(~temporal_valid, -1e4)
+        temporal_attn = torch.softmax(temporal_scores, dim=-1) * temporal_valid.to(temporal_scores.dtype)
+        temporal_attn = temporal_attn / temporal_attn.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        temporal_ctx = (temporal_attn.unsqueeze(-1) * temporal_v).sum(dim=2)
+
+        social_tokens = nbr_social_grid.reshape(batch_size, n_grid * seq_len, self.model_dim)
+        social_valid = social_occ.unsqueeze(-1).expand(-1, -1, seq_len).reshape(batch_size, n_grid * seq_len)
+        social_q = self.social_q(ego_enc)
+        social_k = self.social_k(social_tokens)
+        social_v = self.social_v(social_tokens)
+        social_scores = torch.matmul(social_q, social_k.transpose(1, 2)) / math.sqrt(self.model_dim)
+        social_scores = social_scores.masked_fill(~social_valid.unsqueeze(1), -1e4)
+        social_attn = torch.softmax(social_scores, dim=-1) * social_valid.unsqueeze(1).to(social_scores.dtype)
+        social_attn = social_attn / social_attn.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        social_ctx = torch.matmul(social_attn, social_v)
+
+        fused = self.fusion_mlp(torch.cat((ego_enc, temporal_ctx, social_ctx), dim=-1))
+        memory_tokens = fused
+        memory_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=device)
 
         intent_query = torch.cat(
             (
@@ -347,11 +256,10 @@ class HistEncoder(nn.Module):
             ),
             dim=1,
         )
-        memory_norm = self.intent_memory_norm(memory_tokens)
         intent_tokens = self.intent_attn(
             query=intent_query,
-            key=memory_norm,
-            value=memory_norm,
+            key=fused,
+            value=fused,
             key_padding_mask=memory_mask,
         )[0]
         intent_tokens = self.intent_cls_norm(intent_tokens + intent_query)
