@@ -55,7 +55,15 @@ def prepare_input_data(
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
 
-    return hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask
+    extras = {
+        "ego_lane": batch["lane"].to(device),
+        "nbr_lane": batch["nbrs_lane"].to(device),
+        "nbr_dist": batch["nbrs_distance"].to(device),
+        "lat_gt": batch["lat_enc"].argmax(dim=-1).long().to(device),
+        "lon_gt": batch["lon_enc"].argmax(dim=-1).long().to(device),
+    }
+
+    return hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask, extras
 
 
 def build_ngsim_dataset(mat_path, args):
@@ -395,7 +403,7 @@ def run_evaluation(args, device):
         for batch_idx, batch in pbar:
             if batch_idx >= target_test_batches:
                 break
-            hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask = prepare_input_data(
+            hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask, extras = prepare_input_data(
                 batch,
                 args.feature_dim,
                 mask_type='random',
@@ -411,7 +419,15 @@ def run_evaluation(args, device):
 
             k_samples = max(1, int(args.num_samples))
             _, pred_fut, _, _ = model_fut.forwardEval_minADE(
-                current_hist_input, hist_nbrs, mask, temporal_mask, fut, op_mask, device, K=k_samples
+                current_hist_input,
+                hist_nbrs,
+                mask,
+                temporal_mask,
+                fut,
+                op_mask,
+                extras,
+                device,
+                K=k_samples,
             )
             calc_fut.update(pred_fut, fut, valid_mask=op_mask)
 

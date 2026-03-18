@@ -78,11 +78,21 @@ def get_args_parser():
 
     # Fut loss
     parser.add_argument("--fut_huber_delta", default=1.0, type=float)
-    parser.add_argument("--fut_pos_loss_weight", default=0.5, type=float)
+    parser.add_argument("--fut_pos_loss_weight", default=0.25, type=float)
     parser.add_argument("--fut_end_loss_weight", default=0.5, type=float)
+    parser.add_argument("--intent_loss_weight_lat", default=0.20, type=float)
+    parser.add_argument("--intent_loss_weight_lon", default=0.20, type=float)
+    parser.add_argument("--intent_teacher_forcing_epochs", default=10, type=int)
+    parser.add_argument("--intent_teacher_forcing_min", default=0.20, type=float)
 
     # Hist context memory
     parser.add_argument("--hist_memory_topk", default=4, type=int)
+    parser.add_argument("--interaction_topk", default=6, type=int)
+    parser.add_argument("--interaction_segments", default=4, type=int)
+    parser.add_argument("--interaction_dist_thresh", default=120.0, type=float)
+    parser.add_argument("--use_structured_topk", default=1, type=int)
+    parser.add_argument("--lane_emb_dim", default=8, type=int)
+    parser.add_argument("--class_emb_dim", default=8, type=int)
 
     # Fut visualization
     parser.add_argument("--fut_enable_train_vis", default=0, type=int)

@@ -15,10 +15,8 @@ class NgsimDataset(Dataset):
         d_s=2,
         enc_size=64,
         grid_size=(13, 3),
-        index_file=None,
         feature_dim=4,
         stats_mode=False,
-        silent=False,
     ):
         self.D = scp.loadmat(mat_file)['traj']
         self.T = scp.loadmat(mat_file)['tracks']
@@ -29,16 +27,7 @@ class NgsimDataset(Dataset):
         self.feature_dim = int(feature_dim)
         self.grid_size = grid_size  # size of social context grid
         self.stats_mode = bool(stats_mode)
-        self.silent = bool(silent)
         self.alltime = 0
-        if index_file is not None:
-            if not self.silent:
-                print(f"Loading best index file: {index_file}")
-            self.best_indices = np.load(index_file) if index_file else None
-        else:
-            if not self.silent:
-                print("No best index file provided. Falling back to default target_idx=0.")
-            self.best_indices = None
         # self.count = 0
 
     def __len__(self):
@@ -96,8 +85,7 @@ class NgsimDataset(Dataset):
         lat_enc[int(self.D[idx, 9] - 1)] = 1
         nbrs_num = np.array(sum(1 for arr in neighbors if arr.size != 0))
 
-        target_idx = self.best_indices[idx] if self.best_indices is not None else 0  # 新增
-        return hist, fut, neighbors, lat_enc, lon_enc, va, neighborsva, lane, neighborslane, refdistance, neighborsdistance, cclass, neighborsclass, nbrs_num, target_idx
+        return hist, fut, neighbors, lat_enc, lon_enc, va, neighborsva, lane, neighborslane, refdistance, neighborsdistance, cclass, neighborsclass, nbrs_num
 
     # Get the lane of the vehicle
     def getLane(self, vehId, t, refVehId, dsId):
@@ -233,7 +221,7 @@ class NgsimDataset(Dataset):
         # ttt = time.time()
         # Initialize neighbors and neighbors length batches:
         nbr_batch_size = 0
-        for _, _, nbrs, _, _, _, _, _, _, _, _, _, _, _, _ in samples:
+        for _, _, nbrs, _, _, _, _, _, _, _, _, _, _, _ in samples:
             temp = sum([len(nbrs[i]) != 0 for i in range(len(nbrs))])
             nbr_batch_size += temp
         maxlen = self.t_h // self.d_s + 1
@@ -242,7 +230,6 @@ class NgsimDataset(Dataset):
         nbrslane_batch = torch.zeros(nbr_batch_size, maxlen, 1)
         nbrsclass_batch = torch.zeros(nbr_batch_size, maxlen, 1)
         nbrsdis_batch = torch.zeros(nbr_batch_size, maxlen, 1)
-        target_idx_batch = torch.LongTensor([s[-1] for s in samples])
 
         # Initialize social mask batch:
         pos = [0, 0]
@@ -269,7 +256,7 @@ class NgsimDataset(Dataset):
         count3 = 0
         count4 = 0
         for sampleId, (hist, fut, nbrs, lat_enc, lon_enc, va, neighborsva, lane, neighborslane, refdistance,
-                        neighborsdistance, cclass, neighborsclass, nbrs_num, _) in enumerate(samples):
+                        neighborsdistance, cclass, neighborsclass, nbrs_num) in enumerate(samples):
 
             # Set up history, future, lateral maneuver and longitudinal maneuver batches:
             hist_batch[sampleId, 0:len(hist), 0] = torch.from_numpy(hist[:, 0])
@@ -347,5 +334,4 @@ class NgsimDataset(Dataset):
             "map_position": map_position,
             "nbrs_num": nbrs_num_batch,
             "temporal_mask": temporal_mask_batch,
-            "target_mode_idx": target_idx_batch,
         }

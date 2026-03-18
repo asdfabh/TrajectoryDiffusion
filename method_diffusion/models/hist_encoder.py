@@ -1,37 +1,33 @@
+import math
+
 import torch
 import torch.nn as nn
-import math
-from torch.nn import functional as F
-from method_diffusion.models.transformer import TransformerEncoder, TransformerDecoder, TransformerEncoderLayer, TransformerDecoderLayer, Residual
-from einops import repeat
 
-from method_diffusion.utils.visualization import visualize_batch_trajectories
+from method_diffusion.models.transformer import TransformerEncoder, TransformerEncoderLayer
 
 
 class PositionalEncodingSine(nn.Module):
 
     def __init__(self, num_pos_feats=128, temperature=10000):
         super().__init__()
-        self.num_pos_feats = num_pos_feats  # 64
-        self.temperature = temperature  # 10000
-        self.scale = 2 * math.pi  # 2 * math.pi
+        self.num_pos_feats = num_pos_feats
+        self.temperature = temperature
+        self.scale = 2 * math.pi
 
     def forward(self, x):
-        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=x.device)  # [0, 1, 2, ..., 63]
-        dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)  # [10000^0, 10000^2/64, 10000^4/64, ...]
+        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=x.device)
+        dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)
         x_embed = x[:, :, 0] * self.scale
         y_embed = x[:, :, 1] * self.scale
-        pos_x = x_embed[:, :, None] / dim_t  # [seq_len, batch_size, 1]
-        pos_y = y_embed[:, :, None] / dim_t  # [seq_len, batch_size, 1]
-        pos_x = torch.stack((pos_x[:, :, 0::2].sin(), pos_x[:, :, 1::2].cos()), dim=3).flatten(2)  # [seq_len, batch_size, 64]
-        pos_y = torch.stack((pos_y[:, :, 0::2].sin(), pos_y[:, :, 1::2].cos()), dim=3).flatten(2)  # [seq_len, batch_size, 64]
-        pos = torch.cat((pos_y, pos_x), dim=2)  # [seq_len, batch_size, 128]
-        return pos
+        pos_x = x_embed[:, :, None] / dim_t
+        pos_y = y_embed[:, :, None] / dim_t
+        pos_x = torch.stack((pos_x[:, :, 0::2].sin(), pos_x[:, :, 1::2].cos()), dim=3).flatten(2)
+        pos_y = torch.stack((pos_y[:, :, 0::2].sin(), pos_y[:, :, 1::2].cos()), dim=3).flatten(2)
+        return torch.cat((pos_y, pos_x), dim=2)
 
 
 def build_position_encoding(args):
-    position_embedding = PositionalEncodingSine(args.encoder_input_dim // 2, temperature=10000)
-    return position_embedding
+    return PositionalEncodingSine(args.encoder_input_dim // 2, temperature=10000)
 
 
 class HistEncoder(nn.Module):
@@ -40,188 +36,306 @@ class HistEncoder(nn.Module):
         self.args = args
         if int(args.feature_dim) != 4:
             raise ValueError(
-                "HistEncoder in unified future branch expects feature_dim=4: "
-                "[rel_x, rel_y, v, a]"
+                "HistEncoder in unified future branch expects feature_dim=4: [rel_x, rel_y, v, a]"
             )
+
         self.model_dim = int(args.encoder_input_dim)
         self.hidden_dim = int(getattr(args, "hidden_dim_fut", self.model_dim * 2))
-        self.memory_topk = max(0, int(getattr(args, "hist_memory_topk", 4)))
+        self.hist_length = int(getattr(args, "T", 16))
+        self.interaction_topk = max(
+            0,
+            int(getattr(args, "interaction_topk", getattr(args, "hist_memory_topk", 6))),
+        )
+        self.interaction_segments = max(1, int(getattr(args, "interaction_segments", 4)))
+        self.interaction_dist_thresh = max(1.0, float(getattr(args, "interaction_dist_thresh", 120.0)))
+        self.lane_emb_dim = max(1, int(getattr(args, "lane_emb_dim", 8)))
+        self.max_lane_index = 8
 
-        # Initalize embeddings and input projection.
-        self.input_embedding = nn.Linear(args.feature_dim, args.encoder_input_dim)
+        self.ego_input_embedding = nn.Linear(args.feature_dim, self.model_dim)
         self.position_encoding = build_position_encoding(args)
-
-        # Initialize encoder and decoder transformer layers.
-        encoder_layer = TransformerEncoderLayer(args.encoder_input_dim, args.nheads,
-                                                dim_feedforward=args.dim_feedforward, dropout=0.1,
-                                                activation=args.activation)
-        self.encoder = TransformerEncoder(encoder_layer=encoder_layer, num_layers=args.enc_layers)
-
-        # Intialize Temporal attention mechanism.
-        self.temporal_q = nn.Linear(args.feature_dim, args.attn_nhead * args.attn_out)
-        self.temporal_k = nn.Linear(args.feature_dim, args.attn_nhead * args.attn_out)
-        self.temporal_v = nn.Linear(args.feature_dim, args.attn_nhead * args.attn_out)
-        self.temporal_residual = Residual(args.encoder_input_dim)
-
-        # Initialize social attention mechanism.
-        self.qf = nn.Linear(args.encoder_input_dim, args.attn_nhead * args.attn_out)
-        self.kf = nn.Linear(args.encoder_input_dim, args.attn_nhead * args.attn_out)
-        self.vf = nn.Linear(args.encoder_input_dim, args.attn_nhead * args.attn_out)
-
-        # Initialize activation and regularization functions.
-        self.leaky_relu = nn.LeakyReLU(0.1)
-        self.fusion_gate = nn.Sequential(
-            nn.LayerNorm(self.model_dim * 2),
-            nn.Linear(self.model_dim * 2, self.model_dim),
-            nn.Sigmoid(),
+        encoder_layer = TransformerEncoderLayer(
+            args.encoder_input_dim,
+            args.nheads,
+            dim_feedforward=args.dim_feedforward,
+            dropout=0.1,
+            activation=args.activation,
         )
-        self.fusion_norm = nn.LayerNorm(self.model_dim)
-
-        self.fused_to_hidden = nn.Sequential(
-            nn.LayerNorm(self.model_dim),
-            nn.Linear(self.model_dim, self.hidden_dim),
+        self.ego_encoder = TransformerEncoder(encoder_layer=encoder_layer, num_layers=args.enc_layers)
+        self.ego_lane_embedding = nn.Embedding(self.max_lane_index, self.lane_emb_dim)
+        self.ego_meta_proj = nn.Sequential(
+            nn.LayerNorm(self.lane_emb_dim),
+            nn.Linear(self.lane_emb_dim, self.model_dim),
             nn.GELU(approximate="tanh"),
         )
-        self.nbr_summary_to_hidden = nn.Sequential(
+        self.ego_to_hidden = nn.Sequential(
             nn.LayerNorm(self.model_dim),
             nn.Linear(self.model_dim, self.hidden_dim),
             nn.GELU(approximate="tanh"),
         )
 
-        intent_heads = max(1, int(getattr(args, "heads_fut", 4)))
-        if self.hidden_dim % intent_heads != 0:
-            intent_heads = 1
-        self.intent_cls = nn.Parameter(torch.randn(1, 2, self.hidden_dim) * 0.02)
-        self.intent_memory_norm = nn.LayerNorm(self.hidden_dim)
-        self.intent_attn = nn.MultiheadAttention(self.hidden_dim, intent_heads, dropout=0.1, batch_first=True)
-        self.intent_cls_norm = nn.LayerNorm(self.hidden_dim)
-        self.intent_fusion = nn.Sequential(
-            nn.LayerNorm(self.hidden_dim * 2),
-            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+        relation_heads = max(1, int(getattr(args, "heads_fut", 4)))
+        if self.hidden_dim % relation_heads != 0:
+            relation_heads = 1
+        self.relation_mlp = nn.Sequential(
+            nn.LayerNorm(9),
+            nn.Linear(9, self.hidden_dim),
             nn.SiLU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
+        relation_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=relation_heads,
+            dim_feedforward=max(self.hidden_dim * 2, 128),
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.relation_temporal_encoder = nn.TransformerEncoder(relation_layer, num_layers=1)
+        self.time_embedding = nn.Parameter(torch.randn(1, self.hist_length, self.hidden_dim) * 0.02)
+        self.slot_embedding = nn.Embedding(max(self.interaction_topk, 1), self.hidden_dim)
+        self.segment_embedding = nn.Embedding(self.interaction_segments, self.hidden_dim)
 
-    def _topk_neighbor_tokens(self, soc_enc, social_occ):
-        # soc_enc: [T, B, N_grid, D_enc], social_occ: [B, N_grid]
-        bsz = soc_enc.size(1)
-        n_grid = soc_enc.size(2)
-        topk = min(self.memory_topk, n_grid)
+        self.lat_cls = nn.Parameter(torch.randn(1, 1, self.hidden_dim) * 0.02)
+        self.lon_cls = nn.Parameter(torch.randn(1, 1, self.hidden_dim) * 0.02)
+        self.intent_memory_norm = nn.LayerNorm(self.hidden_dim)
+        self.intent_attn = nn.MultiheadAttention(self.hidden_dim, relation_heads, dropout=0.1, batch_first=True)
+        self.intent_cls_norm = nn.LayerNorm(self.hidden_dim)
+        self.lat_head = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, 3),
+        )
+        self.lon_head = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, 3),
+        )
+
+    def _sanitize_index(self, values, num_embeddings):
+        indices = values.squeeze(-1).round().long() - 1
+        return indices.clamp_(0, num_embeddings - 1)
+
+    @staticmethod
+    def _scatter_neighbors(stacked_tensor, social_occ):
+        batch_size, n_grid = social_occ.shape
+        seq_len = stacked_tensor.size(1)
+        feat_dim = stacked_tensor.size(2)
+        grid_tensor = stacked_tensor.new_zeros((batch_size, n_grid, seq_len, feat_dim))
+
+        offset = 0
+        for batch_idx in range(batch_size):
+            valid_idx = torch.nonzero(social_occ[batch_idx], as_tuple=False).squeeze(-1)
+            count = int(valid_idx.numel())
+            if count > 0:
+                grid_tensor[batch_idx, valid_idx] = stacked_tensor[offset:offset + count]
+                offset += count
+
+        if offset != int(stacked_tensor.size(0)):
+            raise RuntimeError(
+                f"Neighbor scatter mismatch: consumed={offset}, stacked={stacked_tensor.size(0)}"
+            )
+        return grid_tensor
+
+    def _select_neighbor_indices(self, social_occ, ego_state_raw, nbr_state_raw_grid, ego_lane, nbr_lane_grid, nbr_dist_grid):
+        batch_size, n_grid = social_occ.shape
+        topk = min(self.interaction_topk, n_grid)
         if topk <= 0:
-            empty_tokens = soc_enc.new_zeros((bsz, 0, self.model_dim))
-            empty_valid = social_occ.new_zeros((bsz, 0))
-            return empty_tokens, empty_valid
+            empty_idx = social_occ.new_zeros((batch_size, 0), dtype=torch.long)
+            empty_valid = social_occ.new_zeros((batch_size, 0), dtype=torch.bool)
+            return empty_idx, empty_valid
 
-        nbr_tokens = soc_enc.permute(1, 2, 0, 3)  # [B, N_grid, T, D_enc]
-        nbr_summary = nbr_tokens.mean(dim=2)  # [B, N_grid, D_enc]
-        nbr_score = nbr_tokens.pow(2).mean(dim=(2, 3))  # [B, N_grid]
-        nbr_score = nbr_score.masked_fill(~social_occ, float("-inf"))
+        ego_last = ego_state_raw[:, -1, :]
+        nbr_last = nbr_state_raw_grid[:, :, -1, :]
+        lane_delta_last = nbr_lane_grid[:, :, -1, 0] - ego_lane[:, None, -1, 0]
+        same_lane = (lane_delta_last.abs() < 0.5).to(ego_state_raw.dtype)
+        adjacent_lane = ((lane_delta_last.abs() - 1.0).abs() < 0.5).to(ego_state_raw.dtype)
 
-        topk_score, topk_idx = torch.topk(nbr_score, k=topk, dim=1)
-        topk_valid = torch.isfinite(topk_score)
-        gather_idx = topk_idx.unsqueeze(-1).expand(-1, -1, nbr_summary.size(-1))
-        topk_summary = torch.gather(nbr_summary, 1, gather_idx)
-        topk_summary = topk_summary * topk_valid.unsqueeze(-1).to(topk_summary.dtype)
-        return topk_summary, topk_valid
+        dx_last = (nbr_last[..., 0] - ego_last[:, None, 0]).abs()
+        dy_last = (nbr_last[..., 1] - ego_last[:, None, 1]).abs()
+        dist_min = nbr_dist_grid[..., 0].masked_fill(~social_occ.unsqueeze(-1), float("inf")).amin(dim=-1)
+        closing_speed = torch.relu(ego_last[:, None, 2] - nbr_last[..., 2])
 
-    # 输入：src, nbrs [B, T, D] and [N_total, T, D]
-    def forward(self, src, nbrs, mask, temporal_mask):
+        inv_dy = 1.0 / (dy_last + 1.0)
+        inv_dist = 1.0 / (dist_min + 1.0)
+        inv_dx = 1.0 / (dx_last + 1.0)
+        score = (
+            1.20 * inv_dy
+            + 0.90 * inv_dist
+            + 0.35 * torch.clamp(closing_speed / 10.0, 0.0, 2.0)
+            + 0.25 * same_lane
+            + 0.10 * adjacent_lane
+            + 0.15 * inv_dx
+        )
+        score = score.masked_fill(~social_occ, float("-inf"))
 
-        B, T, D_in = src.shape
-        num_heads = int(self.args.attn_nhead)
-        head_dim = int(self.args.attn_out)
+        selected_idx = torch.full((batch_size, topk), -1, dtype=torch.long, device=social_occ.device)
+        selected_valid = torch.zeros((batch_size, topk), dtype=torch.bool, device=social_occ.device)
+        for batch_idx in range(batch_size):
+            available = social_occ[batch_idx].clone()
+            close_enough = dist_min[batch_idx] <= self.interaction_dist_thresh
+            if (available & close_enough).any():
+                available = available & close_enough
+            batch_score = score[batch_idx].masked_fill(~available, float("-inf"))
+            topk_score, topk_idx = torch.topk(batch_score, k=topk, dim=-1)
+            topk_valid = torch.isfinite(topk_score)
+            selected_idx[batch_idx] = topk_idx
+            selected_valid[batch_idx] = topk_valid
+        return selected_idx, selected_valid
 
-        # [B, T, D] -> [T, B, D] [N_total, T, D] -> [T, N_total, D]
-        src_t = src.permute(1, 0, 2).contiguous()
-        nbrs_t = nbrs.permute(1, 0, 2).contiguous()
+    def _build_relation_features(self, ego_state_raw, selected_nbr_state_raw, ego_lane, selected_nbr_lane, selected_nbr_dist):
+        ego_expand = ego_state_raw.unsqueeze(1).expand_as(selected_nbr_state_raw)
+        dx = selected_nbr_state_raw[..., 0:1] - ego_expand[..., 0:1]
+        dy = selected_nbr_state_raw[..., 1:2] - ego_expand[..., 1:2]
+        dv = selected_nbr_state_raw[..., 2:3] - ego_expand[..., 2:3]
+        da = selected_nbr_state_raw[..., 3:4] - ego_expand[..., 3:4]
+        lane_delta = selected_nbr_lane - ego_lane.unsqueeze(1)
+        same_lane = (lane_delta.abs() < 0.5).to(dx.dtype)
+        adjacent_lane = ((lane_delta.abs() - 1.0).abs() < 0.5).to(dx.dtype)
+        closing_speed = torch.clamp((ego_expand[..., 2:3] - selected_nbr_state_raw[..., 2:3]) / 10.0, -2.0, 2.0)
+        relation_feat = torch.cat(
+            (
+                torch.clamp(dx / 20.0, -10.0, 10.0),
+                torch.clamp(dy / 80.0, -10.0, 10.0),
+                torch.clamp(dv / 15.0, -10.0, 10.0),
+                torch.clamp(da / 5.0, -10.0, 10.0),
+                torch.clamp(selected_nbr_dist / self.interaction_dist_thresh, 0.0, 2.0),
+                torch.clamp(lane_delta / 2.0, -2.0, 2.0),
+                same_lane,
+                adjacent_lane,
+                closing_speed,
+            ),
+            dim=-1,
+        )
+        return relation_feat
 
-        # Temporal attention mechanism for temporal dependency.
-        temporal_mask = temporal_mask.view(temporal_mask.size(0), temporal_mask.size(1) * temporal_mask.size(2), temporal_mask.size(3))
-        temporal_occ = temporal_mask.any(dim=-1)  # [B, N_grid]
-        temporal_mask = repeat(temporal_mask, 'b c n -> t b c n', t=T) # [T, B, N, D]
-        temporal_grid = torch.zeros_like(temporal_mask, dtype=nbrs_t.dtype, device=nbrs_t.device)
-        temporal_grid = temporal_grid.masked_scatter_(temporal_mask.bool(), nbrs_t)
+    def _segment_relation_tokens(self, selected_relation_tokens, selected_valid):
+        batch_size, topk, seq_len, hidden_dim = selected_relation_tokens.shape
+        if topk == 0:
+            empty_tokens = selected_relation_tokens.new_zeros((batch_size, 0, hidden_dim))
+            empty_mask = selected_valid.new_zeros((batch_size, 0))
+            return empty_tokens, empty_mask
 
-        temporal_query = self.temporal_q(src_t) # [T, B, H * D_attn]
-        # [T * H, B, 1, D_attn] -> [B, T * H, 1, D_attn]
-        temporal_query = torch.cat(torch.split(torch.unsqueeze(temporal_query, dim=2), head_dim, dim=-1), dim=0).permute(1, 0, 2, 3)
-        temporal_key = self.temporal_k(temporal_grid) # [T, B, N, H * D_attn]
-        temporal_key = torch.cat(torch.split(temporal_key, head_dim, dim=-1), dim=0).permute(1, 0, 3, 2) #[B, T * H, D_attn, N_grid
-        temporal_value = self.temporal_v(temporal_grid)
-        temporal_value = torch.cat(torch.split(temporal_value, head_dim, dim=-1), dim=0).permute(1, 0, 2, 3) # [B, T * H, N_grid, D_attn]
-        temporal_attn_mask = repeat(temporal_occ, 'b n -> b (t h) n', t=T, h=num_heads).unsqueeze(2)
-        temporal_attn_weights = torch.matmul(temporal_query, temporal_key) # [B, T*H, 1, N_grid]
-        temporal_attn_weights /= math.sqrt(head_dim)
-        temporal_attn_weights = temporal_attn_weights.masked_fill(~temporal_attn_mask, -1e9)
-        temporal_attn_weights = F.softmax(temporal_attn_weights, dim=-1)
-        temporal_attn_weights = temporal_attn_weights * temporal_attn_mask.float()
-        temporal_attn_weights = temporal_attn_weights / (temporal_attn_weights.sum(dim=-1, keepdim=True) + 1e-6)
-        temporal_value = torch.matmul(temporal_attn_weights, temporal_value) # [B, T*H, 1, D_attn]
-        temporal_value = torch.cat(torch.split(temporal_value, int(T), dim=1), dim=-1).squeeze(2) # [B, T, H * D_attn]
-        temporal_value = self.temporal_residual(self.input_embedding(src_t).permute(1, 0, 2), temporal_value) # [B, T, H * D_attn]
+        slot_ids = torch.arange(topk, device=selected_relation_tokens.device)
+        slot_emb = self.slot_embedding(slot_ids).view(1, topk, 1, hidden_dim)
+        segment_tokens = []
+        for seg_idx in range(self.interaction_segments):
+            start = (seg_idx * seq_len) // self.interaction_segments
+            end = ((seg_idx + 1) * seq_len) // self.interaction_segments
+            if end <= start:
+                end = min(start + 1, seq_len)
+            pooled = selected_relation_tokens[:, :, start:end, :].mean(dim=2)
+            pooled = pooled + slot_emb.squeeze(2) + self.segment_embedding.weight[seg_idx].view(1, 1, hidden_dim)
+            pooled = pooled * selected_valid.unsqueeze(-1).to(pooled.dtype)
+            segment_tokens.append(pooled)
 
-        hist_enc = self.encoder(self.leaky_relu(self.input_embedding(src_t)), pos=self.position_encoding(src_t)) #  [T, B, D_enc]
-        hist_enc = hist_enc.permute(1, 0, 2) # [B, T, D_enc]
+        relation_tokens = torch.stack(segment_tokens, dim=2).reshape(batch_size, topk * self.interaction_segments, hidden_dim)
+        relation_mask = (~selected_valid).unsqueeze(-1).expand(-1, -1, self.interaction_segments)
+        relation_mask = relation_mask.reshape(batch_size, topk * self.interaction_segments)
+        return relation_tokens, relation_mask
 
-        # Social attention mechanism for interaction capture.
-        nbrs_enc = self.encoder(self.leaky_relu(self.input_embedding(nbrs_t)), pos=self.position_encoding(nbrs_t)) # [T, N_total, D_enc]
-        mask = mask.view(mask.size(0), mask.size(1) * mask.size(2), mask.size(3))
-        social_occ = mask.any(dim=-1)  # [B, N_grid]
-        mask = repeat(mask, 'b c n -> t b c n', t=T) # [T, B, N_grid, N]
+    def forward(
+        self,
+        ego_state_norm,
+        nbr_state_norm,
+        mask,
+        temporal_mask,
+        ego_lane,
+        nbr_lane,
+        nbr_dist,
+        ego_state_raw=None,
+        nbr_state_raw=None,
+    ):
+        del temporal_mask
 
-        soc_enc = torch.zeros_like(mask, dtype=nbrs_enc.dtype, device=nbrs_enc.device)
-        soc_enc = soc_enc.masked_scatter_(mask.bool(), nbrs_enc) # [T, B, N_grid, D_enc]
+        batch_size, seq_len, _ = ego_state_norm.shape
+        if seq_len > self.hist_length:
+            raise ValueError(f"History length {seq_len} exceeds configured hist_length {self.hist_length}")
 
-        query = self.qf(hist_enc) # [B, T, H*d] [1024, 16, 64]
-        _, _, embed_size = query.shape
-        head_dim_social = int(embed_size // num_heads)
-        query = torch.cat(torch.split(torch.unsqueeze(query, dim=2), head_dim_social, dim=-1), dim=1)  # [B, T*H, 1, D_attn]
-        key = torch.cat(torch.split(self.kf(soc_enc), head_dim_social, dim=-1), dim=0).permute(1, 0, 3, 2)  # [B, T*H, D_attn, N_grid]
-        value = torch.cat(torch.split(self.vf(soc_enc), head_dim_social, dim=-1), dim=0).permute(1, 0, 2, 3) # [B, T*H, N_grid, D_attn]
-        social_attn_mask = repeat(social_occ, 'b n -> b (t h) n', t=T, h=num_heads).unsqueeze(2)
-        attn_weights = torch.matmul(query, key) # [B, T*H, 1, N_grid]
-        attn_weights /= math.sqrt(head_dim_social)
-        attn_weights = attn_weights.masked_fill(~social_attn_mask, -1e9)
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = attn_weights * social_attn_mask.float()
-        attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-6)
-        value = torch.matmul(attn_weights, value) # [B, T*H, 1, D_attn]
-        value = torch.cat(torch.split(value, int(T), dim=1), dim=-1).squeeze(2) # [B, T, H * D_attn]
+        ego_tokens = self.ego_encoder(
+            self.ego_input_embedding(ego_state_norm.permute(1, 0, 2).contiguous()),
+            pos=self.position_encoding(ego_state_norm.permute(1, 0, 2).contiguous()),
+        )
+        ego_tokens = ego_tokens.permute(1, 0, 2)
+        ego_lane_idx = self._sanitize_index(ego_lane, self.max_lane_index)
+        ego_tokens = ego_tokens + self.ego_meta_proj(self.ego_lane_embedding(ego_lane_idx))
+        ego_hidden = self.ego_to_hidden(ego_tokens)
 
-        temporal_spatial_agg = self.leaky_relu(temporal_value + value) # [B, T, D_enc]
+        social_occ = mask.view(mask.size(0), mask.size(1) * mask.size(2), mask.size(3)).any(dim=-1)
+        n_grid = social_occ.size(1)
+        if ego_state_raw is None:
+            ego_state_raw = ego_state_norm
+        if nbr_state_raw is None:
+            nbr_state_raw = nbr_state_norm
 
-        # 共享主干融合：把时间建模与交互建模统一到同一语义 token。
-        gate = self.fusion_gate(torch.cat((hist_enc, temporal_spatial_agg), dim=-1))
-        fused_tokens = self.fusion_norm(hist_enc + gate * temporal_spatial_agg)  # [B, T, D_enc]
-
-        # Memory Head: ego 时间 token + Top-K 邻居摘要 token。
-        fused_hidden = self.fused_to_hidden(fused_tokens)  # [B, T, hidden]
-        topk_summary, topk_valid = self._topk_neighbor_tokens(soc_enc, social_occ)
-        if topk_summary.size(1) > 0:
-            nbr_hidden = self.nbr_summary_to_hidden(topk_summary)
-            memory_tokens = torch.cat((fused_hidden, nbr_hidden), dim=1)
+        device = ego_state_norm.device
+        if nbr_state_norm.size(0) > 0:
+            nbr_lane_grid = self._scatter_neighbors(nbr_lane, social_occ)
+            nbr_dist_grid = self._scatter_neighbors(nbr_dist, social_occ)
+            nbr_state_raw_grid = self._scatter_neighbors(nbr_state_raw, social_occ)
         else:
-            memory_tokens = fused_hidden
+            nbr_lane_grid = torch.zeros(batch_size, n_grid, seq_len, 1, device=device, dtype=ego_lane.dtype)
+            nbr_dist_grid = torch.zeros(batch_size, n_grid, seq_len, 1, device=device, dtype=ego_state_norm.dtype)
+            nbr_state_raw_grid = torch.zeros(batch_size, n_grid, seq_len, ego_state_raw.size(-1), device=device, dtype=ego_state_raw.dtype)
 
-        ego_mask = torch.zeros((B, T), dtype=torch.bool, device=src.device)
-        if topk_valid.size(1) > 0:
-            nbr_mask = ~topk_valid
-            memory_mask = torch.cat((ego_mask, nbr_mask), dim=1)
+        selected_idx, selected_valid = self._select_neighbor_indices(
+            social_occ=social_occ,
+            ego_state_raw=ego_state_raw,
+            nbr_state_raw_grid=nbr_state_raw_grid,
+            ego_lane=ego_lane,
+            nbr_lane_grid=nbr_lane_grid,
+            nbr_dist_grid=nbr_dist_grid,
+        )
+
+        if selected_idx.size(1) > 0:
+            safe_idx = selected_idx.clamp(min=0)
+            batch_index = torch.arange(batch_size, device=device).unsqueeze(1)
+            selected_nbr_state_raw = nbr_state_raw_grid[batch_index, safe_idx]
+            selected_nbr_lane = nbr_lane_grid[batch_index, safe_idx]
+            selected_nbr_dist = nbr_dist_grid[batch_index, safe_idx]
+            relation_feat = self._build_relation_features(
+                ego_state_raw,
+                selected_nbr_state_raw,
+                ego_lane,
+                selected_nbr_lane,
+                selected_nbr_dist,
+            )
+            relation_tokens = self.relation_mlp(relation_feat)
+            relation_tokens = relation_tokens + self.time_embedding[:, :seq_len, :].unsqueeze(1)
+
+            topk = selected_idx.size(1)
+            relation_flat = relation_tokens.reshape(batch_size * topk, seq_len, self.hidden_dim)
+            selected_valid_flat = selected_valid.reshape(batch_size * topk)
+            encoded_relation_flat = relation_flat.new_zeros(relation_flat.shape)
+            if selected_valid_flat.any():
+                encoded_relation_flat[selected_valid_flat] = self.relation_temporal_encoder(relation_flat[selected_valid_flat])
+            encoded_relation = encoded_relation_flat.reshape(batch_size, topk, seq_len, self.hidden_dim)
+            encoded_relation = encoded_relation * selected_valid.unsqueeze(-1).unsqueeze(-1).to(encoded_relation.dtype)
+            relation_memory_tokens, relation_memory_mask = self._segment_relation_tokens(encoded_relation, selected_valid)
+            memory_tokens = torch.cat((ego_hidden, relation_memory_tokens), dim=1)
+            ego_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=device)
+            memory_mask = torch.cat((ego_mask, relation_memory_mask), dim=1)
         else:
-            memory_mask = ego_mask
+            memory_tokens = ego_hidden
+            memory_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=device)
 
-        # Intent Head: 两个 CLS 从同一个 memory 池聚合全局行为意图。
-        intent_query = self.intent_cls.expand(B, -1, -1)
+        intent_query = torch.cat(
+            (
+                self.lat_cls.expand(batch_size, -1, -1),
+                self.lon_cls.expand(batch_size, -1, -1),
+            ),
+            dim=1,
+        )
         memory_norm = self.intent_memory_norm(memory_tokens)
         intent_tokens = self.intent_attn(
             query=intent_query,
             key=memory_norm,
             value=memory_norm,
-            key_padding_mask=memory_mask
+            key_padding_mask=memory_mask,
         )[0]
         intent_tokens = self.intent_cls_norm(intent_tokens + intent_query)
-        z_motion, z_maneuver = intent_tokens[:, 0, :], intent_tokens[:, 1, :]
-        z_global = self.intent_fusion(torch.cat((z_motion, z_maneuver), dim=-1))
-
-        return memory_tokens, z_global, memory_mask
-
+        lat_logits = self.lat_head(intent_tokens[:, 0, :])
+        lon_logits = self.lon_head(intent_tokens[:, 1, :])
+        return memory_tokens, memory_mask, lat_logits, lon_logits

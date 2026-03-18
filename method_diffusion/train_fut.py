@@ -22,7 +22,8 @@ def ensure_epoch_text_log(log_path: Path):
     if log_path.exists():
         return
     header = (
-        "epoch,train_loss_cur,train_loss_avg,train_vel_avg,train_pos_avg,train_end_avg,"
+        "epoch,train_loss_cur,train_loss_avg,train_vel_avg,train_pos_avg,train_lat_avg,train_lon_avg,"
+        "train_lat_acc,train_lon_acc,"
         "eval_ratio,eval_loss,eval_ade_ft,eval_fde_ft,eval_rmse_ft,"
         "eval_ade_m,eval_fde_m,eval_rmse_m\n"
     )
@@ -42,7 +43,9 @@ def append_epoch_text_log(
     line = (
         f"{epoch},"
         f"{train_stats['loss_last']:.6f},{train_stats['loss_avg']:.6f},"
-        f"{train_stats['loss_vel_avg']:.6f},{train_stats['loss_pos_avg']:.6f},{train_stats['loss_end_avg']:.6f},"
+        f"{train_stats['loss_vel_avg']:.6f},{train_stats['loss_pos_avg']:.6f},"
+        f"{train_stats['loss_lat_avg']:.6f},{train_stats['loss_lon_avg']:.6f},"
+        f"{train_stats['acc_lat_avg']:.6f},{train_stats['acc_lon_avg']:.6f},"
         f"{eval_ratio:.2f},{eval_loss:.6f},{eval_ade:.6f},{eval_fde:.6f},{eval_rmse:.6f},"
         f"{(eval_ade * 0.3048):.6f},{(eval_fde * 0.3048):.6f},{(eval_rmse * 0.3048):.6f}\n"
     )
@@ -79,6 +82,8 @@ def print_epoch_eval_summary(
     print(
         f"[Epoch {epoch}] "
         f"train_loss={train_stats['loss_avg']:.6f} | "
+        f"lat={train_stats['loss_lat_avg']:.6f}/{train_stats['acc_lat_avg']:.4f} | "
+        f"lon={train_stats['loss_lon_avg']:.6f}/{train_stats['acc_lon_avg']:.4f} | "
         f"eval_ratio={eval_ratio:.2f} | "
         f"eval_loss={eval_loss:.6f} | "
         f"ADE={eval_ade:.6f} ft ({eval_ade * 0.3048:.6f} m) | "
@@ -237,7 +242,15 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     op_mask = op_mask.to(device)
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
-    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
+
+    extras = {
+        "ego_lane": batch["lane"].to(device),
+        "nbr_lane": batch["nbrs_lane"].to(device),
+        "nbr_dist": batch["nbrs_distance"].to(device),
+        "lat_gt": batch["lat_enc"].argmax(dim=-1).long().to(device),
+        "lon_gt": batch["lon_enc"].argmax(dim=-1).long().to(device),
+    }
+    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask, extras
 
 
 def build_ngsim_dataset(mat_path, args):
@@ -257,13 +270,30 @@ def build_ngsim_dataset(mat_path, args):
     return NgsimDataset(mat_path, **filtered)
 
 
+def compute_intent_class_weights(dataset):
+    lat_idx = torch.as_tensor(dataset.D[:, 9].astype(int) - 1, dtype=torch.long)
+    lon_idx = torch.as_tensor(dataset.D[:, 10].astype(int) - 1, dtype=torch.long)
+
+    lat_count = torch.bincount(lat_idx.clamp(min=0, max=2), minlength=3).float()
+    lon_count = torch.bincount(lon_idx.clamp(min=0, max=2), minlength=3).float()
+
+    lat_weight = 1.0 / torch.sqrt(lat_count + 1e-6)
+    lon_weight = 1.0 / torch.sqrt(lon_count + 1e-6)
+    lat_weight = lat_weight / lat_weight.mean().clamp(min=1e-6)
+    lon_weight = lon_weight / lon_weight.mean().clamp(min=1e-6)
+    return lat_weight, lon_weight, lat_count, lon_count
+
+
 # 训练函数新增 ema 参数，在反向传播后进行滑动平均更新
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
     model.train()
     total_loss = 0.0
     total_vel = 0.0
     total_pos = 0.0
-    total_end = 0.0
+    total_lat = 0.0
+    total_lon = 0.0
+    total_acc_lat = 0.0
+    total_acc_lon = 0.0
     last_loss = 0.0
     num_batches = 0
     pbar = tqdm(
@@ -275,9 +305,18 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
     )
 
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, extras = prepare_input_data(batch, feature_dim, device=device)
         loss, loss_parts = model.forwardTrain(
-            hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, return_components=True
+            hist,
+            hist_nbrs,
+            mask,
+            temporal_mask,
+            fut,
+            op_mask,
+            extras,
+            device,
+            epoch=epoch,
+            return_components=True,
         )
 
         optimizer.zero_grad()
@@ -292,18 +331,25 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
         total_loss += float(loss.item())
         total_vel += float(loss_parts["loss_vel"].item())
         total_pos += float(loss_parts["loss_pos"].item())
-        total_end += float(loss_parts["loss_end"].item())
+        total_lat += float(loss_parts["loss_lat"].item())
+        total_lon += float(loss_parts["loss_lon"].item())
+        total_acc_lat += float(loss_parts["acc_lat"].item())
+        total_acc_lon += float(loss_parts["acc_lon"].item())
         last_loss = float(loss.item())
         num_batches += 1
         avg_loss = total_loss / num_batches
         avg_vel = total_vel / num_batches
         avg_pos = total_pos / num_batches
-        avg_end = total_end / num_batches
+        avg_lat = total_lat / num_batches
+        avg_lon = total_lon / num_batches
+        avg_acc_lat = total_acc_lat / num_batches
+        avg_acc_lon = total_acc_lon / num_batches
         pbar.set_postfix_str(
             f"loss={last_loss:.6f}(avg={avg_loss:.6f}) | "
             f"vel={avg_vel:.6f} | "
             f"pos={avg_pos:.6f} | "
-            f"end={avg_end:.6f}"
+            f"lat={avg_lat:.6f}/{avg_acc_lat:.4f} | "
+            f"lon={avg_lon:.6f}/{avg_acc_lon:.4f}"
         )
 
     denom = max(num_batches, 1)
@@ -312,12 +358,15 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
         "loss_last": last_loss,
         "loss_vel_avg": total_vel / denom,
         "loss_pos_avg": total_pos / denom,
-        "loss_end_avg": total_end / denom,
+        "loss_lat_avg": total_lat / denom,
+        "loss_lon_avg": total_lon / denom,
+        "acc_lat_avg": total_acc_lat / denom,
+        "acc_lon_avg": total_acc_lon / denom,
     }
 
 
 @torch.no_grad()
-def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_ratio=0.1, max_batches=0):
+def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_ratio=0.1, max_batches=0, num_samples=5):
     # 固定验证环节的随机数种子，消除采样方差导致的指标波动
     torch.manual_seed(42)
     if torch.cuda.is_available():
@@ -352,9 +401,17 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
         if batch_idx >= target_batches:
             break
 
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        eval_loss, pred_fut, eval_ade, eval_fde = model.forwardEval(
-            hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, extras = prepare_input_data(batch, feature_dim, device=device)
+        eval_loss, pred_fut, eval_ade, eval_fde = model.forwardEval_minADE(
+            hist,
+            hist_nbrs,
+            mask,
+            temporal_mask,
+            fut,
+            op_mask,
+            extras,
+            device,
+            K=max(1, int(num_samples)),
         )
 
         total_loss += float(eval_loss.item())
@@ -445,16 +502,19 @@ def main():
     print(f"[Log] Epoch metrics file: {epoch_text_log_path}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    eval_ratio = 0.03
+    eval_ratio = float(args.eval_ratio)
 
     print(f"[FutModel] self_condition_prob={args.self_condition_prob}, eval_ratio={eval_ratio}")
 
     data_root = Path(args.data_root)
     train_path = str(data_root / "TrainSet.mat")
     test_path = str(data_root / "TestSet.mat")
+    val_path = data_root / "ValSet.mat"
+    eval_path = val_path if val_path.exists() else Path(test_path)
+    eval_split_name = "ValSet" if val_path.exists() else "TestSet"
 
     train_dataset = build_ngsim_dataset(train_path, args)
-    test_dataset = build_ngsim_dataset(test_path, args)
+    eval_dataset = build_ngsim_dataset(str(eval_path), args)
 
     train_loader = DataLoader(
         train_dataset,
@@ -466,12 +526,12 @@ def main():
         persistent_workers=args.num_workers > 0,
         drop_last=True,
     )
-    test_loader = DataLoader(
-        test_dataset,
+    eval_loader = DataLoader(
+        eval_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        collate_fn=test_dataset.collate_fn,
+        collate_fn=eval_dataset.collate_fn,
         pin_memory=True,
         persistent_workers=args.num_workers > 0,
         drop_last=False,
@@ -485,6 +545,20 @@ def main():
     ema = EMAModel(model, decay=0.9999)
 
     start_epoch, best_ade = load_checkpoint_if_needed(args, model, optimizer, scheduler, device, ema)
+    lat_weight, lon_weight, lat_count, lon_count = compute_intent_class_weights(train_dataset)
+    model.set_intent_class_weights(lat_weight, lon_weight)
+    print(
+        "[Intent] lat_count={} lon_count={} lat_weight={} lon_weight={}".format(
+            lat_count.tolist(),
+            lon_count.tolist(),
+            [round(v, 4) for v in lat_weight.tolist()],
+            [round(v, 4) for v in lon_weight.tolist()],
+        )
+    )
+    if eval_split_name == "ValSet":
+        print(f"[Eval] 使用 {eval_split_name} 做 epoch 内选模，指标为 forwardEval_minADE(K={max(1, int(args.num_samples))})")
+    else:
+        print(f"[Eval] 未找到 ValSet.mat，回退到 {eval_split_name} 做评估。")
     last_eval = None
 
     for epoch in range(start_epoch, args.num_epochs):
@@ -494,12 +568,13 @@ def main():
         ema.swap_shadow(model)
         eval_loss, eval_ade, eval_fde, quick_eval = evaluate_on_testset(
             model,
-            test_loader,
+            eval_loader,
             device,
             epoch + 1,
             args.feature_dim,
             eval_ratio=eval_ratio,
             max_batches=args.eval_max_batches,
+            num_samples=args.num_samples,
         )
         ema.swap_shadow(model)
         eval_rmse = float(quick_eval["overall_rmse_ft"])
@@ -557,17 +632,18 @@ def main():
         ema.swap_shadow(model)
         last_eval = evaluate_on_testset(
             model,
-            test_loader,
+            eval_loader,
             device,
             args.num_epochs,
             args.feature_dim,
             eval_ratio=eval_ratio,
             max_batches=args.eval_max_batches,
+            num_samples=args.num_samples,
         )
         ema.swap_shadow(model)
 
     final_loss, final_ade, final_fde, final_quick = last_eval
-    print("\n========== Final Eval (EMA, Single-Modal, TestSet@0.03) ==========")
+    print(f"\n========== Final Eval (EMA, minADE@K={max(1, int(args.num_samples))}, {eval_split_name}@{eval_ratio:.2f}) ==========")
     print(
         f"Avg ADE: {final_ade:.6f} ft ({final_ade * 0.3048:.6f} m) | "
         f"Avg FDE: {final_fde:.6f} ft ({final_fde * 0.3048:.6f} m) | "
