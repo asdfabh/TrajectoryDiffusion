@@ -2,7 +2,6 @@ import sys
 import os
 import math
 import copy
-import inspect
 from datetime import datetime
 from pathlib import Path
 
@@ -13,11 +12,17 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from method_diffusion.config import get_args_parser
-from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
+from method_diffusion.utils.fut_utils import (
+    TrajectoryMetrics,
+    build_ngsim_dataset,
+    format_timestep_metrics,
+    prepare_fut_batch,
+)
 
 
 def ensure_epoch_text_log(log_path: Path):
+    """初始化按 epoch 记录的纯文本日志文件。"""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     if log_path.exists():
         return
@@ -40,6 +45,7 @@ def append_epoch_text_log(
     eval_fde: float,
     eval_rmse: float,
 ):
+    """向 epoch 日志文件追加一行训练与评估摘要。"""
     line = (
         f"{epoch},"
         f"{train_stats['loss_last']:.6f},{train_stats['loss_avg']:.6f},"
@@ -57,6 +63,7 @@ def append_epoch_text_log(
 
 
 def build_epoch_text_log_path(checkpoint_dir: Path, prefix: str) -> Path:
+    """按时间戳生成新的日志文件路径。"""
     timestamp = datetime.now().strftime("%m-%d-%H:%M")
     log_dir = checkpoint_dir / "log"
     log_path = log_dir / f"{prefix}_{timestamp}.txt"
@@ -79,6 +86,7 @@ def print_epoch_eval_summary(
     eval_fde: float,
     eval_rmse: float,
 ):
+    """打印单个 epoch 的训练与评估摘要。"""
     print(
         f"[Epoch {epoch}] "
         f"train_loss={train_stats['loss_avg']:.6f} | "
@@ -103,89 +111,13 @@ EVAL_BAR_FORMAT = (
 TIME_STEP_LABELS = [("1s", 4), ("2s", 9), ("3s", 14), ("4s", 19), ("5s", 24)]
 
 
-class QuickMetrics:
-    """训练内轻量评估统计器：单样本采样 + TAME-style 分时段指标。"""
-
-    def __init__(self, pred_len, meter_per_unit=0.3048):
-        self.pred_len = int(pred_len)
-        self.meter_per_unit = float(meter_per_unit)
-        self.total_se = torch.zeros(self.pred_len, dtype=torch.float64)
-        self.total_de = torch.zeros(self.pred_len, dtype=torch.float64)
-        self.total_counts = torch.zeros(self.pred_len, dtype=torch.float64)
-        self.total_dist_sum = 0.0
-        self.total_valid_points = 0.0
-        self.total_fde_sum = 0.0
-        self.total_fde_count = 0.0
-
-    def update(self, pred, target, op_mask):
-        pred = pred[:, :self.pred_len, :2]
-        target = target[:, :self.pred_len, :2]
-        valid_mask = op_mask[:, :self.pred_len, 0] if op_mask.dim() == 3 else op_mask[:, :self.pred_len]
-        valid_mask = (valid_mask > 0).float().to(pred.device)
-
-        diff = pred - target
-        se = torch.sum(diff ** 2, dim=-1)
-        dist = torch.sqrt(se)
-
-        self.total_se += torch.sum(se * valid_mask, dim=0).double().cpu()
-        self.total_de += torch.sum(dist * valid_mask, dim=0).double().cpu()
-        self.total_counts += torch.sum(valid_mask, dim=0).double().cpu()
-
-        self.total_dist_sum += float(torch.sum(dist * valid_mask).item())
-        self.total_valid_points += float(torch.sum(valid_mask).item())
-
-        t_idx = torch.arange(dist.size(1), device=dist.device).unsqueeze(0).expand_as(dist)
-        masked_idx = torch.where(valid_mask > 0, t_idx, t_idx.new_full(t_idx.shape, -1))
-        last_idx = masked_idx.max(dim=1).values
-        has_valid = last_idx >= 0
-        final_dist = dist.gather(1, last_idx.clamp(min=0).unsqueeze(1)).squeeze(1)
-        self.total_fde_sum += float(torch.sum(final_dist * has_valid.float()).item())
-        self.total_fde_count += float(torch.sum(has_valid.float()).item())
-
-    def summary(self):
-        counts = self.total_counts.clamp(min=1.0)
-        rmse_per_step_ft = torch.sqrt(self.total_se / counts)
-        fde_per_step_ft = self.total_de / counts
-
-        cumsum_de = torch.cumsum(self.total_de, dim=0)
-        cumsum_counts = torch.cumsum(self.total_counts, dim=0).clamp(min=1.0)
-        ade_prefix_ft = cumsum_de / cumsum_counts
-        if ade_prefix_ft.numel() > 1:
-            ade_prefix_ft[1:] = cumsum_de[:-1] / cumsum_counts[:-1]
-
-        overall_ade_ft = 0.0 if self.total_valid_points == 0 else self.total_dist_sum / self.total_valid_points
-        overall_fde_ft = 0.0 if self.total_fde_count == 0 else self.total_fde_sum / self.total_fde_count
-        overall_rmse_ft = 0.0 if self.total_valid_points == 0 else float(torch.sqrt(self.total_se.sum() / self.total_counts.sum().clamp(min=1.0)).item())
-
-        return {
-            "rmse_per_step_ft": rmse_per_step_ft,
-            "rmse_per_step_m": rmse_per_step_ft * self.meter_per_unit,
-            "fde_per_step_ft": fde_per_step_ft,
-            "fde_per_step_m": fde_per_step_ft * self.meter_per_unit,
-            "ade_prefix_ft": ade_prefix_ft,
-            "ade_prefix_m": ade_prefix_ft * self.meter_per_unit,
-            "overall_ade_ft": overall_ade_ft,
-            "overall_fde_ft": overall_fde_ft,
-            "overall_rmse_ft": overall_rmse_ft,
-            "overall_ade_m": overall_ade_ft * self.meter_per_unit,
-            "overall_fde_m": overall_fde_ft * self.meter_per_unit,
-            "overall_rmse_m": overall_rmse_ft * self.meter_per_unit,
-        }
-
-
-def format_timestep_metrics(metric_tensor, meter_per_unit=0.3048):
-    values = []
-    for label, t_idx in TIME_STEP_LABELS:
-        if t_idx < metric_tensor.numel():
-            val_ft = float(metric_tensor[t_idx].item())
-            values.append(f"{label}: {val_ft:.3f} ft ({val_ft * meter_per_unit:.3f} m)")
-    return " | ".join(values) if values else "no valid timestep"
-
-
 # 指数移动平均 (Exponential Moving Average) 包装器类
 # 用于平滑扩散模型在训练后期的参数高频震荡
 class EMAModel:
+    """维护训练模型参数的 EMA 影子副本。"""
+
     def __init__(self, model, decay=0.999):
+        """初始化 EMA 状态。"""
         self.decay = decay
         self.shadow = copy.deepcopy(model.state_dict())
         self._shadow_on_model = False
@@ -195,6 +127,7 @@ class EMAModel:
                 param.requires_grad = False
 
     def step(self, model):
+        """在每次优化后更新 EMA 影子参数。"""
         # 每次优化器步进后调用此方法，平滑更新影子权重
         with torch.no_grad():
             for name, param in model.state_dict().items():
@@ -205,6 +138,7 @@ class EMAModel:
                         self.shadow[name].copy_(param.data)
 
     def swap_shadow(self, target_model):
+        """在真实参数与 EMA 参数之间原地交换。"""
         # 通过参数引用交换进行 EMA 切换，避免 clone 整个 state_dict 造成显存峰值。
         model_state = target_model.state_dict(keep_vars=True)
         for name, tensor in model_state.items():
@@ -222,55 +156,8 @@ class EMAModel:
         self._shadow_on_model = not self._shadow_on_model
 
 
-def prepare_input_data(batch, feature_dim, device="cuda"):
-    hist = batch["hist"]
-    va = batch["va"]
-    fut = batch["fut"]
-    op_mask = batch["op_mask"]
-    hist_nbrs = batch["nbrs"]
-    va_nbrs = batch["nbrs_va"]
-    mask = batch["mask"]
-    temporal_mask = batch["temporal_mask"]
-
-    if int(feature_dim) != 4:
-        raise ValueError("train_fut currently supports feature_dim=4: [rel_x, rel_y, v, a].")
-    # future 分支输入恢复为 [rel_x, rel_y, v, a]
-    hist = torch.cat((hist, va), dim=-1).to(device)
-    hist_nbrs = torch.cat((hist_nbrs, va_nbrs), dim=-1).to(device)
-
-    fut = fut.to(device)
-    op_mask = op_mask.to(device)
-    mask = mask.to(device)
-    temporal_mask = temporal_mask.to(device)
-
-    extras = {
-        "ego_lane": batch["lane"].to(device),
-        "nbr_lane": batch["nbrs_lane"].to(device),
-        "nbr_dist": batch["nbrs_distance"].to(device),
-        "lat_gt": batch["lat_enc"].argmax(dim=-1).long().to(device),
-        "lon_gt": batch["lon_enc"].argmax(dim=-1).long().to(device),
-    }
-    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask, extras
-
-
-def build_ngsim_dataset(mat_path, args):
-    # 兼容不同 NgsimDataset 版本，按签名过滤可用参数，避免 unexpected keyword 异常。
-    dataset_kwargs = {
-        "t_h": 30,
-        "t_f": 50,
-        "d_s": 2,
-        "enc_size": args.encoder_input_dim,
-        "feature_dim": args.feature_dim,
-    }
-    sig = inspect.signature(NgsimDataset.__init__)
-    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-    if has_var_kw:
-        return NgsimDataset(mat_path, **dataset_kwargs)
-    filtered = {k: v for k, v in dataset_kwargs.items() if k in sig.parameters}
-    return NgsimDataset(mat_path, **filtered)
-
-
 def compute_intent_class_weights(dataset):
+    """按训练集标签频率生成横纵向意图类别权重。"""
     lat_idx = torch.as_tensor(dataset.D[:, 9].astype(int) - 1, dtype=torch.long)
     lon_idx = torch.as_tensor(dataset.D[:, 10].astype(int) - 1, dtype=torch.long)
 
@@ -286,6 +173,7 @@ def compute_intent_class_weights(dataset):
 
 # 训练函数新增 ema 参数，在反向传播后进行滑动平均更新
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
+    """执行单个 epoch 的 future 分支训练。"""
     model.train()
     total_loss = 0.0
     total_vel = 0.0
@@ -305,17 +193,16 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
     )
 
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, extras = prepare_input_data(batch, feature_dim, device=device)
+        batch_data = prepare_fut_batch(batch, feature_dim, device=device)
         loss, loss_parts = model.forwardTrain(
-            hist,
-            hist_nbrs,
-            mask,
-            temporal_mask,
-            fut,
-            op_mask,
-            extras,
+            batch_data["hist"],
+            batch_data["hist_nbrs"],
+            batch_data["mask"],
+            batch_data["temporal_mask"],
+            batch_data["fut"],
+            batch_data["op_mask"],
+            batch_data["extras"],
             device,
-            epoch=epoch,
             return_components=True,
         )
 
@@ -367,6 +254,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, ema):
 
 @torch.no_grad()
 def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_ratio=0.1, max_batches=0, num_samples=5):
+    """在验证集或测试集上执行轻量评估。"""
     # 固定验证环节的随机数种子，消除采样方差导致的指标波动
     torch.manual_seed(42)
     if torch.cuda.is_available():
@@ -377,7 +265,7 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
     total_ade = 0.0
     total_fde = 0.0
     num_batches = 0
-    quick_metrics = QuickMetrics(pred_len=int(getattr(model, "T", 25)))
+    quick_metrics = TrajectoryMetrics(pred_len=int(getattr(model, "T", 25)))
 
     total_batches = len(dataloader)
     if total_batches == 0:
@@ -401,15 +289,15 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
         if batch_idx >= target_batches:
             break
 
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, extras = prepare_input_data(batch, feature_dim, device=device)
+        batch_data = prepare_fut_batch(batch, feature_dim, device=device)
         eval_loss, pred_fut, eval_ade, eval_fde = model.forwardEval_minADE(
-            hist,
-            hist_nbrs,
-            mask,
-            temporal_mask,
-            fut,
-            op_mask,
-            extras,
+            batch_data["hist"],
+            batch_data["hist_nbrs"],
+            batch_data["mask"],
+            batch_data["temporal_mask"],
+            batch_data["fut"],
+            batch_data["op_mask"],
+            batch_data["extras"],
             device,
             K=max(1, int(num_samples)),
         )
@@ -417,7 +305,7 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
         total_loss += float(eval_loss.item())
         total_ade += float(eval_ade.item())
         total_fde += float(eval_fde.item())
-        quick_metrics.update(pred_fut, fut, op_mask)
+        quick_metrics.update(pred_fut, batch_data["fut"], batch_data["op_mask"])
         num_batches += 1
         pbar.set_postfix_str(
             f"loss={eval_loss.item():.6f}(avg={(total_loss / num_batches):.6f}) | "
@@ -431,6 +319,7 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
 
 
 def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, ema=None):
+    """按命令行参数恢复 future 训练断点。"""
     start_epoch = 0
     best_ade = float("inf")
     ckpt_path = None
@@ -486,6 +375,7 @@ def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, ema=Non
 
 
 def main():
+    """运行 future 分支的单卡训练入口。"""
     args = get_args_parser().parse_args()
     if int(args.feature_dim) != 4:
         raise ValueError("train_fut currently supports feature_dim=4 only.")
@@ -649,9 +539,9 @@ def main():
         f"Avg FDE: {final_fde:.6f} ft ({final_fde * 0.3048:.6f} m) | "
         f"Avg RMSE: {final_quick['overall_rmse_ft']:.6f} ft ({final_quick['overall_rmse_m']:.6f} m)"
     )
-    print(f"RMSE per-second: {format_timestep_metrics(final_quick['rmse_per_step_ft'])}")
-    print(f"FDE per-second:  {format_timestep_metrics(final_quick['fde_per_step_ft'])}")
-    print(f"ADE per-second:  {format_timestep_metrics(final_quick['ade_prefix_ft'])}")
+    print(f"RMSE per-second: {format_timestep_metrics(final_quick['rmse_per_step_ft'], time_step_labels=TIME_STEP_LABELS)}")
+    print(f"DE per-second:   {format_timestep_metrics(final_quick['de_per_step_ft'], time_step_labels=TIME_STEP_LABELS)}")
+    print(f"ADE per-second:  {format_timestep_metrics(final_quick['ade_prefix_ft'], time_step_labels=TIME_STEP_LABELS)}")
 
 
 if __name__ == "__main__":

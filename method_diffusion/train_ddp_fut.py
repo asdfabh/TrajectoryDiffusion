@@ -2,7 +2,6 @@ import sys
 import os
 import math
 import copy
-import inspect
 from datetime import datetime
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -13,16 +12,23 @@ from torch.utils.data import DataLoader, DistributedSampler
 from pathlib import Path
 from tqdm import tqdm
 import builtins
-from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.config import get_args_parser
 from method_diffusion.models.fut_model import DiffusionFut
+from method_diffusion.utils.fut_utils import (
+    TrajectoryMetrics,
+    build_ngsim_dataset,
+    format_timestep_metrics,
+    prepare_fut_batch,
+)
 
 def ensure_epoch_text_log(log_path: Path):
+    """初始化 DDP 训练的 epoch 文本日志。"""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     if log_path.exists():
         return
     header = (
-        "epoch,train_loss_cur,train_loss_avg,train_vel_avg,train_pos_avg,train_end_avg,"
+        "epoch,train_loss_cur,train_loss_avg,train_vel_avg,train_pos_avg,train_lat_avg,train_lon_avg,"
+        "train_lat_acc,train_lon_acc,"
         "eval_ratio,eval_loss,eval_ade_ft,eval_fde_ft,eval_rmse_ft,"
         "eval_ade_m,eval_fde_m,eval_rmse_m\n"
     )
@@ -39,9 +45,12 @@ def append_epoch_text_log(
     eval_fde: float,
     eval_rmse: float,
 ):
+    """向 DDP epoch 日志中追加一行结果。"""
     line = (
         f"{epoch},{train_stats['loss_last']:.6f},{train_stats['loss_avg']:.6f},"
-        f"{train_stats['loss_vel_avg']:.6f},{train_stats['loss_pos_avg']:.6f},{train_stats['loss_end_avg']:.6f},"
+        f"{train_stats['loss_vel_avg']:.6f},{train_stats['loss_pos_avg']:.6f},"
+        f"{train_stats['loss_lat_avg']:.6f},{train_stats['loss_lon_avg']:.6f},"
+        f"{train_stats['acc_lat_avg']:.6f},{train_stats['acc_lon_avg']:.6f},"
         f"{eval_ratio:.2f},{eval_loss:.6f},{eval_ade:.6f},{eval_fde:.6f},{eval_rmse:.6f},"
         f"{(eval_ade * 0.3048):.6f},{(eval_fde * 0.3048):.6f},{(eval_rmse * 0.3048):.6f}\n"
     )
@@ -53,6 +62,7 @@ def append_epoch_text_log(
 
 
 def build_epoch_text_log_path(checkpoint_dir: Path, prefix: str) -> Path:
+    """按时间戳生成新的 DDP 日志文件路径。"""
     timestamp = datetime.now().strftime("%m-%d-%H:%M")
     log_dir = checkpoint_dir / "log"
     log_path = log_dir / f"{prefix}_{timestamp}.txt"
@@ -75,9 +85,12 @@ def print_epoch_eval_summary(
     eval_fde: float,
     eval_rmse: float,
 ):
+    """打印单个 epoch 的 DDP 训练与评估摘要。"""
     print(
         f"[Epoch {epoch}] "
         f"train_loss={train_stats['loss_avg']:.6f} | "
+        f"lat={train_stats['loss_lat_avg']:.6f}/{train_stats['acc_lat_avg']:.4f} | "
+        f"lon={train_stats['loss_lon_avg']:.6f}/{train_stats['acc_lon_avg']:.4f} | "
         f"eval_ratio={eval_ratio:.2f} | "
         f"eval_loss={eval_loss:.6f} | "
         f"ADE={eval_ade:.6f} ft ({eval_ade * 0.3048:.6f} m) | "
@@ -96,82 +109,11 @@ EVAL_BAR_FORMAT = (
 TIME_STEP_LABELS = [("1s", 4), ("2s", 9), ("3s", 14), ("4s", 19), ("5s", 24)]
 
 
-class QuickMetrics:
-    """训练内轻量评估统计器：单样本采样 + TAME-style 分时段指标。"""
-
-    def __init__(self, pred_len, meter_per_unit=0.3048):
-        self.pred_len = int(pred_len)
-        self.meter_per_unit = float(meter_per_unit)
-        self.total_se = torch.zeros(self.pred_len, dtype=torch.float64)
-        self.total_de = torch.zeros(self.pred_len, dtype=torch.float64)
-        self.total_counts = torch.zeros(self.pred_len, dtype=torch.float64)
-        self.total_dist_sum = 0.0
-        self.total_valid_points = 0.0
-        self.total_fde_sum = 0.0
-        self.total_fde_count = 0.0
-
-    def update(self, pred, target, op_mask):
-        pred = pred[:, :self.pred_len, :2]
-        target = target[:, :self.pred_len, :2]
-        valid_mask = op_mask[:, :self.pred_len, 0] if op_mask.dim() == 3 else op_mask[:, :self.pred_len]
-        valid_mask = (valid_mask > 0).float().to(pred.device)
-
-        diff = pred - target
-        se = torch.sum(diff ** 2, dim=-1)
-        dist = torch.sqrt(se)
-
-        self.total_se += torch.sum(se * valid_mask, dim=0).double().cpu()
-        self.total_de += torch.sum(dist * valid_mask, dim=0).double().cpu()
-        self.total_counts += torch.sum(valid_mask, dim=0).double().cpu()
-
-        self.total_dist_sum += float(torch.sum(dist * valid_mask).item())
-        self.total_valid_points += float(torch.sum(valid_mask).item())
-
-        t_idx = torch.arange(dist.size(1), device=dist.device).unsqueeze(0).expand_as(dist)
-        masked_idx = torch.where(valid_mask > 0, t_idx, t_idx.new_full(t_idx.shape, -1))
-        last_idx = masked_idx.max(dim=1).values
-        has_valid = last_idx >= 0
-        final_dist = dist.gather(1, last_idx.clamp(min=0).unsqueeze(1)).squeeze(1)
-        self.total_fde_sum += float(torch.sum(final_dist * has_valid.float()).item())
-        self.total_fde_count += float(torch.sum(has_valid.float()).item())
-
-    def summary(self):
-        counts = self.total_counts.clamp(min=1.0)
-        rmse_per_step_ft = torch.sqrt(self.total_se / counts)
-        fde_per_step_ft = self.total_de / counts
-
-        cumsum_de = torch.cumsum(self.total_de, dim=0)
-        cumsum_counts = torch.cumsum(self.total_counts, dim=0).clamp(min=1.0)
-        ade_prefix_ft = cumsum_de / cumsum_counts
-        if ade_prefix_ft.numel() > 1:
-            ade_prefix_ft[1:] = cumsum_de[:-1] / cumsum_counts[:-1]
-
-        overall_ade_ft = 0.0 if self.total_valid_points == 0 else self.total_dist_sum / self.total_valid_points
-        overall_fde_ft = 0.0 if self.total_fde_count == 0 else self.total_fde_sum / self.total_fde_count
-        overall_rmse_ft = 0.0 if self.total_valid_points == 0 else float(torch.sqrt(self.total_se.sum() / self.total_counts.sum().clamp(min=1.0)).item())
-
-        return {
-            "rmse_per_step_ft": rmse_per_step_ft,
-            "fde_per_step_ft": fde_per_step_ft,
-            "ade_prefix_ft": ade_prefix_ft,
-            "overall_ade_ft": overall_ade_ft,
-            "overall_fde_ft": overall_fde_ft,
-            "overall_rmse_ft": overall_rmse_ft,
-            "overall_rmse_m": overall_rmse_ft * self.meter_per_unit,
-        }
-
-
-def format_timestep_metrics(metric_tensor, meter_per_unit=0.3048):
-    values = []
-    for label, t_idx in TIME_STEP_LABELS:
-        if t_idx < metric_tensor.numel():
-            val_ft = float(metric_tensor[t_idx].item())
-            values.append(f"{label}: {val_ft:.3f} ft ({val_ft * meter_per_unit:.3f} m)")
-    return " | ".join(values) if values else "no valid timestep"
-
-
 class EMAModel:
+    """维护 DDP 训练模型的 EMA 影子参数。"""
+
     def __init__(self, model, decay=0.999):
+        """初始化 EMA 状态。"""
         self.decay = decay
         self.shadow = copy.deepcopy(model.state_dict())
         self._shadow_on_model = False
@@ -180,6 +122,7 @@ class EMAModel:
                 param.requires_grad = False
 
     def step(self, model):
+        """在每次优化后更新 EMA 参数。"""
         with torch.no_grad():
             for name, param in model.state_dict().items():
                 if name in self.shadow:
@@ -189,6 +132,7 @@ class EMAModel:
                         self.shadow[name].copy_(param.data)
 
     def swap_shadow(self, target_model):
+        """在真实参数与 EMA 影子参数之间原地交换。"""
         # 通过参数引用交换进行 EMA 切换，避免 clone 整个 state_dict 的峰值开销。
         model_state = target_model.state_dict(keep_vars=True)
         for name, tensor in model_state.items():
@@ -223,11 +167,13 @@ def setup_ddp():
 
 
 def cleanup_ddp():
+    """安全释放分布式进程组。"""
     if dist.is_initialized():
         dist.destroy_process_group()
 
 
 def unwrap_model(model):
+    """返回 DDP 包装后的底层模型。"""
     return model.module if hasattr(model, "module") else model
 
 
@@ -244,51 +190,31 @@ def reduce_value(value, average=True):
             value /= world_size
         return value
 
+def compute_intent_class_weights(dataset):
+    """按训练集标签频率生成横纵向意图类别权重。"""
+    lat_idx = torch.as_tensor(dataset.D[:, 9].astype(int) - 1, dtype=torch.long)
+    lon_idx = torch.as_tensor(dataset.D[:, 10].astype(int) - 1, dtype=torch.long)
 
-def prepare_input_data(batch, feature_dim, device='cuda'):
-    hist = batch['hist']
-    va = batch['va']
-    fut = batch['fut']
-    op_mask = batch['op_mask']
-    hist_nbrs = batch['nbrs']
-    va_nbrs = batch['nbrs_va']
-    mask = batch['mask']
-    temporal_mask = batch['temporal_mask']
+    lat_count = torch.bincount(lat_idx.clamp(min=0, max=2), minlength=3).float()
+    lon_count = torch.bincount(lon_idx.clamp(min=0, max=2), minlength=3).float()
 
-    if int(feature_dim) != 4:
-        raise ValueError("train_ddp_fut currently supports feature_dim=4: [rel_x, rel_y, v, a].")
-    hist = torch.cat((hist, va), dim=-1).to(device)
-    hist_nbrs = torch.cat((hist_nbrs, va_nbrs), dim=-1).to(device)
-    fut = fut.to(device)
-    op_mask = op_mask.to(device)
-    mask = mask.to(device)
-    temporal_mask = temporal_mask.to(device)
+    lat_weight = 1.0 / torch.sqrt(lat_count + 1e-6)
+    lon_weight = 1.0 / torch.sqrt(lon_count + 1e-6)
+    lat_weight = lat_weight / lat_weight.mean().clamp(min=1e-6)
+    lon_weight = lon_weight / lon_weight.mean().clamp(min=1e-6)
+    return lat_weight, lon_weight, lat_count, lon_count
 
-    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
-
-
-def build_ngsim_dataset(mat_path, args):
-    # 兼容不同 NgsimDataset 版本，按签名过滤参数。
-    dataset_kwargs = {
-        "t_h": 30,
-        "t_f": 50,
-        "d_s": 2,
-        "enc_size": args.encoder_input_dim,
-        "feature_dim": args.feature_dim,
-    }
-    sig = inspect.signature(NgsimDataset.__init__)
-    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-    if has_var_kw:
-        return NgsimDataset(mat_path, **dataset_kwargs)
-    filtered = {k: v for k, v in dataset_kwargs.items() if k in sig.parameters}
-    return NgsimDataset(mat_path, **filtered)
 
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, ema):
+    """执行一个 DDP epoch 的 future 训练。"""
     model.train()
     total_loss = 0.0
     total_vel = 0.0
     total_pos = 0.0
-    total_end = 0.0
+    total_lat = 0.0
+    total_lon = 0.0
+    total_acc_lat = 0.0
+    total_acc_lon = 0.0
     last_loss = 0.0
     num_batches = 0
 
@@ -305,8 +231,19 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, 
         pbar = dataloader
 
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        loss, loss_parts = model(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, return_components=True)
+        batch_data = prepare_fut_batch(batch, feature_dim, device=device)
+        loss, loss_parts = model(
+            batch_data["hist"],
+            batch_data["hist_nbrs"],
+            batch_data["mask"],
+            batch_data["temporal_mask"],
+            batch_data["fut"],
+            batch_data["op_mask"],
+            extras=batch_data["extras"],
+            device=device,
+            epoch=epoch,
+            return_components=True,
+        )
 
         # Backward
         optimizer.zero_grad()
@@ -319,7 +256,10 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, 
         total_loss += loss.item()
         total_vel += float(loss_parts["loss_vel"].item())
         total_pos += float(loss_parts["loss_pos"].item())
-        total_end += float(loss_parts["loss_end"].item())
+        total_lat += float(loss_parts["loss_lat"].item())
+        total_lon += float(loss_parts["loss_lon"].item())
+        total_acc_lat += float(loss_parts["acc_lat"].item())
+        total_acc_lon += float(loss_parts["acc_lon"].item())
         last_loss = float(loss.item())
         num_batches += 1
 
@@ -327,10 +267,16 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, 
             avg_loss = total_loss / num_batches
             avg_vel = total_vel / num_batches
             avg_pos = total_pos / num_batches
-            avg_end = total_end / num_batches
+            avg_lat = total_lat / num_batches
+            avg_lon = total_lon / num_batches
+            avg_acc_lat = total_acc_lat / num_batches
+            avg_acc_lon = total_acc_lon / num_batches
             pbar.set_postfix_str(
                 f"loss={loss.item():.6f}(avg={avg_loss:.6f}) | "
-                f"vel={avg_vel:.6f} | pos={avg_pos:.6f} | end={avg_end:.6f}"
+                f"vel={avg_vel:.6f} | "
+                f"pos={avg_pos:.6f} | "
+                f"lat={avg_lat:.6f}/{avg_acc_lat:.4f} | "
+                f"lon={avg_lon:.6f}/{avg_acc_lon:.4f}"
             )
 
     # Aggregate metrics/count across all ranks for true global averages.
@@ -338,7 +284,10 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, 
         total_loss,
         total_vel,
         total_pos,
-        total_end,
+        total_lat,
+        total_lon,
+        total_acc_lat,
+        total_acc_lon,
         float(num_batches)
     ], device=device)
     last_loss_tensor = torch.tensor([last_loss], device=device)
@@ -349,18 +298,23 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank, 
     else:
         world_size = 1.0
 
-    global_total_batches = max(float(loss_count[4].item()), 1.0)
+    global_total_batches = max(float(loss_count[7].item()), 1.0)
     return {
         "loss_avg": float(loss_count[0].item()) / global_total_batches,
         "loss_vel_avg": float(loss_count[1].item()) / global_total_batches,
         "loss_pos_avg": float(loss_count[2].item()) / global_total_batches,
-        "loss_end_avg": float(loss_count[3].item()) / global_total_batches,
+        "loss_lat_avg": float(loss_count[3].item()) / global_total_batches,
+        "loss_lon_avg": float(loss_count[4].item()) / global_total_batches,
+        "acc_lat_avg": float(loss_count[5].item()) / global_total_batches,
+        "acc_lon_avg": float(loss_count[6].item()) / global_total_batches,
         "loss_last": float(last_loss_tensor.item()) / world_size,
     }
 
 
 @torch.no_grad()
-def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_ratio=0.1, max_batches=0):
+def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_ratio=0.1, max_batches=0, num_samples=5):
+    """在 rank0 上执行 DDP future 模型的轻量评估。"""
+    # 固定验证环节的随机数种子，消除采样方差导致的指标波动
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
@@ -370,7 +324,7 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
     total_ade = 0.0
     total_fde = 0.0
     num_batches = 0
-    quick_metrics = QuickMetrics(pred_len=int(getattr(fut_model, "T", 25)))
+    quick_metrics = TrajectoryMetrics(pred_len=int(getattr(fut_model, "T", 25)))
 
     total_batches = len(dataloader)
     if total_batches == 0:
@@ -394,15 +348,23 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
         if batch_idx >= target_batches:
             break
 
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        eval_loss, pred_fut, eval_ade, eval_fde = fut_model.forwardEval(
-            hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device
+        batch_data = prepare_fut_batch(batch, feature_dim, device=device)
+        eval_loss, pred_fut, eval_ade, eval_fde = fut_model.forwardEval_minADE(
+            batch_data["hist"],
+            batch_data["hist_nbrs"],
+            batch_data["mask"],
+            batch_data["temporal_mask"],
+            batch_data["fut"],
+            batch_data["op_mask"],
+            batch_data["extras"],
+            device,
+            K=max(1, int(num_samples)),
         )
 
         total_loss += float(eval_loss.item())
         total_ade += float(eval_ade.item())
         total_fde += float(eval_fde.item())
-        quick_metrics.update(pred_fut, fut, op_mask)
+        quick_metrics.update(pred_fut, batch_data["fut"], batch_data["op_mask"])
         num_batches += 1
         pbar.set_postfix_str(
             f"loss={eval_loss.item():.6f}(avg={(total_loss / num_batches):.6f}) | "
@@ -415,6 +377,7 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
     return total_loss / num_batches, total_ade / num_batches, total_fde / num_batches, quick_metrics.summary()
 
 def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, rank, ema=None):
+    """按配置恢复 DDP future 训练断点。"""
     start_epoch = 0
     best_ade = float('inf')
     ckpt_path = None
@@ -480,6 +443,7 @@ def load_checkpoint_if_needed(args, model, optimizer, scheduler, device, rank, e
 
 
 def main():
+    """运行 DDP future 训练入口。"""
     # 1. DDP Setup
     rank, local_rank, world_size = setup_ddp()
     device = torch.device(f"cuda:{local_rank}")
@@ -493,6 +457,7 @@ def main():
     args = get_args_parser().parse_args()
     if int(args.feature_dim) != 4:
         raise ValueError("train_ddp_fut currently supports feature_dim=4 only.")
+    eval_ratio = float(args.eval_ratio)
 
     script_dir = Path(__file__).resolve().parent
     checkpoint_root = Path(args.checkpoint_dir)
@@ -506,18 +471,20 @@ def main():
         epoch_text_log_path = build_epoch_text_log_path(fut_ckpt_dir, "train_ddp_fut_epoch_metrics")
         ensure_epoch_text_log(epoch_text_log_path)
         print(f"[Log] Epoch metrics file: {epoch_text_log_path}")
-        fixed_eval_ratio = 0.03
         print(
             f"[FutModel-DDP] self_condition_prob={args.self_condition_prob}, "
-            f"eval_ratio={fixed_eval_ratio}"
+            f"eval_ratio={eval_ratio}"
         )
     else:
         epoch_text_log_path = None
-        fixed_eval_ratio = 0.03
 
     # Use args.data_root
     data_root = Path(args.data_root)
     train_path = str(data_root / 'TrainSet.mat')
+    test_path = data_root / 'TestSet.mat'
+    val_path = data_root / 'ValSet.mat'
+    eval_path = val_path if val_path.exists() else test_path
+    eval_split_name = "ValSet" if val_path.exists() else "TestSet"
 
     train_dataset = build_ngsim_dataset(train_path, args)
 
@@ -530,21 +497,22 @@ def main():
         num_workers=args.num_workers,
         collate_fn=train_dataset.collate_fn,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
         sampler=train_sampler,
         drop_last=True
     )
 
-    test_loader = None
+    eval_loader = None
     if rank == 0:
-        test_path = str(data_root / 'TestSet.mat')
-        test_dataset = build_ngsim_dataset(test_path, args)
-        test_loader = DataLoader(
-            test_dataset,
+        eval_dataset = build_ngsim_dataset(str(eval_path), args)
+        eval_loader = DataLoader(
+            eval_dataset,
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=args.num_workers,
-            collate_fn=test_dataset.collate_fn,
+            collate_fn=eval_dataset.collate_fn,
             pin_memory=True,
+            persistent_workers=args.num_workers > 0,
             drop_last=False
         )
 
@@ -573,6 +541,21 @@ def main():
     start_epoch, best_ade = load_checkpoint_if_needed(
         args, model, optimizer, scheduler, device, rank, ema
     )
+    lat_weight, lon_weight, lat_count, lon_count = compute_intent_class_weights(train_dataset)
+    unwrap_model(model).set_intent_class_weights(lat_weight, lon_weight)
+    if rank == 0:
+        print(
+            "[Intent] lat_count={} lon_count={} lat_weight={} lon_weight={}".format(
+                lat_count.tolist(),
+                lon_count.tolist(),
+                [round(v, 4) for v in lat_weight.tolist()],
+                [round(v, 4) for v in lon_weight.tolist()],
+            )
+        )
+        if eval_split_name == "ValSet":
+            print(f"[Eval] 使用 {eval_split_name} 做 epoch 内选模，指标为 forwardEval_minADE(K={max(1, int(args.num_samples))})")
+        else:
+            print(f"[Eval] 未找到 ValSet.mat，回退到 {eval_split_name} 做评估。")
     last_eval = None
 
     for epoch in range(start_epoch, args.num_epochs):
@@ -588,8 +571,14 @@ def main():
         if rank == 0:
             ema.swap_shadow(unwrap_model(model))
             eval_loss, eval_ade, eval_fde, quick_eval = evaluate_on_testset(
-                model, test_loader, device, epoch + 1, args.feature_dim,
-                eval_ratio=fixed_eval_ratio, max_batches=args.eval_max_batches
+                model,
+                eval_loader,
+                device,
+                epoch + 1,
+                args.feature_dim,
+                eval_ratio=eval_ratio,
+                max_batches=args.eval_max_batches,
+                num_samples=args.num_samples,
             )
             ema.swap_shadow(unwrap_model(model))
             eval_rmse = float(quick_eval["overall_rmse_ft"])
@@ -598,7 +587,7 @@ def main():
                 log_path=epoch_text_log_path,
                 epoch=epoch + 1,
                 train_stats=train_stats,
-                eval_ratio=fixed_eval_ratio,
+                eval_ratio=eval_ratio,
                 eval_loss=eval_loss,
                 eval_ade=eval_ade,
                 eval_fde=eval_fde,
@@ -607,7 +596,7 @@ def main():
             print_epoch_eval_summary(
                 epoch=epoch + 1,
                 train_stats=train_stats,
-                eval_ratio=fixed_eval_ratio,
+                eval_ratio=eval_ratio,
                 eval_loss=eval_loss,
                 eval_ade=eval_ade,
                 eval_fde=eval_fde,
@@ -646,15 +635,15 @@ def main():
 
     if rank == 0 and last_eval is not None:
         final_loss, final_ade, final_fde, final_quick = last_eval
-        print("\n========== Final Eval (EMA, Single-Modal, TestSet@0.03) ==========")
+        print(f"\n========== Final Eval (EMA, minADE@K={max(1, int(args.num_samples))}, {eval_split_name}@{eval_ratio:.2f}) ==========")
         print(
             f"Avg ADE: {final_ade:.6f} ft ({final_ade * 0.3048:.6f} m) | "
             f"Avg FDE: {final_fde:.6f} ft ({final_fde * 0.3048:.6f} m) | "
             f"Avg RMSE: {final_quick['overall_rmse_ft']:.6f} ft ({final_quick['overall_rmse_m']:.6f} m)"
         )
-        print(f"RMSE per-second: {format_timestep_metrics(final_quick['rmse_per_step_ft'])}")
-        print(f"FDE per-second:  {format_timestep_metrics(final_quick['fde_per_step_ft'])}")
-        print(f"ADE per-second:  {format_timestep_metrics(final_quick['ade_prefix_ft'])}")
+        print(f"RMSE per-second: {format_timestep_metrics(final_quick['rmse_per_step_ft'], time_step_labels=TIME_STEP_LABELS)}")
+        print(f"DE per-second:   {format_timestep_metrics(final_quick['de_per_step_ft'], time_step_labels=TIME_STEP_LABELS)}")
+        print(f"ADE per-second:  {format_timestep_metrics(final_quick['ade_prefix_ft'], time_step_labels=TIME_STEP_LABELS)}")
     cleanup_ddp()
 
 
