@@ -349,7 +349,7 @@ def evaluate_on_testset(model, dataloader, device, epoch, feature_dim, eval_rati
             break
 
         batch_data = prepare_fut_batch(batch, feature_dim, device=device)
-        eval_loss, pred_fut, eval_ade, eval_fde = fut_model.forwardEval_minADE(
+        eval_loss, pred_fut, eval_ade, eval_fde = fut_model.forwardEvalMultiSample(
             batch_data["hist"],
             batch_data["hist_nbrs"],
             batch_data["mask"],
@@ -553,7 +553,7 @@ def main():
             )
         )
         if eval_split_name == "ValSet":
-            print(f"[Eval] 使用 {eval_split_name} 做 epoch 内选模，指标为 forwardEval_minADE(K={max(1, int(args.num_samples))})")
+            print(f"[Eval] 使用 {eval_split_name} 做 epoch 内选模，指标为 forwardEvalMultiSample(num_samples={max(1, int(args.num_samples))})")
         else:
             print(f"[Eval] 未找到 ValSet.mat，回退到 {eval_split_name} 做评估。")
     last_eval = None
@@ -635,7 +635,7 @@ def main():
 
     if rank == 0 and last_eval is not None:
         final_loss, final_ade, final_fde, final_quick = last_eval
-        print(f"\n========== Final Eval (EMA, minADE@K={max(1, int(args.num_samples))}, {eval_split_name}@{eval_ratio:.2f}) ==========")
+        print(f"\n========== Final Eval (EMA, multi-sample oracle, num_samples={max(1, int(args.num_samples))}, {eval_split_name}@{eval_ratio:.2f}) ==========")
         print(
             f"Avg ADE: {final_ade:.6f} ft ({final_ade * 0.3048:.6f} m) | "
             f"Avg FDE: {final_fde:.6f} ft ({final_fde * 0.3048:.6f} m) | "

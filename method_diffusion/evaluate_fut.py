@@ -272,7 +272,7 @@ def run_evaluation(args, device):
                 current_hist_input = pred_hist
 
             k_samples = max(1, int(args.num_samples))
-            _, pred_fut, _, _ = model_fut.forwardEval_minADE(
+            _, pred_fut, _, _ = model_fut.forwardEvalMultiSample(
                 current_hist_input,
                 batch_data["hist_nbrs"],
                 batch_data["mask"],
@@ -286,8 +286,8 @@ def run_evaluation(args, device):
             calc_fut.update(pred_fut, batch_data["fut"], valid_mask=batch_data["op_mask"])
 
             if visualized_count < args.visualize_samples:
-                pred_all_vis = getattr(model_fut, "last_minade_all_preds", None)
-                pred_best_idx_vis = getattr(model_fut, "last_minade_best_idx", None)
+                pred_all_vis = getattr(model_fut, "last_multisample_all_preds", None)
+                pred_best_idx_vis = getattr(model_fut, "last_multisample_best_idx", None)
                 batch_metrics = compute_batch_metrics(pred_fut, batch_data["fut"], batch_data["op_mask"])
                 vis_metrics = compute_single_vis_metrics(pred_fut, batch_data["fut"], batch_data["op_mask"], batch_idx=0)
                 running_summary = calc_fut.summary()

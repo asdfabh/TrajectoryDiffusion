@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 
-from method_diffusion.models.transformer import TransformerEncoder, TransformerEncoderLayer
+from method_diffusion.models.transformer import Residual, TransformerEncoder, TransformerEncoderLayer
 
 
 class PositionalEncodingSine(nn.Module):
@@ -82,6 +82,7 @@ class HistEncoder(nn.Module):
         self.temporal_q = nn.Linear(self.model_dim, self.model_dim)
         self.temporal_k = nn.Linear(self.model_dim, self.model_dim)
         self.temporal_v = nn.Linear(self.model_dim, self.model_dim)
+        self.temporal_residual = Residual(self.model_dim)
         self.social_q = nn.Linear(self.model_dim, self.model_dim)
         self.social_k = nn.Linear(self.model_dim, self.model_dim)
         self.social_v = nn.Linear(self.model_dim, self.model_dim)
@@ -233,17 +234,18 @@ class HistEncoder(nn.Module):
         temporal_attn = torch.softmax(temporal_scores, dim=-1) * temporal_valid.to(temporal_scores.dtype)
         temporal_attn = temporal_attn / temporal_attn.sum(dim=-1, keepdim=True).clamp(min=1e-6)
         temporal_ctx = (temporal_attn.unsqueeze(-1) * temporal_v).sum(dim=2)
+        temporal_ctx = self.temporal_residual(ego_embed, temporal_ctx)
 
-        social_tokens = nbr_social_grid.reshape(batch_size, n_grid * seq_len, self.model_dim)
-        social_valid = social_occ.unsqueeze(-1).expand(-1, -1, seq_len).reshape(batch_size, n_grid * seq_len)
         social_q = self.social_q(ego_enc)
+        social_tokens = nbr_social_grid.permute(0, 2, 1, 3).contiguous()
         social_k = self.social_k(social_tokens)
         social_v = self.social_v(social_tokens)
-        social_scores = torch.matmul(social_q, social_k.transpose(1, 2)) / math.sqrt(self.model_dim)
-        social_scores = social_scores.masked_fill(~social_valid.unsqueeze(1), -1e4)
-        social_attn = torch.softmax(social_scores, dim=-1) * social_valid.unsqueeze(1).to(social_scores.dtype)
+        social_scores = (social_q.unsqueeze(2) * social_k).sum(dim=-1) / math.sqrt(self.model_dim)
+        social_valid = social_occ.unsqueeze(1).expand(-1, seq_len, -1)
+        social_scores = social_scores.masked_fill(~social_valid, -1e4)
+        social_attn = torch.softmax(social_scores, dim=-1) * social_valid.to(social_scores.dtype)
         social_attn = social_attn / social_attn.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-        social_ctx = torch.matmul(social_attn, social_v)
+        social_ctx = (social_attn.unsqueeze(-1) * social_v).sum(dim=2)
 
         fused = self.fusion_mlp(torch.cat((ego_enc, temporal_ctx, social_ctx), dim=-1))
         memory_tokens = fused

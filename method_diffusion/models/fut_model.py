@@ -605,8 +605,8 @@ class DiffusionFut(nn.Module):
         return loss
 
     @torch.no_grad()
-    def forwardEval_minADE(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, extras=None, device=None, K=5):
-        """按 TopK 意图组合展开采样，并返回 oracle minADE 结果。
+    def forwardEvalMultiSample(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, extras=None, device=None, K=5):
+        """执行多样本采样评估，并返回 oracle 最优样本结果。
 
         Args:
             hist: ego 历史状态。
@@ -617,14 +617,14 @@ class DiffusionFut(nn.Module):
             op_mask: 未来有效位掩码。
             extras: 车道、距离与意图标签字典。
             device: 目标设备。
-            K: 参与展开采样的意图组合数量。
+            K: 采样次数。
 
         Returns:
             一个四元组：
-            - loss: 以最佳候选为基准计算的总损失。
-            - best_pred_phys: 最佳候选对应的未来预测轨迹。
-            - ade_batch: 最佳候选的 batch ADE。
-            - fde_batch: 最佳候选的 batch FDE。
+            - loss: 以 oracle 最优样本为基准计算的总损失。
+            - best_pred_phys: oracle 最优样本对应的未来预测轨迹。
+            - ade_batch: oracle 最优样本的 batch ADE。
+            - fde_batch: oracle 最优样本的 batch FDE。
         """
         extras, device = self.resolveForwardInputs(hist, hist_nbrs, extras, device)
         batch_size, t_len, _ = future.shape
@@ -680,10 +680,10 @@ class DiffusionFut(nn.Module):
             lon_gt=extras.get("lon_gt"),
         )
 
-        self.last_minade_all_preds = all_preds.detach()
-        self.last_minade_best_idx = best_k_idx.detach()
-        self.last_minade_intent_pairs = None
-        self.last_minade_intent_prob = None
+        self.last_multisample_all_preds = all_preds.detach()
+        self.last_multisample_best_idx = best_k_idx.detach()
+        self.last_multisample_intent_pairs = None
+        self.last_multisample_intent_prob = None
 
         ade_batch, fde_batch = self.computeAdeFde(best_pred_phys, future, valid_mask)
         self.maybeVisualize(
@@ -726,5 +726,6 @@ class DiffusionFut(nn.Module):
             op_mask,
             extras,
             device,
+            epoch=epoch,
             return_components=return_components,
         )
