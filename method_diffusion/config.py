@@ -81,7 +81,7 @@ def get_args_parser():
     parser.add_argument("--fut_enable_eval_vis", default=0, type=int)
 
     # Eval
-    parser.add_argument("--eval_ratio", default=0.03, type=float)
+    parser.add_argument("--eval_ratio", default=0.5, type=float)
     parser.add_argument("--num_samples", default=5, type=int)
 
     return parser
