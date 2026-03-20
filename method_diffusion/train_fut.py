@@ -2,6 +2,7 @@ import sys
 import os
 import re
 import csv
+import math
 from pathlib import Path
 
 import torch
@@ -55,13 +56,12 @@ def load_checkpoint(args, model, optimizer, scheduler, device):
     return start_epoch, best_ade
 
 # 将单个 epoch 的训练和验证结果追加写入 CSV。
-def write_csv_log(csv_path, epoch, train_stats, eval_loss, eval_ade, eval_fde, lr):
+def write_csv_log(csv_path, epoch, train_stats, eval_ade, eval_fde, lr):
     row = {
         "epoch": epoch,
         "train_loss": train_stats["loss"],
         "train_vel_loss": train_stats["loss_vel"],
         "train_pos_loss": train_stats["loss_pos"],
-        "val_loss": eval_loss,
         "val_ade_ft": eval_ade,
         "val_fde_ft": eval_fde,
         "val_ade_m": eval_ade * 0.3048,
@@ -79,7 +79,6 @@ def init_csv_log(csv_path):
         "train_loss",
         "train_vel_loss",
         "train_pos_loss",
-        "val_loss",
         "val_ade_ft",
         "val_fde_ft",
         "val_ade_m",
@@ -141,6 +140,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
         loss, loss_parts = model.forwardTrain( hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, return_components=True)
+        # _, eval_ade, eval_fde = model.forwardEval_minADE(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, K=5)
 
         optimizer.zero_grad()
         loss.backward()
@@ -166,29 +166,35 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
     }
 
 @torch.no_grad()
-# 在完整验证集上评估模型并返回平均指标。
-def evaluate(model, dataloader, device, epoch, feature_dim):
+# 按验证集比例评估模型并返回平均指标。
+def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio):
     # 固定验证环节的随机数种子，消除采样方差导致的指标波动
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
 
     model.eval()
-    total_loss = 0.0
     total_ade = 0.0
     total_fde = 0.0
     num_batches = 0
 
     if len(dataloader) == 0:
         model.train()
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0
 
-    pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Val", ncols=120)
+    total_batches = len(dataloader)
+    if eval_ratio <= 0.0 or eval_ratio >= 1.0:
+        target_batches = total_batches
+    else:
+        target_batches = max(1, int(math.ceil(total_batches * float(eval_ratio))))
+
+    pbar = tqdm(dataloader, total=target_batches, desc=f"Ep{epoch} Val", ncols=120)
     for batch in pbar:
+        if num_batches >= target_batches:
+            break
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        eval_loss, _, eval_ade, eval_fde = model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+        _, eval_ade, eval_fde = model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
 
-        total_loss += float(eval_loss.item())
         total_ade += float(eval_ade.item())
         total_fde += float(eval_fde.item())
         num_batches += 1
@@ -199,8 +205,8 @@ def evaluate(model, dataloader, device, epoch, feature_dim):
 
     model.train()
     if num_batches == 0:
-        return 0.0, 0.0, 0.0
-    return total_loss / num_batches, total_ade / num_batches, total_fde / num_batches
+        return 0.0, 0.0
+    return total_ade / num_batches, total_fde / num_batches
 
 
 # 初始化训练组件并执行 fut 训练主流程。
@@ -248,22 +254,23 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
     start_epoch, best_ade = load_checkpoint(args, model, optimizer, scheduler, device)
+    eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
 
     for epoch in range(start_epoch, args.num_epochs):
         train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim)
-        eval_loss, eval_ade, eval_fde = evaluate(model, val_loader, device, epoch + 1, args.feature_dim)
+        eval_ade, eval_fde = evaluate(model, val_loader, device, epoch + 1, args.feature_dim, eval_ratio)
         current_lr = optimizer.param_groups[0]["lr"]
-        write_csv_log(log_csv_path, epoch + 1, train_stats, eval_loss, eval_ade, eval_fde, current_lr)
+        write_csv_log(log_csv_path, epoch + 1, train_stats, eval_ade, eval_fde, current_lr)
         writer.add_scalar("Loss/Train", train_stats["loss"], epoch + 1)
         writer.add_scalar("Loss/TrainVel", train_stats["loss_vel"], epoch + 1)
         writer.add_scalar("Loss/TrainPos", train_stats["loss_pos"], epoch + 1)
-        writer.add_scalar("Loss/Val", eval_loss, epoch + 1)
+        writer.add_scalar("Eval/ADE_ft", eval_ade, epoch + 1)
+        writer.add_scalar("Eval/FDE_ft", eval_fde, epoch + 1)
         print(
             f"Epoch {epoch + 1}/{args.num_epochs} | "
             f"train={train_stats['loss']:.6f} | "
             f"vel={train_stats['loss_vel']:.6f} | "
             f"pos={train_stats['loss_pos']:.6f} | "
-            f"val={eval_loss:.6f} | "
             f"ade={eval_ade:.4f}ft | "
             f"fde={eval_fde:.4f}ft"
         )
@@ -279,7 +286,6 @@ def main():
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "loss": train_stats["loss"],
-            "eval_loss": eval_loss,
             "eval_ade": eval_ade,
             "eval_fde": eval_fde,
             "best_ade": best_ade,
