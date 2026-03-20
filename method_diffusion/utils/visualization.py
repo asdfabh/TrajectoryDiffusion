@@ -215,347 +215,318 @@ def plot_traj_with_mask(hist_original, hist_masked, hist_pred, nbrs_original=Non
     plt.show()
 
 
-def _to_numpy_if_tensor(x):
-    if isinstance(x, torch.Tensor):
-        return x.detach().cpu().numpy()
-    return x
-
-
-def _normalize_ego_hist(hist_arr):
-    if hist_arr is None:
-        return None
-    arr = np.asarray(hist_arr)
-    if arr.ndim == 3:
-        if arr.shape[0] == 1:
-            arr = arr[0]
-        elif arr.shape[1] == 1:
-            arr = arr[:, 0, :]
-    if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] < 2:
-        return None
-    return arr
-
-
-def _extract_nbrs_for_batch(hist_nbrs, temporal_mask, batch_idx):
+def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, future=None, pred=None,
+                                 pred_all=None, pred_best_idx=None,
+                                 hist_masked=None, future_mask=None, batch_idx=None, save_path=None,
+                                 metrics=None, input_unit=None, show_plot=None):
     """
-    统一邻居输入格式，输出 [N, T, D]。
-    支持:
-    - None
-    - [B, N, T, D]
-    - [B, T, N, D]
-    - [N_total, T, D] + temporal_mask(用于恢复每个样本的邻居切片)
+    统一可视化函数（所有参数都允许 None）：
+    1) 可视化 Ego 历史、邻车历史、真实 future、预测 future
+    2) 支持显示多模态全部预测轨迹，最佳轨迹高亮
+    3) 输出并标记 FUT/PRED 最后一个点的坐标与 index
     """
-    if hist_nbrs is None:
-        return None
 
-    nbr_data = _to_numpy_if_tensor(hist_nbrs)
-    tm_data = _to_numpy_if_tensor(temporal_mask)
-
-    # list/tuple: 视为 batch 维可索引结构
-    if isinstance(nbr_data, (list, tuple)):
-        if len(nbr_data) == 0:
+    def to_numpy(data):
+        if data is None:
             return None
-        pick_idx = int(max(0, min(batch_idx, len(nbr_data) - 1)))
-        sample = _to_numpy_if_tensor(nbr_data[pick_idx])
-        sample = np.asarray(sample)
-        if sample.ndim == 2:
-            return sample[None, ...]
-        if sample.ndim == 3:
-            return sample
-        return None
+        if isinstance(data, torch.Tensor):
+            return data.detach().cpu().numpy()
+        return np.asarray(data)
 
-    nbr_arr = np.asarray(nbr_data)
-    if nbr_arr.ndim == 2:
-        # 单条邻居轨迹 [T, D]
-        return nbr_arr[None, ...]
-
-    if nbr_arr.ndim == 4:
-        # [B, N, T, D] 或 [B, T, N, D]
-        if batch_idx >= nbr_arr.shape[0]:
+    def safe_get_batch(data, b_idx, batch_ndim=3):
+        arr = to_numpy(data)
+        if arr is None:
             return None
-        sample = nbr_arr[batch_idx]
-        if sample.ndim != 3:
+        if arr.ndim >= batch_ndim and arr.shape[0] > b_idx:
+            return arr[b_idx]
+        return arr
+
+    def normalize_traj2d(arr):
+        if arr is None:
+            return None
+        arr = np.asarray(arr)
+        if arr.ndim == 3 and arr.shape[0] == 1:
+            arr = arr.squeeze(0)
+        if arr.ndim != 2 or arr.shape[-1] < 2:
+            return None
+        return arr
+
+    def reconstruct_nbrs_from_mask(nbrs_flat, tmask, b_idx):
+        """
+        固定格式：
+        - nbrs_flat: [N_total, T, D]
+        - temporal_mask: [B, 3, 13, F]
+        通过 temporal_mask 的占位顺序把当前样本邻车恢复成 [N_grid, T, D]。
+        """
+        nbrs_arr = to_numpy(nbrs_flat)
+        mask_arr = to_numpy(tmask)
+        if nbrs_arr is None or mask_arr is None:
+            return None
+        if nbrs_arr.ndim != 3 or mask_arr.ndim != 4:
+            return None
+        if b_idx < 0 or b_idx >= mask_arr.shape[0]:
             return None
 
-        # 优先利用 temporal_mask 计数判断邻居轴。
-        if tm_data is not None:
-            tm_arr = np.asarray(tm_data)
-            if tm_arr.ndim >= 2 and batch_idx < tm_arr.shape[0]:
-                if tm_arr.ndim == 4:
-                    occ = np.any(tm_arr > 0, axis=-1).reshape(tm_arr.shape[0], -1)
-                elif tm_arr.ndim == 3:
-                    occ = np.any(tm_arr > 0, axis=-1)
-                else:
-                    occ = tm_arr > 0
-                cur_nbrs = int(occ.sum(axis=1).astype(np.int64)[batch_idx])
-                if cur_nbrs >= 0:
-                    # [T, N, D] -> [N, T, D]
-                    if sample.shape[1] == cur_nbrs and sample.shape[0] != cur_nbrs:
-                        return np.transpose(sample, (1, 0, 2))
-                    # [N, T, D]
-                    if sample.shape[0] == cur_nbrs:
-                        return sample
+        occ = mask_arr[..., 0] if mask_arr.shape[-1] > 0 else mask_arr[..., -1]
+        occ = occ.astype(bool)
+        occ_flat = occ.reshape(occ.shape[0], -1)
 
-        # 回退启发式：如果第 0 维更像时间长度，按 [T, N, D] 处理
-        if sample.shape[0] in (16, 25, 26, 31, 50):
-            return np.transpose(sample, (1, 0, 2))
-        return sample
+        counts = occ_flat.sum(axis=1).astype(int)
+        start = int(counts[:b_idx].sum())
+        cur_count = int(counts[b_idx])
+        if cur_count <= 0 or start >= nbrs_arr.shape[0]:
+            return None
 
-    if nbr_arr.ndim == 3:
-        # 关键场景: collate 后扁平邻居 [N_total, T, D]
-        # 通过 temporal_mask 恢复某个 batch 样本的邻居切片。
-        if tm_data is not None:
-            tm_arr = np.asarray(tm_data)
-            if tm_arr.ndim >= 2 and batch_idx < tm_arr.shape[0]:
-                if tm_arr.ndim == 4:
-                    occ = np.any(tm_arr > 0, axis=-1).reshape(tm_arr.shape[0], -1)
-                elif tm_arr.ndim == 3:
-                    occ = np.any(tm_arr > 0, axis=-1)
-                else:
-                    occ = tm_arr > 0
+        end = min(start + cur_count, nbrs_arr.shape[0])
+        cur_nbrs = nbrs_arr[start:end]  # [cur, T, D]
+        occ_ids = np.where(occ_flat[b_idx])[0]
+        take = min(len(occ_ids), cur_nbrs.shape[0])
+        if take <= 0:
+            return None
 
-                occ_counts = occ.sum(axis=1).astype(np.int64)
-                start = int(occ_counts[:batch_idx].sum())
-                cur = int(occ_counts[batch_idx])
-                end = min(start + cur, nbr_arr.shape[0])
-                if end > start:
-                    return nbr_arr[start:end]
-                return np.empty((0, nbr_arr.shape[1], nbr_arr.shape[2]), dtype=nbr_arr.dtype)
+        n_grid = occ_flat.shape[1]
+        t_len, feat_dim = cur_nbrs.shape[1], cur_nbrs.shape[2]
+        out = np.zeros((n_grid, t_len, feat_dim), dtype=cur_nbrs.dtype)
+        out[occ_ids[:take], :, :] = cur_nbrs[:take, :, :]
+        return out  # [N_grid, T, D]
 
-        # 无法从 temporal_mask 还原时，尽量按 [N, T, D] 解释
-        return nbr_arr
+    def resolve_best_idx(best_idx_data, b_idx, num_modes):
+        if best_idx_data is None or num_modes <= 0:
+            return None
+        arr = to_numpy(best_idx_data)
+        if arr is None:
+            return None
+        idx_val = None
+        if np.isscalar(arr):
+            idx_val = int(arr)
+        elif arr.ndim == 0:
+            idx_val = int(arr.item())
+        elif arr.ndim >= 1 and arr.shape[0] > b_idx:
+            idx_val = int(np.asarray(arr[b_idx]).reshape(-1)[0])
+        if idx_val is None:
+            return None
+        return max(0, min(num_modes - 1, idx_val))
 
-    return None
+    def select_best_by_ade(pred_modes, gt_traj, fut_mask_arr):
+        if pred_modes is None or pred_modes.ndim != 3 or pred_modes.shape[0] == 0:
+            return None
+        if gt_traj is None or gt_traj.ndim != 2 or gt_traj.shape[-1] < 2:
+            return 0
 
+        valid = np.ones(gt_traj.shape[0], dtype=bool)
+        if fut_mask_arr is not None:
+            fm = np.asarray(fut_mask_arr).squeeze()
+            if fm.ndim > 1:
+                fm = fm[..., 0]
+            valid = fm[:gt_traj.shape[0]] > 0.5
+            if not np.any(valid):
+                valid = np.ones(gt_traj.shape[0], dtype=bool)
 
-def visualize_batch_trajectories(
-        hist=None,
-        hist_nbrs=None,
-        future=None,
-        pred=None,
-        hist_masked=None,
-        batch_idx=0,
-        save_path=None,
-        best_index=None,
-        temporal_mask=None,
-        pred_all=None,
-        pred_best_idx=None,
-        future_mask=None,
-        metrics=None,
-        input_unit='m',
-        show_plot=True,
-):
-    """
-    可视化函数 (支持多模态预测):
-    - hist (Blue): Hist Model 输出的 Ego 重构轨迹
-    - hist_nbrs (Yellow): 真实的完整历史 (Ego + Neighbors)
-    - hist_masked (Red X): 在真实的 Ego 历史(hist_nbrs[0])上标记被掩码的点
-    - future (Green): 真实未来轨迹
-    - pred (Cyan): 预测未来轨迹 (支持多条)
-    - best_index: 多模态下指定的最佳轨迹索引，突出显示为红色
-    """
+        best_k = 0
+        best_ade = float("inf")
+        for k in range(pred_modes.shape[0]):
+            traj = pred_modes[k]
+            if traj.ndim != 2 or traj.shape[-1] < 2:
+                continue
+            t_len = min(traj.shape[0], gt_traj.shape[0], valid.shape[0])
+            if t_len <= 0:
+                continue
+            vm = valid[:t_len]
+            if not np.any(vm):
+                continue
+            diff = traj[:t_len, :2] - gt_traj[:t_len, :2]
+            ade = float(np.linalg.norm(diff, axis=-1)[vm].mean())
+            if ade < best_ade:
+                best_ade = ade
+                best_k = k
+        return best_k
 
-    # --- 数据提取辅助函数 ---
-    def get_val(tensor, b_idx):
-        if tensor is None: return None
-        if isinstance(tensor, torch.Tensor):
-            return tensor[b_idx].detach().cpu().numpy()
-        return tensor[b_idx]
+    idx = 0 if batch_idx is None else int(batch_idx)
+    unit = 'ft' if input_unit is None else input_unit
+    if show_plot is None:
+        show_plot = save_path is None
 
-    # 1. 提取数据
-    recon_hist = get_val(hist, batch_idx)  # [T, D]
-    ego_hist = _normalize_ego_hist(recon_hist)
-    nbr_hist = _extract_nbrs_for_batch(hist_nbrs, temporal_mask, batch_idx)  # [N, T, D] or None
-    gt_fut = get_val(future, batch_idx)  # [T_f, D]
-    pred_src = pred_all if pred_all is not None else pred
-    pred_fut = get_val(pred_src, batch_idx)  # [K, T_f, D] / [T_f, K, D] / [T_f, D]
-    mask_arr = get_val(hist_masked, batch_idx)  # [T, ...]
+    recon_hist = normalize_traj2d(safe_get_batch(hist, idx, batch_ndim=3))
+    gt_fut = normalize_traj2d(safe_get_batch(future, idx, batch_ndim=3))
+    pred_fut_single = normalize_traj2d(safe_get_batch(pred, idx, batch_ndim=3))
+    hist_mask_arr = safe_get_batch(hist_masked, idx, batch_ndim=3)
+    fut_mask_arr = safe_get_batch(future_mask, idx, batch_ndim=3)
+
+    pred_modes = safe_get_batch(pred_all, idx, batch_ndim=4)
+    if pred_modes is not None:
+        pred_modes = np.asarray(pred_modes)
+        if pred_modes.ndim == 2 and pred_modes.shape[-1] >= 2:
+            pred_modes = pred_modes[None, ...]
+        if pred_modes.ndim != 3 or pred_modes.shape[-1] < 2:
+            pred_modes = None
+
+    best_k = resolve_best_idx(pred_best_idx, idx, 0 if pred_modes is None else pred_modes.shape[0])
+    if best_k is None and pred_modes is not None:
+        best_k = select_best_by_ade(pred_modes, gt_fut, fut_mask_arr)
+
+    pred_fut_best = pred_fut_single
+    if pred_fut_best is None and pred_modes is not None and pred_modes.shape[0] > 0:
+        k_idx = 0 if best_k is None else best_k
+        pred_fut_best = normalize_traj2d(pred_modes[k_idx])
+
+    nbrs_vis = reconstruct_nbrs_from_mask(hist_nbrs, temporal_mask, idx)
 
     fig, ax = plt.subplots(figsize=(10, 10))
+    info = {"fut_last": None, "pred_last": None, "pred_best_idx": best_k}
 
-    # 将 best_index 规范为当前 batch 样本的 int，避免张量布尔歧义
-    best_index_src = pred_best_idx if pred_best_idx is not None else best_index
-    best_idx = None
-    if best_index_src is not None:
-        if isinstance(best_index_src, torch.Tensor):
-            idx_tensor = best_index_src
-            if idx_tensor.numel() == 1:
-                best_idx = int(idx_tensor.item())
-            else:
-                best_idx = int(idx_tensor[batch_idx].item())
-        elif isinstance(best_index_src, (np.ndarray, list, tuple)):
-            if np.asarray(best_index_src).ndim == 0:
-                best_idx = int(best_index_src)
-            else:
-                best_idx = int(best_index_src[batch_idx])
-        else:
-            best_idx = int(best_index_src)
+    # A. Neighbors
+    if nbrs_vis is not None:
+        first_nbr = True
+        for n_idx in range(nbrs_vis.shape[0]):
+            traj = np.asarray(nbrs_vis[n_idx])
+            if traj.ndim != 2 or traj.shape[0] == 0 or traj.shape[-1] < 2:
+                continue
+            valid = np.any(np.abs(traj[:, :2]) > 1e-4, axis=1)
+            if np.count_nonzero(valid) < 2:
+                continue
+            traj_valid = traj[valid]
+            ax.plot(
+                traj_valid[:, 1], traj_valid[:, 0],
+                color='#D8B365', alpha=0.55, linewidth=1.1, linestyle='-',
+                label='Neighbors' if first_nbr else None, zorder=1
+            )
+            first_nbr = False
 
-    # --- A. 绘制 Hist/Nbrs Context ---
-    gt_ego_traj = ego_hist
-    if gt_ego_traj is not None and np.sum(np.abs(gt_ego_traj[:, :2])) > 1e-2:
-        ax.plot(
-            gt_ego_traj[:, 1], gt_ego_traj[:, 0],
-            color='orange', alpha=0.45, linewidth=1.2, marker='.', markersize=2,
-            label='GT Hist (Ego)'
-        )
+    # B. Ego Hist
+    gt_ego_traj = recon_hist
+    if gt_ego_traj is not None:
+        ax.plot(gt_ego_traj[:, 1], gt_ego_traj[:, 0], 'b-o', label='Hist', markersize=4, linewidth=2, alpha=0.8)
 
-    if nbr_hist is not None:
-        nbr_arr = np.asarray(nbr_hist)
-        if nbr_arr.ndim == 2:
-            nbr_arr = nbr_arr[None, ...]
-        if nbr_arr.ndim == 3:
-            nbr_label_written = False
-            for i in range(nbr_arr.shape[0]):
-                traj = nbr_arr[i]
-                if traj.ndim != 2 or traj.shape[0] == 0 or traj.shape[1] < 2:
-                    continue
-                if np.sum(np.abs(traj[:, :2])) <= 1e-2:
-                    continue
-                ax.plot(
-                    traj[:, 1], traj[:, 0],
-                    color='orange', alpha=0.6, linewidth=1.0, marker='.', markersize=2,
-                    label='GT Hist (Nbrs)' if not nbr_label_written else None
-                )
-                nbr_label_written = True
-
-    # --- B. 绘制 Mask 标记 (红色 X) ---
-    if mask_arr is not None and gt_ego_traj is not None:
-        if mask_arr.ndim > 1 and mask_arr.shape[-1] > 1:
-            m = mask_arr[..., -1]
-        else:
-            m = mask_arr.squeeze()
-
+    # C. Hist Mask
+    if hist_mask_arr is not None and gt_ego_traj is not None:
+        m = hist_mask_arr[..., -1] if (np.asarray(hist_mask_arr).ndim > 1 and np.asarray(hist_mask_arr).shape[-1] > 1) else np.asarray(hist_mask_arr).squeeze()
         L = min(len(m), len(gt_ego_traj))
-        m = m[:L]
-        traj_to_mark = gt_ego_traj[:L]
-        masked_indices = np.where(m < 0.5)[0]
+        masked_ids = np.where(m[:L] < 0.5)[0]
+        if len(masked_ids) > 0:
+            ax.plot(gt_ego_traj[masked_ids, 1], gt_ego_traj[masked_ids, 0], 'rx',
+                    markersize=8, markeredgewidth=2, label='Masked Input', zorder=10)
 
-        if len(masked_indices) > 0:
-            ax.plot(traj_to_mark[masked_indices, 1], traj_to_mark[masked_indices, 0],
-                    'rx', markersize=8, markeredgewidth=2, label='Masked Input', zorder=10)
-
-    # --- C. 绘制 Hist Model Output (Ego 重构) - 蓝色 ---
-    if recon_hist is not None:
-        if recon_hist.ndim == 3:
-            if recon_hist.shape[0] == 1:
-                recon_hist = recon_hist[0]
-            elif recon_hist.shape[1] == 1:
-                recon_hist = recon_hist[:, 0, :]
-        if recon_hist.ndim == 2 and recon_hist.shape[1] >= 2:
-            ax.plot(recon_hist[:, 1], recon_hist[:, 0], 'b-o', label='Hist Model Pred', markersize=4, linewidth=2,
-                    alpha=0.8)
-
-    # --- D. 绘制 Future (真实) - 绿色 ---
-    if gt_fut is not None:
-        if gt_fut.ndim == 3: gt_fut = gt_fut.squeeze(1)
-        ax.plot(gt_fut[:, 1], gt_fut[:, 0], 'g-*', label='GT Future', markersize=5, linewidth=2)
-
-        # 连线
-        if gt_ego_traj is not None:
+    # D. GT FUT + last point
+    fut_last_idx = None
+    if gt_fut is not None and len(gt_fut) > 0:
+        ax.plot(gt_fut[:, 1], gt_fut[:, 0], 'g-*', label='GT Future', markersize=4, linewidth=2)
+        if gt_ego_traj is not None and len(gt_ego_traj) > 0:
             ax.plot([gt_ego_traj[-1, 1], gt_fut[0, 1]], [gt_ego_traj[-1, 0], gt_fut[0, 0]], 'g--', alpha=0.5)
 
-    # --- E. 绘制 Pred (预测未来) - 深天蓝 ---
-    # 兼容三种形状：
-    #   1) [T, 2] 单模态
-    #   2) [T, K, 2] 多模态（时间优先）
-    #   3) [K, T, 2] 多模态（模式优先）
-    if pred_fut is not None:
-        pred_arr = np.asarray(pred_fut)
-        if pred_arr.ndim == 2:
-            ax.plot(pred_arr[:, 1], pred_arr[:, 0], color='deepskyblue', linestyle='-', marker='o',
-                    label='Pred Future', markersize=4, linewidth=1.5)
-        elif pred_arr.ndim == 3:
-            fut_len = gt_fut.shape[0] if gt_fut is not None and gt_fut.ndim >= 2 else None
-            if pred_arr.shape[0] == 1:
-                pred_arr = pred_arr[0]
-                ax.plot(pred_arr[:, 1], pred_arr[:, 0], color='deepskyblue', linestyle='-', marker='o',
-                        label='Pred Future', markersize=4, linewidth=1.5)
-            elif pred_arr.shape[1] == 1:
-                pred_arr = pred_arr[:, 0, :]
-                ax.plot(pred_arr[:, 1], pred_arr[:, 0], color='deepskyblue', linestyle='-', marker='o',
-                        label='Pred Future', markersize=4, linewidth=1.5)
-            else:
-                # time-first: [T, K, 2]
-                if fut_len is not None and pred_arr.shape[0] == fut_len:
-                    num_modes = pred_arr.shape[1]
-                    mode_getter = lambda k: pred_arr[:, k, :]
-                # mode-first: [K, T, 2]
-                else:
-                    num_modes = pred_arr.shape[0]
-                    mode_getter = lambda k: pred_arr[k, :, :]
+        if fut_mask_arr is not None:
+            fm = np.asarray(fut_mask_arr).squeeze()
+            if fm.ndim > 1:
+                fm = fm[..., 0]
+            valid_ids = np.where(fm[:len(gt_fut)] > 0.5)[0]
+            fut_last_idx = int(valid_ids[-1]) if len(valid_ids) > 0 else len(gt_fut) - 1
+        else:
+            fut_last_idx = len(gt_fut) - 1
 
-                for k in range(num_modes):
-                    traj_k = mode_getter(k)
-                    is_best = (best_idx is not None and k == best_idx)
-                    color = 'red' if is_best else 'deepskyblue'
-                    alpha = 0.95 if is_best else 0.6
-                    marker = 'o' if is_best else 'x'
-                    label = None
-                    if is_best:
-                        label = 'Pred Future (Best)'
-                    elif k == 0:
-                        label = 'Pred Future (Multi)'
-                    ax.plot(traj_k[:, 1], traj_k[:, 0], color=color, linestyle='-', marker=marker,
-                            markersize=4, linewidth=1.8 if is_best else 1.2, alpha=alpha, label=label)
+        fut_last_pt = gt_fut[fut_last_idx]
+        ax.scatter(fut_last_pt[1], fut_last_pt[0], color='darkgreen', s=28, zorder=12)
+        ax.text(
+            fut_last_pt[1],
+            fut_last_pt[0],
+            f"({fut_last_pt[1]:.2f}, {fut_last_pt[0]:.2f}) {fut_last_idx}",
+            color='darkgreen',
+            fontsize=9,
+            ha='left', va='bottom'
+        )
+        info["fut_last"] = {"index": fut_last_idx, "coord": (float(fut_last_pt[1]), float(fut_last_pt[0]))}
+        print(f"[Visualization] ({fut_last_pt[1]:.3f}, {fut_last_pt[0]:.3f}) {fut_last_idx}")
 
-    # 设置绘图属性
+    # E. 多模态预测轨迹 + 最佳轨迹高亮
+    if pred_modes is not None and pred_modes.shape[0] > 0:
+        plotted_samples = False
+        for k in range(pred_modes.shape[0]):
+            traj = normalize_traj2d(pred_modes[k])
+            if traj is None or len(traj) == 0:
+                continue
+            is_best = (best_k is not None and k == best_k)
+            ax.plot(
+                traj[:, 1], traj[:, 0],
+                color='red' if is_best else 'deepskyblue',
+                linestyle='-' if is_best else '--',
+                marker='x' if is_best else None,
+                markersize=4 if is_best else 0,
+                linewidth=2.4 if is_best else 1.2,
+                alpha=1.0 if is_best else 0.35,
+                label='Best Pred' if is_best else ('Pred Samples' if not plotted_samples else None),
+                zorder=11 if is_best else 4
+            )
+            if not is_best:
+                plotted_samples = True
+
+    # F. 单轨预测（无多模态时）
+    if pred_fut_best is not None and (pred_modes is None or pred_modes.shape[0] == 0):
+        ax.plot(pred_fut_best[:, 1], pred_fut_best[:, 0], color='red', linestyle='-', marker='x',
+                label='Best Pred', markersize=4, linewidth=2.2, zorder=11)
+
+    # G. 预测末点标注（按最佳轨迹）
+    if pred_fut_best is not None and len(pred_fut_best) > 0:
+        pred_last_idx = len(pred_fut_best) - 1 if fut_last_idx is None else min(len(pred_fut_best) - 1, fut_last_idx)
+        pred_last_pt = pred_fut_best[pred_last_idx]
+        ax.scatter(pred_last_pt[1], pred_last_pt[0], color='darkred', s=28, zorder=12)
+        ax.text(
+            pred_last_pt[1],
+            pred_last_pt[0],
+            f"({pred_last_pt[1]:.2f}, {pred_last_pt[0]:.2f}) {pred_last_idx}",
+            color='darkred',
+            fontsize=9,
+            ha='left', va='top'
+        )
+        info["pred_last"] = {"index": pred_last_idx, "coord": (float(pred_last_pt[1]), float(pred_last_pt[0]))}
+        print(f"[Visualization] ({pred_last_pt[1]:.3f}, {pred_last_pt[0]:.3f}) {pred_last_idx}")
+
     for y in [18, 6, -6, -18]:
         ax.axhline(y=y, color='gray', linestyle=':', linewidth=0.5)
 
-    ax.set_xlabel('Longitudinal (m)')
-    ax.set_ylabel('Lateral (m)')
-    # 去重图例
-    handles, labels = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    ax.legend(by_label.values(), by_label.keys(), loc='best')
+    if unit == 'ft':
+        ax.set_xlabel('Longitudinal (ft)')
+        ax.set_ylabel('Lateral (ft)')
+        ft_to_m = lambda x: x * 0.3048
+        m_to_ft = lambda x: x / 0.3048
+        secax_x = ax.secondary_xaxis('top', functions=(ft_to_m, m_to_ft))
+        secax_y = ax.secondary_yaxis('right', functions=(ft_to_m, m_to_ft))
+        secax_x.set_xlabel('Longitudinal (m)')
+        secax_y.set_ylabel('Lateral (m)')
+    else:
+        ax.set_xlabel('Longitudinal (m)')
+        ax.set_ylabel('Lateral (m)')
+        m_to_ft = lambda x: x / 0.3048
+        ft_to_m = lambda x: x * 0.3048
+        secax_x = ax.secondary_xaxis('top', functions=(m_to_ft, ft_to_m))
+        secax_y = ax.secondary_yaxis('right', functions=(m_to_ft, ft_to_m))
+        secax_x.set_xlabel('Longitudinal (ft)')
+        secax_y.set_ylabel('Lateral (ft)')
 
-    if isinstance(metrics, dict) and len(metrics) > 0:
-        lines = []
-        for key, val in metrics.items():
-            if isinstance(val, dict):
-                if "ft" in val and "m" in val:
-                    lines.append(f"{key}: {val['ft']:.3f} ft / {val['m']:.3f} m")
-                else:
-                    lines.append(f"{key}: {val}")
+    if metrics:
+        metric_lines = []
+        for name, values in metrics.items():
+            if isinstance(values, dict):
+                metric_lines.append(f"{name}: {values.get('m', 0.0):.3f} m | {values.get('ft', 0.0):.3f} ft")
             else:
-                lines.append(f"{key}: {val}")
-        if lines:
-            ax.text(
-                0.02, 0.98, "\n".join(lines),
-                transform=ax.transAxes, va='top', ha='left',
-                fontsize=8, bbox=dict(facecolor='white', alpha=0.7, edgecolor='none')
-            )
+                metric_lines.append(f"{name}: {values}")
+        if pred_modes is not None:
+            metric_lines.append(f"Pred Modes: {int(pred_modes.shape[0])}")
+            if best_k is not None:
+                metric_lines.append(f"Best Mode Idx: {int(best_k)}")
+        ax.text(
+            0.02, 0.98, "\n".join(metric_lines),
+            transform=ax.transAxes, va='top', ha='left',
+            fontsize=9,
+            bbox=dict(boxstyle='round,pad=0.35', facecolor='white', alpha=0.85, edgecolor='gray')
+        )
 
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(loc='best')
     ax.grid(True, linestyle=':', alpha=0.5)
     plt.tight_layout()
 
-    if save_path:
+    if save_path is not None:
         plt.savefig(save_path)
-    if show_plot and not save_path:
+    if show_plot:
         plt.show()
-
     plt.close(fig)
-    vis_info = {}
-    if gt_fut is not None and gt_fut.ndim >= 2 and gt_fut.shape[0] > 0:
-        vis_info["fut_last"] = {"coord": (float(gt_fut[-1, 1]), float(gt_fut[-1, 0]))}
-    if pred_fut is not None:
-        pred_arr = np.asarray(pred_fut)
-        pred_last = None
-        if pred_arr.ndim == 2 and pred_arr.shape[0] > 0:
-            pred_last = pred_arr[-1, :2]
-        elif pred_arr.ndim == 3:
-            if pred_arr.shape[0] == 1 and pred_arr.shape[1] > 0:
-                pred_last = pred_arr[0, -1, :2]
-            elif pred_arr.shape[1] == 1 and pred_arr.shape[0] > 0:
-                pred_last = pred_arr[-1, 0, :2]
-            else:
-                idx = int(best_idx) if best_idx is not None else 0
-                idx = max(0, min(idx, (pred_arr.shape[1] - 1 if pred_arr.shape[0] != 0 else 0)))
-                if gt_fut is not None and pred_arr.shape[0] == gt_fut.shape[0]:
-                    pred_last = pred_arr[-1, idx, :2]
-                else:
-                    idx = max(0, min(int(best_idx) if best_idx is not None else 0, pred_arr.shape[0] - 1))
-                    pred_last = pred_arr[idx, -1, :2]
-        if pred_last is not None:
-            vis_info["pred_last"] = {"coord": (float(pred_last[1]), float(pred_last[0]))}
-    return vis_info
+    return info

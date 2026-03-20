@@ -6,40 +6,24 @@ import scipy.io as scp
 
 # Dataset class for the dataset
 class NgsimDataset(Dataset):
-    """为历史重建、联合训练和 future 预测提供 NGSIM 样本。"""
 
-    def __init__(
-        self,
-        mat_file,
-        t_h=30,
-        t_f=50,
-        d_s=2,
-        enc_size=64,
-        grid_size=(13, 3),
-        feature_dim=4,
-        stats_mode=False,
-        future_only=False,
-    ):
-        """初始化轨迹表、轨迹缓存和输出模式。"""
-        self.D = scp.loadmat(mat_file)['traj']
-        self.T = scp.loadmat(mat_file)['tracks']
+    def __init__(self, mat_file, t_h=30, t_f=50, d_s=2, enc_size=64, grid_size=(13, 3), feature_dim=4):
+        mat_data = scp.loadmat(mat_file)
+        self.D = mat_data['traj']
+        self.T = mat_data['tracks']
         self.t_h = t_h  #
         self.t_f = t_f  #
         self.d_s = d_s  # skip
         self.enc_size = enc_size  # size of the grid cell
-        self.feature_dim = int(feature_dim)
+        self.feature_dim = feature_dim
         self.grid_size = grid_size  # size of social context grid
-        self.stats_mode = bool(stats_mode)
-        self.future_only = bool(future_only)
         self.alltime = 0
         # self.count = 0
 
     def __len__(self):
-        """返回样本总数。"""
         return len(self.D)
 
     def __getitem__(self, idx):
-        """读取单条样本并按当前模式组织原始字段。"""
 
         dsId = self.D[idx, 0].astype(int)  # dataset id
         vehId = self.D[idx, 1].astype(int)  # agent id
@@ -53,58 +37,49 @@ class NgsimDataset(Dataset):
 
         # Get track history 'hist' = ndarray, and future track 'fut' = ndarray
         hist = self.getHistory(vehId, t, vehId, dsId)
+        refdistance = np.zeros_like(hist[:, 0])
+        refdistance = refdistance.reshape(len(refdistance), 1)
         fut = self.getFuture(vehId, t, dsId)
         va = self.getVA(vehId, t, vehId, dsId)
-        if self.stats_mode:
-            lane = np.empty([0, 1])
-            cclass = np.empty([0, 1])
-        else:
-            lane = self.getLane(vehId, t, vehId, dsId)
-            cclass = np.empty([0, 1]) if self.future_only else self.getClass(vehId, t, vehId, dsId)
+        lane = self.getLane(vehId, t, vehId, dsId)
+        cclass = self.getClass(vehId, t, vehId, dsId)
 
         # Get track histories of all neighbours 'neighbors' = [ndarray,[],ndarray,ndarray]
         for i in grid:
             nbrsdis = self.getHistory(i.astype(int), t, vehId, dsId)
+            if nbrsdis.shape != (0, 2):
+                uu = np.power(hist - nbrsdis, 2)
+                distancexxx = np.sqrt(uu[:, 0] + uu[:, 1])
+                distancexxx = distancexxx.reshape(len(distancexxx), 1)
+            else:
+                distancexxx = np.empty([0, 1])
             neighbors.append(nbrsdis)
             neighborsva.append(self.getVA(i.astype(int), t, vehId, dsId))
-            if self.stats_mode:
-                neighborslane.append(np.empty([0, 1]))
-                neighborsclass.append(np.empty([0, 1]))
-                neighborsdistance.append(np.empty([0, 1]))
-            else:
-                if nbrsdis.shape != (0, 2):
-                    uu = np.power(hist - nbrsdis, 2)
-                    distancexxx = np.sqrt(uu[:, 0] + uu[:, 1])
-                    distancexxx = distancexxx.reshape(len(distancexxx), 1)
-                else:
-                    distancexxx = np.empty([0, 1])
-                if self.future_only:
-                    neighborslane.append(self.getLane(i.astype(int), t, vehId, dsId).reshape(-1, 1))
-                    neighborsclass.append(np.empty([0, 1]))
-                else:
-                    neighborslane.append(self.getLane(i.astype(int), t, vehId, dsId).reshape(-1, 1))
-                    neighborsclass.append(self.getClass(i.astype(int), t, vehId, dsId).reshape(-1, 1))
-                neighborsdistance.append(distancexxx)
+            neighborslane.append(self.getLane(
+                i.astype(int), t, vehId, dsId).reshape(-1, 1))
+            neighborsclass.append(self.getClass(
+                i.astype(int), t, vehId, dsId).reshape(-1, 1))
+            neighborsdistance.append(distancexxx)
         lon_enc = np.zeros([3])
         lon_enc[int(self.D[idx, 10] - 1)] = 1
         lat_enc = np.zeros([3])
         lat_enc[int(self.D[idx, 9] - 1)] = 1
-        if self.future_only:
-            return hist, fut, neighbors, lat_enc, lon_enc, va, neighborsva, lane, neighborslane, neighborsdistance
-
-        refdistance = np.zeros_like(hist[:, 0]).reshape(len(hist), 1)
         nbrs_num = np.array(sum(1 for arr in neighbors if arr.size != 0))
+
+        # hist, nbrs, mask, lat_enc, lon_enc, fut, op_mask = data
+
         return hist, fut, neighbors, lat_enc, lon_enc, va, neighborsva, lane, neighborslane, refdistance, neighborsdistance, cclass, neighborsclass, nbrs_num
 
     # Get the lane of the vehicle
     def getLane(self, vehId, t, refVehId, dsId):
-        """提取车辆在历史窗口内的车道序列。"""
         if vehId == 0:
             return np.empty([0, 1])
         else:
             if self.T.shape[1] <= vehId - 1:
                 return np.empty([0, 1])
+            refTrack = self.T[dsId - 1][refVehId - 1].transpose()
             vehTrack = self.T[dsId - 1][vehId - 1].transpose()
+            refPos = refTrack[np.where(refTrack[:, 0] == t)][0, 5]
 
             if vehTrack.size == 0 or np.argwhere(vehTrack[:, 0] == t).size == 0:
                 return np.empty([0, 1])
@@ -120,13 +95,14 @@ class NgsimDataset(Dataset):
 
     # Get the class of the vehicle
     def getClass(self, vehId, t, refVehId, dsId):
-        """提取车辆在历史窗口内的类别序列。"""
         if vehId == 0:
             return np.empty([0, 1])
         else:
             if self.T.shape[1] <= vehId - 1:
                 return np.empty([0, 1])
+            refTrack = self.T[dsId - 1][refVehId - 1].transpose()
             vehTrack = self.T[dsId - 1][vehId - 1].transpose()
+            refPos = refTrack[np.where(refTrack[:, 0] == t)][0, 6]
 
             if vehTrack.size == 0 or np.argwhere(vehTrack[:, 0] == t).size == 0:
                 return np.empty([0, 1])
@@ -142,13 +118,14 @@ class NgsimDataset(Dataset):
 
     # Get the velocity and acceleration of the vehicle
     def getVA(self, vehId, t, refVehId, dsId):
-        """提取车辆在历史窗口内的速度与加速度序列。"""
         if vehId == 0:
             return np.empty([0, 2])
         else:
             if self.T.shape[1] <= vehId - 1:
                 return np.empty([0, 2])
+            refTrack = self.T[dsId - 1][refVehId - 1].transpose()
             vehTrack = self.T[dsId - 1][vehId - 1].transpose()
+            refPos = refTrack[np.where(refTrack[:, 0] == t)][0, 3:5]
 
             if vehTrack.size == 0 or np.argwhere(vehTrack[:, 0] == t).size == 0:
                 return np.empty([0, 2])
@@ -164,7 +141,6 @@ class NgsimDataset(Dataset):
 
     # Helper function to get track history
     def getHistory(self, vehId, t, refVehId, dsId):
-        """提取相对 ego 的历史位置序列。"""
         if vehId == 0:
             return np.empty([0, 2])
         else:
@@ -186,9 +162,35 @@ class NgsimDataset(Dataset):
                 return np.empty([0, 2])
             return hist
 
+    # Helper function to get track distance
+    def getdistance(self, vehId, t, refVehId, dsId):
+        if vehId == 0:
+            return np.empty([0, 1])
+        else:
+            if self.T.shape[1] <= vehId - 1:
+                return np.empty([0, 1])
+            refTrack = self.T[dsId - 1][refVehId - 1].transpose()
+            vehTrack = self.T[dsId - 1][vehId - 1].transpose()
+            refPos = refTrack[np.where(refTrack[:, 0] == t)][0, 1:3]
+
+            if vehTrack.size == 0 or np.argwhere(vehTrack[:, 0] == t).size == 0:
+                return np.empty([0, 1])
+            else:
+                stpt = np.maximum(0, np.argwhere(
+                    vehTrack[:, 0] == t).item() - self.t_h)
+                enpt = np.argwhere(vehTrack[:, 0] == t).item() + 1
+                hist = vehTrack[stpt:enpt:self.d_s, 1:3] - refPos
+                hist_ref = refTrack[stpt:enpt:self.d_s, 1:3] - refPos
+                uu = np.power(hist - hist_ref, 2)
+                distance = np.sqrt(uu[:, 0] + uu[:, 1])
+                distance = distance.reshape(len(distance), 1)
+
+            if len(hist) < self.t_h // self.d_s + 1:
+                return np.empty([0, 1])
+            return distance
+
     # Helper function to get track future
     def getFuture(self, vehId, t, dsId):
-        """提取相对当前时刻的未来轨迹。"""
         vehTrack = self.T[dsId - 1][vehId - 1].transpose()
         refPos = vehTrack[np.where(vehTrack[:, 0] == t)][0, 1:3]
         stpt = np.argwhere(vehTrack[:, 0] == t).item() + self.d_s
@@ -199,56 +201,50 @@ class NgsimDataset(Dataset):
 
     # Collate function for dataloader
     def collate_fn(self, samples):
-        """将若干样本拼成 batch，并按模式裁剪冗余字段。"""
         # ttt = time.time()
         # Initialize neighbors and neighbors length batches:
         nbr_batch_size = 0
-        for sample in samples:
-            nbrs = sample[2]
-            temp = sum(len(nbrs[i]) != 0 for i in range(len(nbrs)))
+        for _, _, nbrs, _, _, _, _, _, _, _, _, _, _, _ in samples:
+            temp = sum([len(nbrs[i]) != 0 for i in range(len(nbrs))])
             nbr_batch_size += temp
         maxlen = self.t_h // self.d_s + 1
         nbrs_batch = torch.zeros(nbr_batch_size, maxlen, 2)
         nbrsva_batch = torch.zeros(nbr_batch_size, maxlen, 2)
         nbrslane_batch = torch.zeros(nbr_batch_size, maxlen, 1)
+        nbrsclass_batch = torch.zeros(nbr_batch_size, maxlen, 1)
         nbrsdis_batch = torch.zeros(nbr_batch_size, maxlen, 1)
-        if not self.future_only:
-            nbrsclass_batch = torch.zeros(nbr_batch_size, maxlen, 1)
 
         # Initialize social mask batch:
         pos = [0, 0]
         mask_batch = torch.zeros(len(samples), self.grid_size[1], self.grid_size[0], self.enc_size)  # (batch,3,13,h)
         temporal_mask_batch = torch.zeros(len(samples), self.grid_size[1], self.grid_size[0], self.feature_dim)  # (batch,3,13,h)
+        map_position = torch.zeros(0, 2)
         mask_batch = mask_batch.bool()
         temporal_mask_batch = temporal_mask_batch.bool()
 
         # Initialize history, history lengths, future, output mask, lateral maneuver and longitudinal maneuver batches:
         hist_batch = torch.zeros(len(samples), maxlen, 2)  # (len1,batch,2)
+        distance_batch = torch.zeros(len(samples), maxlen, 1)
         fut_batch = torch.zeros(len(samples), self.t_f // self.d_s, 2)  # (len2,batch,2)
         op_mask_batch = torch.zeros(len(samples), self.t_f // self.d_s, 2)  # (len2,batch,2)
         lat_enc_batch = torch.zeros(len(samples), 3)  # (batch,3)
         lon_enc_batch = torch.zeros(len(samples), 3)  # (batch,3)
         va_batch = torch.zeros(len(samples), maxlen, 2)
         lane_batch = torch.zeros(len(samples), maxlen, 1)
-        if not self.future_only:
-            distance_batch = torch.zeros(len(samples), maxlen, 1)
-            class_batch = torch.zeros(len(samples), maxlen, 1)
-            nbrs_num_batch = torch.zeros(len(samples), 1)
-            map_position = torch.zeros(0, 2)
+        class_batch = torch.zeros(len(samples), maxlen, 1)
+        nbrs_num_batch = torch.zeros(len(samples), 1)
         count = 0
         count1 = 0
         count2 = 0
         count3 = 0
         count4 = 0
-        for sampleId, sample in enumerate(samples):
-            if self.future_only:
-                hist, fut, nbrs, lat_enc, lon_enc, va, neighborsva, lane, neighborslane, neighborsdistance = sample
-            else:
-                hist, fut, nbrs, lat_enc, lon_enc, va, neighborsva, lane, neighborslane, refdistance, neighborsdistance, cclass, neighborsclass, nbrs_num = sample
+        for sampleId, (hist, fut, nbrs, lat_enc, lon_enc, va, neighborsva, lane, neighborslane, refdistance,
+                        neighborsdistance, cclass, neighborsclass, nbrs_num) in enumerate(samples):
 
             # Set up history, future, lateral maneuver and longitudinal maneuver batches:
             hist_batch[sampleId, 0:len(hist), 0] = torch.from_numpy(hist[:, 0])
             hist_batch[sampleId, 0:len(hist), 1] = torch.from_numpy(hist[:, 1])
+            distance_batch[sampleId, 0:len(hist), :] = torch.from_numpy(refdistance)
             fut_batch[sampleId, 0:len(fut), 0] = torch.from_numpy(fut[:, 0])
             fut_batch[sampleId, 0:len(fut), 1] = torch.from_numpy(fut[:, 1])
             op_mask_batch[sampleId, 0:len(fut), :] = 1
@@ -257,10 +253,8 @@ class NgsimDataset(Dataset):
             va_batch[sampleId, 0:len(va), 0] = torch.from_numpy(va[:, 0])
             va_batch[sampleId, 0:len(va), 1] = torch.from_numpy(va[:, 1])
             lane_batch[sampleId, 0:len(lane), 0] = torch.from_numpy(lane)
-            if not self.future_only:
-                distance_batch[sampleId, 0:len(hist), :] = torch.from_numpy(refdistance)
-                class_batch[sampleId, 0:len(cclass), 0] = torch.from_numpy(cclass)
-                nbrs_num_batch[sampleId, :] = torch.from_numpy(nbrs_num)
+            class_batch[sampleId, 0:len(cclass), 0] = torch.from_numpy(cclass)
+            nbrs_num_batch[sampleId, :] = torch.from_numpy(nbrs_num)
             # Set up neighbor, neighbor sequence length, and mask batches:
             for id, nbr in enumerate(nbrs):
                 if len(nbr) != 0:
@@ -270,8 +264,7 @@ class NgsimDataset(Dataset):
                     pos[1] = id // self.grid_size[0]
                     mask_batch[sampleId, pos[1], pos[0], :] = torch.ones(self.enc_size).byte()
                     temporal_mask_batch[sampleId, pos[1], pos[0], :] = torch.ones(self.feature_dim).byte()
-                    if not self.future_only:
-                        map_position = torch.cat((map_position, torch.tensor([[pos[1], pos[0]]])), 0)
+                    map_position = torch.cat((map_position, torch.tensor([[pos[1], pos[0]]])), 0)
                     count += 1
             for id, nbrva in enumerate(neighborsva):
                 if len(nbrva) != 0:
@@ -294,11 +287,10 @@ class NgsimDataset(Dataset):
                     nbrsdis_batch[count3, 0:len(nbrdis), :] = torch.from_numpy(nbrdis)
                     count3 += 1
 
-            if not self.future_only:
-                for id, nbrclass in enumerate(neighborsclass):
-                    if len(nbrclass) != 0:
-                        nbrsclass_batch[count4, 0:len(nbrclass), :] = torch.from_numpy(nbrclass)
-                        count4 += 1
+            for id, nbrclass in enumerate(neighborsclass):
+                if len(nbrclass) != 0:
+                    nbrsclass_batch[count4, 0:len(nbrclass), :] = torch.from_numpy(nbrclass)
+                    count4 += 1
         #  mask_batch
         # self.alltime += (time.time() - ttt)
         # print(self.alltime, "data load time")
@@ -306,7 +298,7 @@ class NgsimDataset(Dataset):
         # if (self.count > args['time']):
         #    print(self.alltime / self.count, "data load time")
 
-        batch = {
+        return {
             "hist": hist_batch,
             "nbrs": nbrs_batch,
             "mask": mask_batch,
@@ -318,16 +310,11 @@ class NgsimDataset(Dataset):
             "nbrs_va": nbrsva_batch,
             "lane": lane_batch,
             "nbrs_lane": nbrslane_batch,
-            "nbrs_distance": nbrsdis_batch,
-            "temporal_mask": temporal_mask_batch,
-        }
-        if self.future_only:
-            return batch
-        batch.update({
             "distance": distance_batch,
+            "nbrs_distance": nbrsdis_batch,
             "cclass": class_batch,
             "nbrs_class": nbrsclass_batch,
             "map_position": map_position,
             "nbrs_num": nbrs_num_batch,
-        })
-        return batch
+            "temporal_mask": temporal_mask_batch,
+        }

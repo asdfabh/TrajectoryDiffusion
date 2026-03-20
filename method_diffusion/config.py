@@ -2,7 +2,6 @@ import argparse
 
 
 def get_args_parser():
-    """构建项目统一的命令行参数解析器。"""
     parser = argparse.ArgumentParser("Set diffusion predicter", add_help=False)
 
     # Data
@@ -11,10 +10,11 @@ def get_args_parser():
 
     # Feature
     parser.add_argument("--feature_dim", default=4, type=int)
+    parser.add_argument("--feature_dim_fut", default=2, type=int)
 
     # Train runtime
     parser.add_argument("--batch_size", default=512, type=int)
-    parser.add_argument("--num_epochs", default=30, type=int)
+    parser.add_argument("--num_epochs", default=100, type=int)
     parser.add_argument("--num_workers", default=10, type=int)
     parser.add_argument("--learning_rate", default=1e-4, type=float)
     parser.add_argument("--save_interval", default=5, type=int)
@@ -77,19 +77,14 @@ def get_args_parser():
     parser.add_argument("--self_condition_prob", default=0.5, type=float)
 
     # Fut loss
+    parser.add_argument("--fut_y_loss_weight", default=2.0, type=float)
     parser.add_argument("--fut_huber_delta", default=1.0, type=float)
-    parser.add_argument("--fut_pos_loss_weight", default=0.25, type=float)
-    parser.add_argument("--intent_loss_weight_lat", default=0.20, type=float)
-    parser.add_argument("--intent_loss_weight_lon", default=0.20, type=float)
-    parser.add_argument("--intent_teacher_forcing_epochs", default=10, type=int)
-
-    # Hist context memory
-    parser.add_argument("--use_relative_lane_delta", default=1, type=int)
-    parser.add_argument("--lane_emb_dim", default=8, type=int)
+    parser.add_argument("--fut_pos_loss_weight", default=0.5, type=float)
 
     # Fut visualization
     parser.add_argument("--fut_enable_train_vis", default=0, type=int)
     parser.add_argument("--fut_enable_eval_vis", default=0, type=int)
+    parser.add_argument("--fut_vis_every_n", default=200, type=int)
 
     # Eval
     parser.add_argument("--eval_ratio", default=0.03, type=float)

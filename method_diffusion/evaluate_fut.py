@@ -11,12 +11,140 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.models.hist_model import DiffusionPast
+from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.config import get_args_parser
-from method_diffusion.utils.fut_utils import TrajectoryMetrics, build_ngsim_dataset, prepare_fut_batch
+from method_diffusion.utils.mask_util import random_mask, continuous_mask
 from method_diffusion.utils.visualization import visualize_batch_trajectories
 
+def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.4, device='cuda'):
+    """数据准备函数，与训练代码保持一致"""
+    hist = batch['hist']
+    va = batch['va']
+    lane = batch['lane']
+    cclass = batch['cclass']
+    fut = batch['fut']
+    op_mask = batch['op_mask']
+    hist_nbrs = batch['nbrs']
+    va_nbrs = batch['nbrs_va']
+    lane_nbrs = batch['nbrs_lane']
+    cclass_nbrs = batch['nbrs_class']
+    mask = batch['mask']
+    temporal_mask = batch['temporal_mask']
+
+    if feature_dim == 6:
+        hist = torch.cat((hist, va, lane, cclass), dim=-1).to(device)
+        hist_nbrs = torch.cat((hist_nbrs, va_nbrs, lane_nbrs, cclass_nbrs), dim=-1).to(device)
+    elif feature_dim == 5:
+        hist = torch.cat((hist, va, lane), dim=-1).to(device)
+        hist_nbrs = torch.cat((hist_nbrs, va_nbrs, lane_nbrs), dim=-1).to(device)
+    elif feature_dim == 4:
+        hist = torch.cat((hist, va), dim=-1).to(device)
+        hist_nbrs = torch.cat((hist_nbrs, va_nbrs), dim=-1).to(device)
+    else:
+        hist = hist.to(device)
+        hist_nbrs = hist_nbrs.to(device)
+    fut = fut.to(device)
+    op_mask = op_mask.to(device)
+
+    if mask_type == 'random':
+        hist_mask = random_mask(hist, p=mask_prob).to(device)
+    elif mask_type == 'block':
+        hist_mask = continuous_mask(hist, p=mask_prob).to(device)
+    else:
+        hist_mask = random_mask(hist, p=mask_prob).to(device)
+
+    hist_masked_val = hist_mask * hist
+    hist_masked = torch.cat([hist_masked_val, hist_mask], dim=-1)
+
+    hist_masked = hist_masked.to(device)
+    mask = mask.to(device)
+    temporal_mask = temporal_mask.to(device)
+
+    return hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask
+
+
+class MetricsCalculator:
+    """辅助类：用于累积和计算评估指标 (ADE, FDE, RMSE at timesteps)"""
+
+    def __init__(self, t_max, device, meter_per_unit=0.3048):
+        self.t_max = t_max
+        self.device = device
+        self.meter_per_unit = meter_per_unit
+
+        self.total_se = torch.zeros(t_max).to(device)
+        self.total_de = torch.zeros(t_max).to(device)
+        self.total_counts = torch.zeros(t_max).to(device)
+        self.total_dist_sum = 0.0
+        self.total_valid_points = 0.0
+        self.total_fde_sum = 0.0
+        self.total_fde_count = 0.0
+
+    @staticmethod
+    def _normalize_valid_mask(valid_mask, pred):
+        if valid_mask is None:
+            return torch.ones(pred.shape[0], pred.shape[1], device=pred.device, dtype=pred.dtype)
+        if valid_mask.dim() == 3:
+            valid_mask = valid_mask[..., 0]
+        return (valid_mask > 0.5).to(pred.device).float()
+
+    def update(self, pred, target, valid_mask=None):
+        pred = pred[:, :self.t_max, :2]
+        target = target[:, :self.t_max, :2]
+        _, T, _ = pred.shape
+        valid_mask = self._normalize_valid_mask(valid_mask, pred)[:, :T]
+
+        diff = pred - target
+        dist_sq = torch.sum(diff ** 2, dim=-1)
+        dist = torch.sqrt(dist_sq)
+        dist_sq = dist_sq * valid_mask
+        dist = dist * valid_mask
+
+        self.total_se[:T] += torch.sum(dist_sq, dim=0)
+        self.total_de[:T] += torch.sum(dist, dim=0)
+        self.total_counts[:T] += torch.sum(valid_mask, dim=0)
+
+        self.total_dist_sum += torch.sum(dist).item()
+        self.total_valid_points += torch.sum(valid_mask).item()
+
+        valid_counts = torch.sum(valid_mask, dim=1).long()
+        has_valid = valid_counts > 0
+        last_idx = torch.clamp(valid_counts - 1, min=0)
+        final_dist = dist.gather(1, last_idx.unsqueeze(1)).squeeze(1)
+
+        self.total_fde_sum += torch.sum(final_dist * has_valid.float()).item()
+        self.total_fde_count += torch.sum(has_valid.float()).item()
+
+    def get_summary(self):
+        counts = self.total_counts.clamp(min=1)
+        rmse_per_step_ft = torch.sqrt(self.total_se / counts)
+        de_avg_per_step_ft = self.total_de / counts
+
+        overall_ade_ft = 0.0 if self.total_valid_points == 0 else self.total_dist_sum / self.total_valid_points
+        overall_fde_ft = 0.0 if self.total_fde_count == 0 else self.total_fde_sum / self.total_fde_count
+
+        return {
+            'rmse_per_step_ft': rmse_per_step_ft,
+            'rmse_per_step_m': rmse_per_step_ft * self.meter_per_unit,
+            'de_per_step_ft': de_avg_per_step_ft,
+            'de_per_step_m': de_avg_per_step_ft * self.meter_per_unit,
+            'overall_ade_ft': overall_ade_ft,
+            'overall_ade_m': overall_ade_ft * self.meter_per_unit,
+            'overall_fde_ft': overall_fde_ft,
+            'overall_fde_m': overall_fde_ft * self.meter_per_unit,
+            'num_valid_points': self.total_valid_points,
+            'num_valid_final_points': self.total_fde_count,
+        }
+
+
 def load_checkpoint(model, resume_arg, default_dir, device, model_name="Model"):
-    """从指定目录或别名恢复评估模型参数。"""
+    """
+    鲁棒的模型加载函数
+    :param model: 模型实例
+    :param resume_arg: 参数传入的字符串 (none, best, latest, epochX, or path)
+    :param default_dir: 默认查找目录 (Path对象)
+    :param device: 设备
+    :param model_name: 打印日志用的名称
+    """
     ckpt_path = None
     default_dir = Path(default_dir)
 
@@ -71,7 +199,7 @@ def load_checkpoint(model, resume_arg, default_dir, device, model_name="Model"):
 
 
 def get_test_loader(args):
-    """构造 future 测试集 DataLoader。"""
+    """获取测试集 DataLoader"""
     if hasattr(args, 'test_path') and args.test_path:
         test_path = args.test_path
     elif os.path.exists(os.path.join(args.data_root, 'TestSet.mat')):
@@ -82,7 +210,14 @@ def get_test_loader(args):
 
     print(f"Loading test data from: {test_path}")
 
-    test_dataset = build_ngsim_dataset(test_path, args)
+    test_dataset = NgsimDataset(
+        test_path,
+        t_h=30,
+        t_f=50,
+        d_s=2,
+        enc_size=args.encoder_input_dim,
+        feature_dim=args.feature_dim
+    )
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
@@ -96,7 +231,6 @@ def get_test_loader(args):
 
 
 def resolve_checkpoint_base_dir(checkpoint_dir):
-    """解析 checkpoint 根目录的绝对路径。"""
     ckpt_path = Path(checkpoint_dir)
     if ckpt_path.is_absolute():
         return ckpt_path
@@ -105,7 +239,6 @@ def resolve_checkpoint_base_dir(checkpoint_dir):
 
 def print_metrics_table(metrics, name="Model", time_indices=[4, 9, 14, 19, 24],
                         time_labels=['1s', '2s', '3s', '4s', '5s']):
-    """打印统一格式的评估指标表。"""
     print(f'\n{"=" * 30} Test Results: {name} {"=" * 30}')
     rmse_m = metrics['rmse_per_step_m']
     rmse_ft = metrics['rmse_per_step_ft']
@@ -131,7 +264,6 @@ def print_metrics_table(metrics, name="Model", time_indices=[4, 9, 14, 19, 24],
 
 
 def compute_batch_metrics(pred, target, op_mask, meter_per_unit=0.3048):
-    """计算单个 batch 的 ADE / FDE / RMSE。"""
     pred = pred[..., :2]
     target = target[..., :2]
     valid_mask = op_mask[..., 0] if op_mask.dim() == 3 else op_mask
@@ -144,11 +276,10 @@ def compute_batch_metrics(pred, target, op_mask, meter_per_unit=0.3048):
     ade_ft = (dist * valid_mask).sum() / (valid_mask.sum() + 1e-6)
     rmse_ft = torch.sqrt((dist_sq * valid_mask).sum() / (valid_mask.sum() + 1e-6))
 
-    t_idx = torch.arange(dist.size(1), device=dist.device).unsqueeze(0).expand_as(dist)
-    masked_idx = torch.where(valid_mask > 0, t_idx, t_idx.new_full(t_idx.shape, -1))
-    last_idx = masked_idx.max(dim=1).values
-    has_valid = last_idx >= 0
-    final_dist = dist.gather(1, last_idx.clamp(min=0).unsqueeze(1)).squeeze(1)
+    valid_counts = torch.sum(valid_mask, dim=1).long()
+    has_valid = valid_counts > 0
+    last_idx = torch.clamp(valid_counts - 1, min=0)
+    final_dist = dist.gather(1, last_idx.unsqueeze(1)).squeeze(1)
     fde_ft = (final_dist * has_valid.float()).sum() / (has_valid.float().sum() + 1e-6)
 
     return {
@@ -159,7 +290,9 @@ def compute_batch_metrics(pred, target, op_mask, meter_per_unit=0.3048):
 
 
 def compute_single_vis_metrics(pred, target, op_mask, batch_idx=0, meter_per_unit=0.3048):
-    """计算单条可视化轨迹的误差与终点信息。"""
+    """
+    针对单条可视化轨迹计算 ADE/FDE，并输出 GT/Pred End Point（坐标+index）。
+    """
     b = max(0, min(int(batch_idx), pred.size(0) - 1))
     pred_xy = pred[b, :, :2]
     target_xy = target[b, :, :2]
@@ -193,7 +326,6 @@ def compute_single_vis_metrics(pred, target, op_mask, batch_idx=0, meter_per_uni
 
 
 def run_evaluation(args, device):
-    """运行 future-only 或 joint 模式的完整评估流程。"""
     # 强制固定测试时的噪声种子！
     torch.manual_seed(42)
     if torch.cuda.is_available():
@@ -233,8 +365,8 @@ def run_evaluation(args, device):
         model_hist = DiffusionPast(args).to(device)
         load_checkpoint(model_hist, args.resume_hist, hist_ckpt_dir, device, model_name="HistModel")
 
-    calc_fut = TrajectoryMetrics(args.T_f)
-    calc_hist = TrajectoryMetrics(args.T) if args.eval_mode == 'joint' else None
+    calc_fut = MetricsCalculator(args.T_f, device)
+    calc_hist = MetricsCalculator(args.T, device) if args.eval_mode == 'joint' else None
     visualize_dir = None
     if args.visualize_samples > 0:
         if args.visualize_dir:
@@ -256,41 +388,28 @@ def run_evaluation(args, device):
         for batch_idx, batch in pbar:
             if batch_idx >= target_test_batches:
                 break
-            batch_data = prepare_fut_batch(
-                batch,
-                args.feature_dim,
-                device=device,
-                include_hist_mask=args.eval_mode == 'joint',
-                mask_type='random',
-                mask_prob=args.mask_prob,
+            hist, hist_masked, hist_mask, fut, op_mask, hist_nbrs, mask, temporal_mask = prepare_input_data(
+                batch, args.feature_dim, mask_type='random', mask_prob=args.mask_prob, device=device
             )
 
-            current_hist_input = batch_data["hist"]
+            current_hist_input = hist
             if model_hist is not None:
-                _, pred_hist, _, _ = model_hist.forward_eval(batch_data["hist"], batch_data["hist_masked"], device)
-                calc_hist.update(pred_hist[..., :2], batch_data["hist"][..., :2], valid_mask=torch.ones_like(batch_data["hist"][..., 0]))
+                _, pred_hist, _, _ = model_hist.forward_eval(hist, hist_masked, device)
+                calc_hist.update(pred_hist[..., :2], hist[..., :2], valid_mask=torch.ones_like(hist[..., 0]))
                 current_hist_input = pred_hist
 
             k_samples = max(1, int(args.num_samples))
-            _, pred_fut, _, _ = model_fut.forwardEvalMultiSample(
-                current_hist_input,
-                batch_data["hist_nbrs"],
-                batch_data["mask"],
-                batch_data["temporal_mask"],
-                batch_data["fut"],
-                batch_data["op_mask"],
-                batch_data["extras"],
-                device,
-                K=k_samples,
+            _, pred_fut, _, _ = model_fut.forwardEval_minADE(
+                current_hist_input, hist_nbrs, mask, temporal_mask, fut, op_mask, device, K=k_samples
             )
-            calc_fut.update(pred_fut, batch_data["fut"], valid_mask=batch_data["op_mask"])
+            calc_fut.update(pred_fut, fut, valid_mask=op_mask)
 
             if visualized_count < args.visualize_samples:
-                pred_all_vis = getattr(model_fut, "last_multisample_all_preds", None)
-                pred_best_idx_vis = getattr(model_fut, "last_multisample_best_idx", None)
-                batch_metrics = compute_batch_metrics(pred_fut, batch_data["fut"], batch_data["op_mask"])
-                vis_metrics = compute_single_vis_metrics(pred_fut, batch_data["fut"], batch_data["op_mask"], batch_idx=0)
-                running_summary = calc_fut.summary()
+                pred_all_vis = getattr(model_fut, "last_minade_all_preds", None)
+                pred_best_idx_vis = getattr(model_fut, "last_minade_best_idx", None)
+                batch_metrics = compute_batch_metrics(pred_fut, fut, op_mask)
+                vis_metrics = compute_single_vis_metrics(pred_fut, fut, op_mask, batch_idx=0)
+                running_summary = calc_fut.get_summary()
                 running_metrics = {
                     "ADE (running, residual-anchor)": {"m": running_summary["overall_ade_m"], "ft": running_summary["overall_ade_ft"]},
                     "FDE (running, residual-anchor)": {"m": running_summary["overall_fde_m"], "ft": running_summary["overall_fde_ft"]},
@@ -306,13 +425,13 @@ def run_evaluation(args, device):
 
                 vis_info = visualize_batch_trajectories(
                     hist=current_hist_input,
-                    hist_nbrs=batch_data["hist_nbrs"],
-                    temporal_mask=batch_data["temporal_mask"],
-                    future=batch_data["fut"],
+                    hist_nbrs=hist_nbrs,
+                    temporal_mask=temporal_mask,
+                    future=fut,
                     pred=pred_fut,
                     pred_all=pred_all_vis,
                     pred_best_idx=pred_best_idx_vis,
-                    hist_masked=batch_data.get("hist_mask"),
+                    hist_masked=hist_mask,
                     batch_idx=0,
                     save_path=str(save_path) if save_path else None,
                     metrics=metrics_for_plot,
@@ -337,16 +456,15 @@ def run_evaluation(args, device):
                 visualized_count += 1
 
     if args.eval_mode == 'joint' and calc_hist:
-        hist_metrics = calc_hist.summary()
+        hist_metrics = calc_hist.get_summary()
         print_metrics_table(hist_metrics, name="History Reconstruction",
                             time_indices=[4, 9, 14], time_labels=['1s', '2s', '3s'])
 
-    fut_metrics = calc_fut.summary()
+    fut_metrics = calc_fut.get_summary()
     print_metrics_table(fut_metrics, name="Future Prediction (Residual Anchor Rollout)")
 
 
 def main():
-    """运行 future 分支的评估脚本入口。"""
     parser = get_args_parser()
     parser.add_argument('--eval_mode', type=str, default='fut_only', choices=['fut_only', 'joint'],
                         help="评估模式: 'fut_only' (使用GT历史) 或 'joint' (使用Hist模型输出)")

@@ -47,31 +47,31 @@ class DiTBlock(nn.Module):
         self.norm1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
         self.norm2 = nn.LayerNorm(dim)
-        self.cross_attn = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
-        self.norm3 = nn.LayerNorm(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp1 = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(dim, 9 * dim, bias=True)
+            nn.Linear(dim, 6 * dim, bias=True)
         )
-        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+        self.norm3 = nn.LayerNorm(dim)
+        self.cross_attn = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
+        self.norm4 = nn.LayerNorm(dim)
 
-    def forward(self, x, y, cross=None, attn_mask=None, cross_attn_mask=None):
+        self.mlp2 = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
 
-        shift_msa, scale_msa, gate_msa, shift_cross, scale_cross, gate_cross, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(9, dim=1)
+    def forward(self, x, y, cross, attn_mask=None):
+
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(6, dim=1)
 
         modulated_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulated_x, modulated_x, modulated_x, key_padding_mask=attn_mask)[0]
 
-        if cross is not None:
-            modulated_x = modulate(self.norm2(x), shift_cross, scale_cross)
-            x = x + gate_cross.unsqueeze(1) * self.cross_attn(modulated_x, cross, cross, key_padding_mask=cross_attn_mask)[0]
-
-        modulated_x = modulate(self.norm3(x), shift_mlp, scale_mlp)
+        modulated_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = x + gate_mlp.unsqueeze(1) * self.mlp1(modulated_x)
+
+        x = x + self.cross_attn(self.norm3(x), cross, cross)[0]
+        x = x + self.mlp2(self.norm4(x))
 
         return x
 
@@ -117,20 +117,14 @@ class DiT(nn.Module):
     def model_type(self):
         return self._model_type
 
-    def forward(self, x, y, cross=None, attn_mask=None, cross_attn_mask=None):
-        if isinstance(y, (list, tuple)):
-            if len(y) != len(self.blocks):
-                raise ValueError(f"Per-layer condition length mismatch: expected {len(self.blocks)}, got {len(y)}")
-            for idx, block in enumerate(self.blocks):
-                x = block(x, y[idx], cross=cross, attn_mask=attn_mask, cross_attn_mask=cross_attn_mask)
-            y_final = y[-1]
-        else:
-            for block in self.blocks:
-                x = block(x, y, cross=cross, attn_mask=attn_mask, cross_attn_mask=cross_attn_mask)
-            y_final = y
-        x = self.final_layer(x, y_final)
+    def forward(self, x, y, cross):
+        for block in self.blocks:
+            x = block(x, y, cross)
+        x = self.final_layer(x, y)
 
         return x
+
+
 
 
 
