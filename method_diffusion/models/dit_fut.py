@@ -42,27 +42,44 @@ class TimestepEmbedder(nn.Module):
 
 class DiTBlock(nn.Module):
 
-    def __init__(self, dim=128, heads=4, dropout=0.1, mlp_ratio=4.0):
+    def __init__(self, dim=128, heads=4, dropout=0.1, mlp_ratio=4.0, use_split_cond=False):
         super().__init__()
+        self.use_split_cond = use_split_cond
         self.norm1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
         self.norm2 = nn.LayerNorm(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp1 = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(dim, 6 * dim, bias=True)
-        )
+        if self.use_split_cond:
+            self.adaLN_time = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(dim, 6 * dim, bias=True)
+            )
+            self.adaLN_scene = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(dim, 6 * dim, bias=True)
+            )
+        else:
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(dim, 6 * dim, bias=True)
+            )
         self.norm3 = nn.LayerNorm(dim)
         self.cross_attn = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
         self.norm4 = nn.LayerNorm(dim)
 
         self.mlp2 = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
 
-    def forward(self, x, y, cross, attn_mask=None):
+    def build_modulation(self, t_cond, scene_cond):
+        if self.use_split_cond:
+            return self.adaLN_time(t_cond) + self.adaLN_scene(scene_cond)
+        return self.adaLN_modulation(t_cond + scene_cond)
 
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(6, dim=1)
+    def forward(self, x, t_cond, scene_cond, cross, attn_mask=None):
+
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
+            self.build_modulation(t_cond, scene_cond).chunk(6, dim=1)
 
         modulated_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulated_x, modulated_x, modulated_x, key_padding_mask=attn_mask)[0]
@@ -77,8 +94,9 @@ class DiTBlock(nn.Module):
 
 
 class FinalLayer(nn.Module):
-    def __init__(self, hidden_size, T=16, output_dim=2):
+    def __init__(self, hidden_size, T=16, output_dim=2, use_split_cond=False):
         super().__init__()
+        self.use_split_cond = use_split_cond
         self.T = T
         self.output_dim = output_dim
         self.norm_final = nn.LayerNorm(hidden_size)
@@ -91,13 +109,28 @@ class FinalLayer(nn.Module):
             nn.Linear(hidden_size * 4, output_dim, bias=True)
         )
 
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
-        )
+        if self.use_split_cond:
+            self.adaLN_time = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+            )
+            self.adaLN_scene = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+            )
+        else:
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+            )
 
-    def forward(self, x, y):
-        shift, scale = self.adaLN_modulation(y).chunk(2, dim=1)
+    def build_modulation(self, t_cond, scene_cond):
+        if self.use_split_cond:
+            return self.adaLN_time(t_cond) + self.adaLN_scene(scene_cond)
+        return self.adaLN_modulation(t_cond + scene_cond)
+
+    def forward(self, x, t_cond, scene_cond):
+        shift, scale = self.build_modulation(t_cond, scene_cond).chunk(2, dim=1)
         x = modulate(self.norm_final(x), shift, scale)
         x = self.proj(x)
         return x
@@ -117,13 +150,12 @@ class DiT(nn.Module):
     def model_type(self):
         return self._model_type
 
-    def forward(self, x, y, cross):
+    def forward(self, x, t_cond, scene_cond, cross):
         for block in self.blocks:
-            x = block(x, y, cross)
-        x = self.final_layer(x, y)
+            x = block(x, t_cond, scene_cond, cross)
+        x = self.final_layer(x, t_cond, scene_cond)
 
         return x
-
 
 
 

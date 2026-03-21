@@ -9,14 +9,14 @@ def get_args_parser():
 
     # Train runtime
     parser.add_argument("--batch_size", default=512, type=int)
-    parser.add_argument("--num_epochs", default=100, type=int)
-    parser.add_argument("--num_workers", default=10, type=int)
+    parser.add_argument("--num_epochs", default=50, type=int)
+    parser.add_argument("--num_workers", default=3, type=int)
     parser.add_argument("--learning_rate", default=1e-4, type=float)
     parser.add_argument("--save_interval", default=5, type=int)
     parser.add_argument("--mask_prob", default=0.4, type=float)
     parser.add_argument("--checkpoint_dir", default="./checkpoints", type=str)
     parser.add_argument("--resume_fut", default="none", type=str)
-    parser.add_argument("--resume_hist", default="best", type=str)
+    parser.add_argument("--resume_hist", default="none", type=str)
 
     # Joint train strategy
     parser.add_argument("--joint_freeze_hist", default=1, type=int)
@@ -83,5 +83,7 @@ def get_args_parser():
     # Eval
     parser.add_argument("--eval_ratio", default=0.5, type=float)
     parser.add_argument("--num_samples", default=5, type=int)
+    parser.add_argument("--fut_use_attention_pooling", default=1, type=int)
+    parser.add_argument("--fut_use_split_cond_adaln", default=1, type=int)
 
     return parser
