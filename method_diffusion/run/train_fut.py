@@ -10,13 +10,13 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
 
 # 解析 resume 标识并返回对应的 checkpoint 路径。

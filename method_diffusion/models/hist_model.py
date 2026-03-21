@@ -224,9 +224,9 @@ class DiffusionPast(nn.Module):
 
         return loss, final_pred
 
-    def forward(self, hist, hist_masked, device):
+    def forward(self, hist, hist_masked, device, return_components=False):
         """Standard forward method for DDP compatibility"""
-        return self.forward_train(hist, hist_masked, device)
+        return self.forward_train(hist, hist_masked, device, return_components=return_components)
 
     # hist = [B, T, dim], nbrs = [N_total, T, dim]. dim = x, y, v, a, laneID, class
     def norm(self, x):

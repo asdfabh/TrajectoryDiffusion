@@ -11,12 +11,12 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
-from method_diffusion.train_fut import (
+from method_diffusion.run.train_fut import (
     FUT_CHECKPOINT_DIR,
     init_csv_log,
     load_checkpoint,

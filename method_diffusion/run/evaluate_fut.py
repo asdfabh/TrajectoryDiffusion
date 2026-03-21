@@ -7,14 +7,14 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.utils.fut_utils import TrajectoryMetrics
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
 # 整理 batch 数据并按特征维度拼接评估输入。
 def prepare_input_data(batch, feature_dim, device="cuda"):

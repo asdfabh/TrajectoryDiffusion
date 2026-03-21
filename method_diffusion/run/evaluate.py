@@ -7,7 +7,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 # 添加项目根目录到 sys.path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.dataset.ngsim_hist_dataset import NgsimHistDataset
@@ -15,7 +15,7 @@ from method_diffusion.config import get_args_parser
 from method_diffusion.utils.mask_util import random_mask, continuous_mask
 
 METER_PER_FOOT = 0.3048
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 HIST_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "hist"
 
 
