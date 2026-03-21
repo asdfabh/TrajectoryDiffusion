@@ -240,22 +240,32 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
     if gt_fut is not None:
         ax.plot(gt_fut[:, 1], gt_fut[:, 0], 'g-o', label='GT Future', markersize=4, linewidth=2, alpha=0.8)
     if pred_modes is not None:
+        non_best_labeled = False
         for k in range(pred_modes.shape[0]):
             traj = normalize_traj2d(pred_modes[k])
             if traj is None:
                 continue
             is_best = (best_k is not None and k == best_k)
+            label = None
+            if is_best:
+                label = 'Pred Best'
+            elif not non_best_labeled:
+                label = 'Pred Modes'
+                non_best_labeled = True
             ax.plot(
                 traj[:, 1], traj[:, 0],
-                linestyle='--' if not is_best else '-',
-                linewidth=1.2 if not is_best else 2.0,
-                alpha=0.35 if not is_best else 0.95,
-                color='#FF7F0E' if is_best else '#BDBDBD',
-                label='Pred Best' if is_best else ('Pred Modes' if k == 0 else None),
+                linestyle='-',
+                marker='o' if is_best else '+',
+                markersize=4 if is_best else 6,
+                markeredgewidth=1.2 if not is_best else 1.0,
+                linewidth=1.4 if not is_best else 2.0,
+                alpha=0.65 if not is_best else 0.95,
+                color='#FF0000' if is_best else '#5DADE2',
+                label=label,
                 zorder=3 if is_best else 2
             )
     elif pred_best is not None:
-        ax.plot(pred_best[:, 1], pred_best[:, 0], 'r--o', label='Pred', markersize=4, linewidth=2, alpha=0.9)
+        ax.plot(pred_best[:, 1], pred_best[:, 0], 'r-o', label='Pred', markersize=4, linewidth=2, alpha=0.9)
 
     unit = input_unit or "ft"
     title = "Trajectory Visualization"
