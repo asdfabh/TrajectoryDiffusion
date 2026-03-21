@@ -18,10 +18,13 @@ from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.run.train_fut import (
     FUT_CHECKPOINT_DIR,
+    build_zero_loss_stats,
     init_csv_log,
     load_checkpoint,
+    print_eval_summary,
     prepare_input_data,
     write_csv_log,
+    write_tensorboard_log,
 )
 
 
@@ -90,7 +93,6 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
     total_vel_loss = 0.0
     total_pos_loss = 0.0
     num_batches = 0
-
     pbar = tqdm(
         dataloader,
         total=len(dataloader),
@@ -156,13 +158,16 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
     fut_model = model.module if hasattr(model, "module") else model
     fut_model.eval()
 
+    total_loss = 0.0
+    total_vel_loss = 0.0
+    total_pos_loss = 0.0
     total_ade = 0.0
     total_fde = 0.0
     num_batches = 0
 
     if len(dataloader) == 0:
         fut_model.train()
-        return 0.0, 0.0
+        return build_zero_loss_stats(), 0.0, 0.0
 
     total_batches = len(dataloader)
     if eval_ratio <= 0.0 or eval_ratio >= 1.0:
@@ -183,8 +188,21 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
             break
 
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
+        val_loss, val_parts = fut_model.forwardTrain(
+            hist,
+            hist_nbrs,
+            mask,
+            temporal_mask,
+            fut,
+            op_mask,
+            device,
+            return_components=True,
+        )
         _, eval_ade, eval_fde = fut_model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
 
+        total_loss += float(val_loss.item())
+        total_vel_loss += float(val_parts["loss_vel"].item())
+        total_pos_loss += float(val_parts["loss_pos"].item())
         total_ade += float(eval_ade.item())
         total_fde += float(eval_fde.item())
         num_batches += 1
@@ -192,21 +210,29 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
         if is_main_process(rank):
             pbar.set_postfix(
                 {
+                    "val_loss": f"{(total_loss / num_batches):.6f}",
+                    "val_vel": f"{(total_vel_loss / num_batches):.6f}",
+                    "val_pos": f"{(total_pos_loss / num_batches):.6f}",
                     "avg_ade_ft": f"{(total_ade / num_batches):.4f}",
                     "avg_fde_ft": f"{(total_fde / num_batches):.4f}",
                 }
             )
 
     stats = torch.tensor(
-        [total_ade, total_fde, float(num_batches)],
+        [total_loss, total_vel_loss, total_pos_loss, total_ade, total_fde, float(num_batches)],
         device=device,
         dtype=torch.float64,
     )
     stats = reduce_tensor(stats)
     fut_model.train()
 
-    denom = max(int(stats[2].item()), 1)
-    return float(stats[0].item()) / denom, float(stats[1].item()) / denom
+    denom = max(int(stats[5].item()), 1)
+    val_stats = {
+        "loss": float(stats[0].item()) / denom,
+        "loss_vel": float(stats[1].item()) / denom,
+        "loss_pos": float(stats[2].item()) / denom,
+    }
+    return val_stats, float(stats[3].item()) / denom, float(stats[4].item()) / denom
 
 
 def main():
@@ -291,24 +317,13 @@ def main():
         train_sampler.set_epoch(epoch)
 
         train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim, rank)
-        eval_ade, eval_fde = evaluate(model, val_loader, device, epoch + 1, args.feature_dim, eval_ratio, rank)
+        val_stats, eval_ade, eval_fde = evaluate(model, val_loader, device, epoch + 1, args.feature_dim, eval_ratio, rank)
         current_lr = optimizer.param_groups[0]["lr"]
 
         if is_main_process(rank):
-            write_csv_log(log_csv_path, epoch + 1, train_stats, eval_ade, eval_fde, current_lr)
-            writer.add_scalar("Loss/Train", train_stats["loss"], epoch + 1)
-            writer.add_scalar("Loss/TrainVel", train_stats["loss_vel"], epoch + 1)
-            writer.add_scalar("Loss/TrainPos", train_stats["loss_pos"], epoch + 1)
-            writer.add_scalar("Eval/ADE_ft", eval_ade, epoch + 1)
-            writer.add_scalar("Eval/FDE_ft", eval_fde, epoch + 1)
-            print(
-                f"Epoch {epoch + 1}/{args.num_epochs} | "
-                f"train={train_stats['loss']:.6f} | "
-                f"vel={train_stats['loss_vel']:.6f} | "
-                f"pos={train_stats['loss_pos']:.6f} | "
-                f"ade={eval_ade:.4f}ft | "
-                f"fde={eval_fde:.4f}ft"
-            )
+            write_csv_log(log_csv_path, epoch + 1, train_stats, val_stats, eval_ade, eval_fde, current_lr)
+            write_tensorboard_log(writer, epoch + 1, train_stats, val_stats, eval_ade, eval_fde, current_lr)
+            print_eval_summary(epoch + 1, args.num_epochs, train_stats, val_stats, eval_ade, eval_fde)
 
         scheduler.step()
         is_best = eval_ade < best_ade

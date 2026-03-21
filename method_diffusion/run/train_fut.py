@@ -56,12 +56,15 @@ def load_checkpoint(args, model, optimizer, scheduler, device):
     return start_epoch, best_ade
 
 # 将单个 epoch 的训练和验证结果追加写入 CSV。
-def write_csv_log(csv_path, epoch, train_stats, eval_ade, eval_fde, lr):
+def write_csv_log(csv_path, epoch, train_stats, val_stats, eval_ade, eval_fde, lr):
     row = {
         "epoch": epoch,
         "train_loss": train_stats["loss"],
         "train_vel_loss": train_stats["loss_vel"],
         "train_pos_loss": train_stats["loss_pos"],
+        "val_loss": val_stats["loss"],
+        "val_vel_loss": val_stats["loss_vel"],
+        "val_pos_loss": val_stats["loss_pos"],
         "val_ade_ft": eval_ade,
         "val_fde_ft": eval_fde,
         "val_ade_m": eval_ade * 0.3048,
@@ -79,6 +82,9 @@ def init_csv_log(csv_path):
         "train_loss",
         "train_vel_loss",
         "train_pos_loss",
+        "val_loss",
+        "val_vel_loss",
+        "val_pos_loss",
         "val_ade_ft",
         "val_fde_ft",
         "val_ade_m",
@@ -88,6 +94,43 @@ def init_csv_log(csv_path):
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
+
+
+# 返回统一格式的空损失统计。
+def build_zero_loss_stats():
+    return {
+        "loss": 0.0,
+        "loss_vel": 0.0,
+        "loss_pos": 0.0,
+    }
+
+
+# 将训练和验证指标统一写入 TensorBoard。
+def write_tensorboard_log(writer, epoch, train_stats, val_stats, eval_ade, eval_fde, lr):
+    writer.add_scalar("Loss/Train", train_stats["loss"], epoch)
+    writer.add_scalar("Loss/TrainVel", train_stats["loss_vel"], epoch)
+    writer.add_scalar("Loss/TrainPos", train_stats["loss_pos"], epoch)
+    writer.add_scalar("Loss/Val", val_stats["loss"], epoch)
+    writer.add_scalar("Loss/ValVel", val_stats["loss_vel"], epoch)
+    writer.add_scalar("Loss/ValPos", val_stats["loss_pos"], epoch)
+    writer.add_scalar("Eval/ADE_ft", eval_ade, epoch)
+    writer.add_scalar("Eval/FDE_ft", eval_fde, epoch)
+    writer.add_scalar("LR", lr, epoch)
+
+
+# 打印每个 epoch 的训练与验证摘要。
+def print_eval_summary(epoch, total_epochs, train_stats, val_stats, eval_ade, eval_fde):
+    print(
+        f"Epoch {epoch}/{total_epochs} | "
+        f"train={train_stats['loss']:.6f} | "
+        f"train_vel={train_stats['loss_vel']:.6f} | "
+        f"train_pos={train_stats['loss_pos']:.6f} | "
+        f"val={val_stats['loss']:.6f} | "
+        f"val_vel={val_stats['loss_vel']:.6f} | "
+        f"val_pos={val_stats['loss_pos']:.6f} | "
+        f"ade={eval_ade:.4f}ft | "
+        f"fde={eval_fde:.4f}ft"
+    )
 
 # 整理 batch 数据并按特征维度拼接模型输入。
 def prepare_input_data(batch, feature_dim, device="cuda"):
@@ -174,13 +217,16 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio):
         torch.cuda.manual_seed_all(42)
 
     model.eval()
+    total_loss = 0.0
+    total_vel_loss = 0.0
+    total_pos_loss = 0.0
     total_ade = 0.0
     total_fde = 0.0
     num_batches = 0
 
     if len(dataloader) == 0:
         model.train()
-        return 0.0, 0.0
+        return build_zero_loss_stats(), 0.0, 0.0
 
     total_batches = len(dataloader)
     if eval_ratio <= 0.0 or eval_ratio >= 1.0:
@@ -193,20 +239,43 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio):
         if num_batches >= target_batches:
             break
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
+        val_loss, val_parts = model.forwardTrain(
+            hist,
+            hist_nbrs,
+            mask,
+            temporal_mask,
+            fut,
+            op_mask,
+            device,
+            return_components=True,
+        )
         _, eval_ade, eval_fde = model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
 
+        total_loss += float(val_loss.item())
+        total_vel_loss += float(val_parts["loss_vel"].item())
+        total_pos_loss += float(val_parts["loss_pos"].item())
         total_ade += float(eval_ade.item())
         total_fde += float(eval_fde.item())
         num_batches += 1
         pbar.set_postfix({
+            "val_loss": f"{(total_loss / num_batches):.6f}",
+            "val_vel": f"{(total_vel_loss / num_batches):.6f}",
+            "val_pos": f"{(total_pos_loss / num_batches):.6f}",
             "avg_ade_ft": f"{(total_ade / num_batches):.4f}",
             "avg_fde_ft": f"{(total_fde / num_batches):.4f}",
         })
 
     model.train()
     if num_batches == 0:
-        return 0.0, 0.0
-    return total_ade / num_batches, total_fde / num_batches
+        return build_zero_loss_stats(), 0.0, 0.0
+
+    denom = float(num_batches)
+    val_stats = {
+        "loss": total_loss / denom,
+        "loss_vel": total_vel_loss / denom,
+        "loss_pos": total_pos_loss / denom,
+    }
+    return val_stats, total_ade / denom, total_fde / denom
 
 
 # 初始化训练组件并执行 fut 训练主流程。
@@ -258,22 +327,11 @@ def main():
 
     for epoch in range(start_epoch, args.num_epochs):
         train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim)
-        eval_ade, eval_fde = evaluate(model, val_loader, device, epoch + 1, args.feature_dim, eval_ratio)
+        val_stats, eval_ade, eval_fde = evaluate(model, val_loader, device, epoch + 1, args.feature_dim, eval_ratio)
         current_lr = optimizer.param_groups[0]["lr"]
-        write_csv_log(log_csv_path, epoch + 1, train_stats, eval_ade, eval_fde, current_lr)
-        writer.add_scalar("Loss/Train", train_stats["loss"], epoch + 1)
-        writer.add_scalar("Loss/TrainVel", train_stats["loss_vel"], epoch + 1)
-        writer.add_scalar("Loss/TrainPos", train_stats["loss_pos"], epoch + 1)
-        writer.add_scalar("Eval/ADE_ft", eval_ade, epoch + 1)
-        writer.add_scalar("Eval/FDE_ft", eval_fde, epoch + 1)
-        print(
-            f"Epoch {epoch + 1}/{args.num_epochs} | "
-            f"train={train_stats['loss']:.6f} | "
-            f"vel={train_stats['loss_vel']:.6f} | "
-            f"pos={train_stats['loss_pos']:.6f} | "
-            f"ade={eval_ade:.4f}ft | "
-            f"fde={eval_fde:.4f}ft"
-        )
+        write_csv_log(log_csv_path, epoch + 1, train_stats, val_stats, eval_ade, eval_fde, current_lr)
+        write_tensorboard_log(writer, epoch + 1, train_stats, val_stats, eval_ade, eval_fde, current_lr)
+        print_eval_summary(epoch + 1, args.num_epochs, train_stats, val_stats, eval_ade, eval_fde)
 
         scheduler.step()
         is_best = eval_ade < best_ade

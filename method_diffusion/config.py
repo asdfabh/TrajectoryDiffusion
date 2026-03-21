@@ -10,7 +10,7 @@ def get_args_parser():
     # Train runtime
     parser.add_argument("--batch_size", default=512, type=int)
     parser.add_argument("--num_epochs", default=50, type=int)
-    parser.add_argument("--num_workers", default=3, type=int)
+    parser.add_argument("--num_workers", default=10, type=int)
     parser.add_argument("--learning_rate", default=1e-4, type=float)
     parser.add_argument("--save_interval", default=5, type=int)
     parser.add_argument("--mask_prob", default=0.4, type=float)
@@ -72,7 +72,7 @@ def get_args_parser():
 
     # Fut loss
     parser.add_argument("--fut_huber_delta", default=1.0, type=float)
-    parser.add_argument("--fut_pos_loss_weight", default=0.1, type=float)
+    parser.add_argument("--fut_pos_loss_weight", default=1.5, type=float)
 
     # Fut visualization
     parser.add_argument("--fut_enable_train_vis", default=0, type=int)
