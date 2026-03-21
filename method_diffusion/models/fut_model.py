@@ -38,20 +38,12 @@ class DiffusionFut(nn.Module):
         self.fut_enable_train_vis = int(args.fut_enable_train_vis) > 0
         self.fut_enable_eval_vis = int(args.fut_enable_eval_vis) > 0
         self.meter_per_foot = 0.3048
-        self.use_attention_pooling = int(getattr(args, "fut_use_attention_pooling", 1)) > 0
-        self.use_split_cond_adaln = int(getattr(args, "fut_use_split_cond_adaln", 1)) > 0
 
         # 输入编码模块：分别处理 future 噪声序列和 history context。
         self.input_embedding = nn.Linear(self.output_dim * 2, self.hidden_dim)
         self.context_embedding = nn.Linear(self.hidden_dim, self.hidden_dim)
         self.pos_embedding = SequentialPositionalEncoding(self.hidden_dim)
         self.hist_encoder = HistEncoder(args)
-        self.scene_pool_score = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.Tanh(),
-            nn.Linear(self.hidden_dim, 1),
-        )
-        self.scene_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
 
         # DiT 主干与扩散调度器：负责时间嵌入、去噪建模和 DDIM 调度。
         self.timestep_embedder = dit.TimestepEmbedder(self.hidden_dim, self.time_embedding_size)
@@ -62,19 +54,8 @@ class DiffusionFut(nn.Module):
             clip_sample=False,
         )
 
-        dit_block = dit.DiTBlock(
-            self.hidden_dim,
-            self.heads,
-            self.dropout,
-            self.mlp_ratio,
-            use_split_cond=self.use_split_cond_adaln,
-        )
-        final_layer = dit.FinalLayer(
-            self.hidden_dim,
-            self.T,
-            self.output_dim,
-            use_split_cond=self.use_split_cond_adaln,
-        )
+        dit_block = dit.DiTBlock(self.hidden_dim, self.heads, self.dropout, self.mlp_ratio)
+        final_layer = dit.FinalLayer(self.hidden_dim, self.T, self.output_dim)
         self.dit = dit.DiT(dit_block=dit_block, final_layer=final_layer, depth=self.depth, model_type="x_start")
 
         # 双空间归一化参数
@@ -92,29 +73,13 @@ class DiffusionFut(nn.Module):
     def toValidMask(op_mask, device):
         return (op_mask[..., 0] > 0.5).float().to(device)
 
-    # 从完整 history context 中提取 scene-level 全局条件，默认使用 attention pooling。
-    def buildSceneEmbedding(self, context):
-        if not self.use_attention_pooling:
-            return context[:, -1, :]
-
-        attn_scores = self.scene_pool_score(context).squeeze(-1)
-        attn_weights = torch.softmax(attn_scores, dim=1)
-        scene_vec = torch.sum(context * attn_weights.unsqueeze(-1), dim=1)
-        return self.scene_proj(scene_vec)
-
-    # 统一编码 history side 条件，输出 cross-attn context 和 scene embedding。
-    def encodeHistoryCondition(self, hist_norm, hist_nbrs_norm, mask, temporal_mask):
-        context, _ = self.hist_encoder(hist_norm, hist_nbrs_norm, mask, temporal_mask)
-        scene_emb = self.buildSceneEmbedding(context)
-        return context, scene_emb
-
     # 基于当前噪声状态与历史条件预测归一化速度。
-    def predictX0(self, x_t, timesteps, context_aligned, scene_emb, pred_x0_cond):
+    def predictX0(self, x_t, timesteps, context_aligned, enc_emb, pred_x0_cond):
         t_emb = self.timestep_embedder(timesteps)
         combined_input = torch.cat([x_t, pred_x0_cond], dim=-1)
         input_embedded = self.input_embedding(combined_input) + self.pos_embedding(x_t)
         context_with_pos = self.context_embedding(context_aligned) + self.pos_embedding(context_aligned)
-        return self.dit(x=input_embedded, t_cond=t_emb, scene_cond=scene_emb, cross=context_with_pos)
+        return self.dit(x=input_embedded, y=t_emb + enc_emb, cross=context_with_pos)
 
     # 计算训练使用的速度损失与物理位置损失。
     def computeLoss(self, pred_vel_norm, target_vel_norm, future_phys, anchor_phys, valid_mask, return_parts=False):
@@ -165,14 +130,14 @@ class DiffusionFut(nn.Module):
         return ade, fde
 
     # 执行推理阶段的 DDIM 采样并输出最终预测结果（相对坐标系）。
-    def sampleFromXt(self, x_t, context_aligned, scene_emb, infer_scheduler):
+    def sampleFromXt(self, x_t, context_aligned, enc_emb, infer_scheduler):
         bsz, t_len, _ = x_t.shape
         pred_vel_cond = torch.zeros((bsz, t_len, self.output_dim), device=x_t.device, dtype=x_t.dtype)
         for t in infer_scheduler.timesteps:
             t_scalar = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
             timesteps = torch.full((bsz,), t_scalar, device=x_t.device, dtype=torch.long)
 
-            pred_vel_norm = self.predictX0(x_t, timesteps, context_aligned, scene_emb, pred_vel_cond)
+            pred_vel_norm = self.predictX0(x_t, timesteps, context_aligned, enc_emb, pred_vel_cond)
             if self.x0_clip is not None:
                 pred_vel_norm = torch.clamp(pred_vel_norm, -self.x0_clip, self.x0_clip)
 
@@ -190,12 +155,13 @@ class DiffusionFut(nn.Module):
         anchor_phys = hist[..., -1:, :self.output_dim]
         future_phys = future[..., :self.output_dim]
         hist_norm = self.normalize(hist)
-        context, scene_emb = self.encodeHistoryCondition(hist_norm, self.normalize(hist_nbrs), mask, temporal_mask)
+        context, _ = self.hist_encoder(hist_norm, self.normalize(hist_nbrs), mask, temporal_mask)
+        enc_emb = context[:, -1, :]
         infer_scheduler = DDIMScheduler.from_config(self.diffusion_scheduler.config)
         infer_scheduler.set_timesteps(self.num_inference_steps)
         std_vel = self.vel_std.view(1, 1, 2).to(device)
         mean_vel = self.vel_mean.view(1, 1, 2).to(device)
-        return bsz, t_len, valid_mask, anchor_phys, future_phys, context, scene_emb, infer_scheduler, std_vel, mean_vel
+        return bsz, t_len, valid_mask, anchor_phys, future_phys, context, enc_emb, infer_scheduler, std_vel, mean_vel
 
     # 执行单个 batch 的 fut 训练前向与损失计算。
     def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, return_components=False):
@@ -223,7 +189,8 @@ class DiffusionFut(nn.Module):
 
         # 编码历史信息，得到条件上下文和全局编码，用于指导去噪过程【可以尝试的修改点】
         hist_norm = self.normalize(hist)
-        context, scene_emb = self.encodeHistoryCondition(hist_norm, self.normalize(hist_nbrs), mask, temporal_mask)
+        context, _ = self.hist_encoder(hist_norm, self.normalize(hist_nbrs), mask, temporal_mask)
+        enc_emb = context[:, -1, :]
 
         # 自条件：以一定概率将前一步的预测结果作为下一步的输入条件，增强模型稳定性和一致性
         pred_vel_cond = torch.zeros_like(x_t)
@@ -231,11 +198,11 @@ class DiffusionFut(nn.Module):
             use_sc = (torch.rand(bsz, 1, 1, device=device) < self.self_condition_prob).float()
             if use_sc.any():
                 with torch.no_grad():
-                    prev_pred_vel = self.predictX0(x_t, timesteps, context, scene_emb, pred_vel_cond)
+                    prev_pred_vel = self.predictX0(x_t, timesteps, context, enc_emb, pred_vel_cond)
                 pred_vel_cond = prev_pred_vel.detach() * use_sc
 
         # 网络输出：预测的归一化速度
-        pred_vel_norm_t = self.predictX0(x_t, timesteps, context, scene_emb, pred_vel_cond)
+        pred_vel_norm_t = self.predictX0(x_t, timesteps, context, enc_emb, pred_vel_cond)
 
         # 传入双轨 Loss 损失函数
         loss, loss_parts = self.computeLoss(pred_vel_norm_t, target_vel_norm, future_phys, anchor_phys, valid_mask, return_parts=True,)
@@ -267,11 +234,11 @@ class DiffusionFut(nn.Module):
     @torch.no_grad()
     # 执行单模态推理评估并返回轨迹与指标。
     def forwardEval(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
-        bsz, t_len, valid_mask, anchor_phys, future_phys, context, scene_emb, infer_scheduler, std_vel, mean_vel = \
+        bsz, t_len, valid_mask, anchor_phys, future_phys, context, enc_emb, infer_scheduler, std_vel, mean_vel = \
             self.prepareEvalInputs(hist, hist_nbrs, mask, temporal_mask, future, op_mask, device)
 
         x_t = torch.randn((bsz, t_len, self.output_dim), device=device)
-        pred_vel_norm = self.sampleFromXt(x_t, context, scene_emb, infer_scheduler)
+        pred_vel_norm = self.sampleFromXt(x_t, context, enc_emb, infer_scheduler)
 
         # 积分还原：解归一化 -> 累加 -> 拼接绝对锚点
         pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
@@ -297,16 +264,16 @@ class DiffusionFut(nn.Module):
     @torch.no_grad()
     # 执行并行多模态推理评估并返回 minADE 对应结果。
     def forwardEval_minADE(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, K=5):
-        bsz, t_len, valid_mask, anchor_phys, future_phys, context, scene_emb, infer_scheduler, std_vel, mean_vel = \
+        bsz, t_len, valid_mask, anchor_phys, future_phys, context, enc_emb, infer_scheduler, std_vel, mean_vel = \
             self.prepareEvalInputs(hist, hist_nbrs, mask, temporal_mask, future, op_mask, device)
 
         # 核心提速优化：在 Batch 维度上并行展开 K 倍
         context_k = context.repeat_interleave(K, dim=0)
-        scene_emb_k = scene_emb.repeat_interleave(K, dim=0)
+        enc_emb_k = enc_emb.repeat_interleave(K, dim=0)
 
         # 一次性生成 bsz * K 份随机噪声，并行执行完整的去噪过程
         x_t_k = torch.randn((bsz * K, t_len, self.output_dim), device=device)
-        pred_vel_norm_k = self.sampleFromXt(x_t_k, context_k, scene_emb_k, infer_scheduler)
+        pred_vel_norm_k = self.sampleFromXt(x_t_k, context_k, enc_emb_k, infer_scheduler)
 
         # 把并发结果 Reshape 回 [bsz, K, t_len, dim]
         pred_vel_norm = pred_vel_norm_k.view(bsz, K, t_len, self.output_dim)
