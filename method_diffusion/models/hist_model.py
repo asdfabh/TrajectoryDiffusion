@@ -58,9 +58,9 @@ class DiffusionPast(nn.Module):
             "xy_known": 0.20,
             "va_unknown": 0.45,
             "va_known": 0.10,
-            "dxy": 0.20,
-            "v_cons": 0.15,
-            "a_cons": 0.08,
+            "dxy": 0.00,
+            "v_cons": 0.00,
+            "a_cons": 0.00,
         }
 
     def masked_smooth_l1(self, pred, target, mask=None):
@@ -102,13 +102,16 @@ class DiffusionPast(nn.Module):
             pred_dxy = pred_phys[:, 1:, :2] - pred_phys[:, :-1, :2]
             target_dxy = target_phys[:, 1:, :2] - target_phys[:, :-1, :2]
             pair_unknown = torch.maximum(unknown_mask[:, 1:, :], unknown_mask[:, :-1, :])
+            # loss_dxy: 约束相邻时刻的位置增量 delta(x, y) 与 GT 一致，衡量局部轨迹形状是否平滑且正确。
             loss_dxy = self.masked_smooth_l1(pred_dxy, target_dxy, pair_unknown)
 
             pred_v = pred_phys[..., 2]
             pred_a = pred_phys[..., 3]
             pred_v_from_y = pred_dxy[..., 1] / self.hist_dt
             pred_a_from_v = (pred_v[:, 1:] - pred_v[:, :-1]) / self.hist_dt
+            # loss_v_cons: 用位置序列的纵向差分速度约束输出 v，衡量预测位置与预测速度是否自洽。
             loss_v_cons = self.masked_smooth_l1(pred_v_from_y, pred_v[:, 1:], None)
+            # loss_a_cons: 用速度序列的一阶差分约束输出 a，衡量预测速度与预测加速度是否自洽。
             loss_a_cons = self.masked_smooth_l1(pred_a_from_v, pred_a[:, 1:], None)
 
         total_loss = (
@@ -157,11 +160,6 @@ class DiffusionPast(nn.Module):
         loss, loss_parts = self.compute_motion_loss(pred_x0, x_start, hist_mask, return_parts=True)
 
         pred = self.denorm(pred_x0)
-        diff = pred[..., :2] - hist[..., :2]
-        dist = torch.norm(diff, dim=-1) # [B, T]
-
-        ade = dist.mean()
-        fde = dist[:, -1].mean()
         maybe_visualize_hist_reconstruction(
             hist=hist,
             hist_masked=hist_masked,
@@ -172,8 +170,8 @@ class DiffusionPast(nn.Module):
         )
 
         if return_components:
-            return loss, pred, ade, fde, loss_parts
-        return loss, pred, ade, fde
+            return loss, pred, loss_parts
+        return loss, pred
 
     @torch.no_grad()
     def forward_eval(self, hist, hist_masked, device):
@@ -215,10 +213,6 @@ class DiffusionPast(nn.Module):
         final_pred_norm = hist_mask * known_x0 + mask_unknown * x_t
         final_pred = self.denorm(final_pred_norm)
         loss = torch.nn.functional.mse_loss(final_pred, hist)
-        diff = final_pred[..., :2] - hist[..., :2]
-        dist = torch.norm(diff, dim=-1)  # [B, T]
-        ade = dist.mean()  # Scalar
-        fde = dist[:, -1].mean() # Scalar
         maybe_visualize_hist_reconstruction(
             hist=hist,
             hist_masked=hist_masked,
@@ -228,7 +222,7 @@ class DiffusionPast(nn.Module):
             enable_eval_vis=int(getattr(self.args, "hist_enable_eval_vis", 0)) > 0,
         )
 
-        return loss, final_pred, ade, fde
+        return loss, final_pred
 
     def forward(self, hist, hist_masked, device):
         """Standard forward method for DDP compatibility"""

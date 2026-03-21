@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import torch
 from torch.utils.data import DataLoader
 from pathlib import Path
@@ -14,6 +15,8 @@ from method_diffusion.config import get_args_parser
 from method_diffusion.utils.mask_util import random_mask, continuous_mask
 
 METER_PER_FOOT = 0.3048
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+HIST_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "hist"
 
 
 def get_eval_args():
@@ -70,47 +73,44 @@ def filter_valid_batch(batch):
     return filtered
 
 
-def load_checkpoint(model, resume_arg, default_dir, device, model_name="Model"):
-    ckpt_path = None
-    default_dir = Path(default_dir)
+def resolve_checkpoint_path(resume_arg, checkpoint_dir):
+    checkpoint_dir = Path(checkpoint_dir)
+    if resume_arg in ("none", "", None):
+        resume_arg = "best"
 
-    if Path(resume_arg).is_absolute() and Path(resume_arg).exists():
-        ckpt_path = Path(resume_arg)
-    elif (default_dir / resume_arg).exists():
-        ckpt_path = default_dir / resume_arg
-    elif resume_arg == 'latest':
-        ckpts = sorted(default_dir.glob('checkpoint_epoch_*.pth'))
-        if ckpts: ckpt_path = ckpts[-1]
-    elif resume_arg == 'best':
-        best_cand = default_dir / 'checkpoint_best.pth'
-        if best_cand.exists(): ckpt_path = best_cand
-    elif resume_arg.startswith('epoch'):
-        try:
-            ep = int(resume_arg.replace('epoch', ''))
-            ckpt_path = default_dir / f'checkpoint_epoch_{ep}.pth'
-        except:
-            pass
+    resume_path = Path(str(resume_arg))
+    if resume_path.exists():
+        return resume_path
+    if resume_arg == "best":
+        return checkpoint_dir / "checkpoint_best.pth"
+    if resume_arg == "latest":
+        ckpts = sorted(checkpoint_dir.glob("checkpoint_epoch_*.pth"))
+        return ckpts[-1] if ckpts else None
+    if re.fullmatch(r"epoch\d+", str(resume_arg)):
+        epoch_num = int(str(resume_arg).replace("epoch", ""))
+        return checkpoint_dir / f"checkpoint_epoch_{epoch_num}.pth"
+    return None
 
-    if ckpt_path and ckpt_path.exists():
-        print(f"[{model_name}] Loading checkpoint from: {ckpt_path}")
-        checkpoint = torch.load(ckpt_path, map_location=device)
 
-        if 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-        else:
-            state_dict = checkpoint
+def load_checkpoint(model, resume_arg, checkpoint_dir, device, model_name="Model"):
+    ckpt_path = resolve_checkpoint_path(resume_arg, checkpoint_dir)
+    if ckpt_path is None or not ckpt_path.exists():
+        raise FileNotFoundError(
+            f"[{model_name}] Checkpoint not found: resume_hist={resume_arg}, dir={checkpoint_dir}"
+        )
 
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            if k in ['pos_mean', 'pos_std', 'va_mean', 'va_std']: continue
-            new_key = k.replace('module.', '')
-            new_state_dict[new_key] = v
+    print(f"[{model_name}] Loading checkpoint from: {ckpt_path}")
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
 
-        model.load_state_dict(new_state_dict, strict=False)
-        model.eval()
-    else:
-        print(f"[{model_name}] [Error] Checkpoint '{resume_arg}' not found in {default_dir}. Using random weights!")
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k in ["pos_mean", "pos_std", "va_mean", "va_std"]:
+            continue
+        new_state_dict[k.replace("module.", "")] = v
 
+    model.load_state_dict(new_state_dict, strict=False)
+    model.eval()
     return model
 
 
@@ -126,9 +126,6 @@ class HistReconstructionMetrics:
 
         self.va_coord_se = {key: torch.zeros(2, dtype=torch.float64) for key in ("all", "known", "masked")}
         self.va_point_count = {"all": 0.0, "known": 0.0, "masked": 0.0}
-
-        self.masked_fde_sum = 0.0
-        self.masked_fde_count = 0.0
 
         self.dxy_coord_se = 0.0
         self.dxy_coord_count = 0.0
@@ -178,14 +175,6 @@ class HistReconstructionMetrics:
             self.a_cons_se += float((((pred_a_from_v - pred_a[:, 1:]) ** 2) * pair_mask).sum().item())
             self.a_cons_count += float(pair_mask.sum().item())
 
-        t_idx = torch.arange(masked.shape[1], device=masked.device).unsqueeze(0).expand_as(masked)
-        last_mask_idx = torch.where(masked, t_idx, t_idx.new_full(t_idx.shape, -1)).max(dim=1).values
-        has_masked = last_mask_idx >= 0
-        if bool(has_masked.any()):
-            last_err = xy_dist.gather(1, last_mask_idx.clamp(min=0).unsqueeze(1)).squeeze(1)
-            self.masked_fde_sum += float((last_err * has_masked.float()).sum().item())
-            self.masked_fde_count += float(has_masked.float().sum().item())
-
     @staticmethod
     def safe_div(numerator, denominator):
         return numerator / denominator if denominator > 0 else 0.0
@@ -211,7 +200,6 @@ class HistReconstructionMetrics:
         return {
             "xy_ade_m": xy_ade_m,
             "xy_rmse_m": xy_rmse_m,
-            "masked_fde_m": self.safe_div(self.masked_fde_sum, self.masked_fde_count) * self.meter_per_foot,
             "dxy_rmse_m": self.safe_div(self.dxy_coord_se, self.dxy_coord_count) ** 0.5 * self.meter_per_foot,
             "v_cons_rmse_mps": self.safe_div(self.v_cons_se, self.v_cons_count) ** 0.5 * self.meter_per_foot,
             "a_cons_rmse_mps2": self.safe_div(self.a_cons_se, self.a_cons_count) ** 0.5 * self.meter_per_foot,
@@ -223,7 +211,6 @@ def print_metrics(summary, title, mask_type, mask_prob):
     print('\n' + '=' * 28 + f' {title} ' + '=' * 28)
     print(f"Mask Type: {mask_type} | Mask Probability: {mask_prob:.4f}")
     print(f"Masked XY ADE (m): {summary['xy_ade_m']['masked']:.6f}")
-    print(f"Masked XY FDE (m): {summary['masked_fde_m']:.6f}")
     print(f"Masked XY RMSE (m): {summary['xy_rmse_m']['masked']:.6f}")
     print('-' * 90)
     print(f"{'XY Region':<12} | {'ADE (m)':<12} | {'RMSE (m)':<12}")
@@ -246,31 +233,19 @@ def print_metrics(summary, title, mask_type, mask_prob):
 
 def main():
     args = get_eval_args()
+    args.checkpoint_dir = str(HIST_CHECKPOINT_DIR)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+    print(f"[HistEval] Checkpoint dir: {args.checkpoint_dir}")
 
-    script_dir = Path(__file__).resolve().parent
-    arg_ckpt_path = Path(args.checkpoint_dir)
-    if arg_ckpt_path.is_absolute():
-        base_ckpt_dir = arg_ckpt_path
-    else:
-        base_ckpt_dir = script_dir / arg_ckpt_path.name
+    data_root = Path(args.data_root)
+    test_path = data_root / "TestSet.mat"
+    if not test_path.exists():
+        test_path = data_root / "ValSet.mat"
+    print(f"[HistEval] Loading test data from: {test_path}")
 
-    hist_ckpt_dir = base_ckpt_dir / 'hist'
-    print(f"[Info] Checkpoint Search Dir: {hist_ckpt_dir}")
-
-    if os.path.exists(os.path.join(args.data_root, 'TestSet.mat')):
-        test_path = os.path.join(args.data_root, 'TestSet.mat')
-    else:
-        data_root = script_dir.parent / 'mnt/datasets/ngsimdata'
-        if not data_root.exists():
-            data_root = Path('/mnt/datasets/ngsimdata')
-        test_path = str(data_root / 'TestSet.mat')
-
-    print(f"Loading test data from: {test_path}")
-
-    test_dataset = NgsimHistDataset(test_path, t_h=30, d_s=2)
+    test_dataset = NgsimHistDataset(str(test_path), t_h=30, d_s=2)
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
@@ -281,8 +256,7 @@ def main():
     )
 
     model = DiffusionPast(args).to(device)
-    resume_target = args.resume_hist if args.resume_hist != 'none' else 'best'
-    load_checkpoint(model, resume_target, hist_ckpt_dir, device, model_name="HistModel")
+    load_checkpoint(model, args.resume_hist, args.checkpoint_dir, device, model_name="HistModel")
     metrics = HistReconstructionMetrics(hist_dt=getattr(model, "hist_dt", 0.2))
     eval_mask_type = str(args.hist_eval_mask_type).lower()
     eval_mask_prob = float(args.hist_eval_mask_prob)
@@ -299,13 +273,12 @@ def main():
                 batch, args.feature_dim, mask_type=eval_mask_type, mask_prob=eval_mask_prob, device=device
             )
 
-            _, pred, _, _ = model.forward_eval(hist, hist_masked, device)
+            _, pred = model.forward_eval(hist, hist_masked, device)
             metrics.update(pred, hist, hist_mask)
 
             summary = metrics.summary()
             pbar.set_postfix({
                 "xy_mask_ade": f"{summary['xy_ade_m']['masked']:.4f}",
-                "xy_mask_fde": f"{summary['masked_fde_m']:.4f}",
                 "xy_mask_rmse": f"{summary['xy_rmse_m']['masked']:.4f}",
             })
 

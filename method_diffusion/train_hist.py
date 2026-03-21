@@ -80,10 +80,8 @@ def init_csv_log(csv_path):
         "train_v_cons",
         "train_a_cons",
         "val_loss",
-        "val_ade_ft",
-        "val_fde_ft",
-        "val_ade_m",
-        "val_fde_m",
+        "val_masked_ade_ft",
+        "val_masked_ade_m",
         "lr",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
@@ -103,10 +101,8 @@ def write_csv_log(csv_path, epoch, train_stats, eval_stats, lr):
         "train_v_cons": train_stats["loss_v_cons"],
         "train_a_cons": train_stats["loss_a_cons"],
         "val_loss": eval_stats["loss"],
-        "val_ade_ft": eval_stats["ade_ft"],
-        "val_fde_ft": eval_stats["fde_ft"],
-        "val_ade_m": eval_stats["ade_ft"] * 0.3048,
-        "val_fde_m": eval_stats["fde_ft"] * 0.3048,
+        "val_masked_ade_ft": eval_stats["masked_ade_ft"],
+        "val_masked_ade_m": eval_stats["masked_ade_ft"] * 0.3048,
         "lr": lr,
     }
     with csv_path.open("a", newline="", encoding="utf-8") as f:
@@ -170,6 +166,14 @@ def sample_train_mask_type():
     return "block" if torch.rand(1).item() < TRAIN_BLOCK_MASK_RATIO else "random"
 
 
+def compute_masked_xy_ade(pred, target, hist_mask):
+    masked = hist_mask[..., 0] < 0.5
+    if not bool(masked.any()):
+        return pred.new_tensor(0.0)
+    xy_dist = torch.norm(pred[..., :2] - target[..., :2], dim=-1)
+    return xy_dist[masked].mean()
+
+
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, mask_prob):
     model.train()
     total_stats = {
@@ -184,7 +188,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, mask_p
     }
     num_batches = 0
 
-    pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Train", ncols=140)
+    pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Train", dynamic_ncols=True)
     for batch in pbar:
         batch = filter_valid_batch(batch)
         hist = prepare_input_data(batch, feature_dim, device=device)
@@ -193,9 +197,9 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, mask_p
 
         mask_type = sample_train_mask_type()
         hist_masked, _ = build_masked_history(hist, mask_type=mask_type, mask_prob=mask_prob)
-        loss, _, ade, fde, loss_parts = model.forward_train(hist, hist_masked, device, return_components=True)
+        loss, pred, loss_parts = model.forward_train(hist, hist_masked, device, return_components=True)
+        masked_ade = compute_masked_xy_ade(pred, hist, hist_masked[..., -1:])
         # _, _, _, _ = model.forward_train(hist, hist_masked, device)
-
 
         optimizer.zero_grad()
         loss.backward()
@@ -212,8 +216,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, mask_p
             "xy_u": f"{(total_stats['loss_xy_unknown'] / num_batches):.5f}",
             "va_u": f"{(total_stats['loss_va_unknown'] / num_batches):.5f}",
             "dxy": f"{(total_stats['loss_dxy'] / num_batches):.5f}",
-            "ade": f"{ade.item():.4f}",
-            "fde": f"{fde.item():.4f}",
+            "mask_ade": f"{masked_ade.item():.4f}",
         })
 
     denom = max(num_batches, 1)
@@ -228,13 +231,12 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, mask_pro
 
     model.eval()
     total_loss = 0.0
-    total_ade = 0.0
-    total_fde = 0.0
+    total_masked_ade = 0.0
     num_batches = 0
 
     if len(dataloader) == 0:
         model.train()
-        return {"loss": 0.0, "ade_ft": 0.0, "fde_ft": 0.0}
+        return {"loss": 0.0, "masked_ade_ft": 0.0}
 
     total_batches = len(dataloader)
     if eval_ratio <= 0.0 or eval_ratio >= 1.0:
@@ -242,7 +244,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, mask_pro
     else:
         target_batches = max(1, int(math.ceil(total_batches * float(eval_ratio))))
 
-    pbar = tqdm(dataloader, total=target_batches, desc=f"Ep{epoch} Val", ncols=140)
+    pbar = tqdm(dataloader, total=target_batches, desc=f"Ep{epoch} Val", dynamic_ncols=True)
     for batch in pbar:
         if num_batches >= target_batches:
             break
@@ -252,27 +254,25 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, mask_pro
         if hist.shape[0] == 0:
             continue
 
-        hist_masked, _ = build_masked_history(hist, mask_type=VAL_MASK_TYPE, mask_prob=mask_prob)
-        loss, _, ade, fde = model.forward_eval(hist, hist_masked, device)
+        hist_masked, hist_mask = build_masked_history(hist, mask_type=VAL_MASK_TYPE, mask_prob=mask_prob)
+        loss, pred = model.forward_eval(hist, hist_masked, device)
+        masked_ade = compute_masked_xy_ade(pred, hist, hist_mask)
 
         total_loss += float(loss.item())
-        total_ade += float(ade.item())
-        total_fde += float(fde.item())
+        total_masked_ade += float(masked_ade.item())
         num_batches += 1
         pbar.set_postfix({
             "avg_loss": f"{(total_loss / num_batches):.6f}",
-            "avg_ade_ft": f"{(total_ade / num_batches):.4f}",
-            "avg_fde_ft": f"{(total_fde / num_batches):.4f}",
+            "avg_mask_ade_ft": f"{(total_masked_ade / num_batches):.4f}",
         })
 
     model.train()
     if num_batches == 0:
-        return {"loss": 0.0, "ade_ft": 0.0, "fde_ft": 0.0}
+        return {"loss": 0.0, "masked_ade_ft": 0.0}
 
     return {
         "loss": total_loss / num_batches,
-        "ade_ft": total_ade / num_batches,
-        "fde_ft": total_fde / num_batches,
+        "masked_ade_ft": total_masked_ade / num_batches,
     }
 
 
@@ -341,8 +341,7 @@ def main():
         writer.add_scalar("Loss/TrainVConsistency", train_stats["loss_v_cons"], epoch + 1)
         writer.add_scalar("Loss/TrainAConsistency", train_stats["loss_a_cons"], epoch + 1)
         writer.add_scalar("Eval/Loss", eval_stats["loss"], epoch + 1)
-        writer.add_scalar("Eval/ADE_ft", eval_stats["ade_ft"], epoch + 1)
-        writer.add_scalar("Eval/FDE_ft", eval_stats["fde_ft"], epoch + 1)
+        writer.add_scalar("Eval/MaskedADE_ft", eval_stats["masked_ade_ft"], epoch + 1)
 
         print(
             f"Epoch {epoch + 1}/{args.num_epochs} | "
@@ -352,8 +351,7 @@ def main():
             f"va_u={train_stats['loss_va_unknown']:.6f} | "
             f"va_k={train_stats['loss_va_known']:.6f} | "
             f"val_loss={eval_stats['loss']:.6f} | "
-            f"ade={eval_stats['ade_ft']:.4f}ft | "
-            f"fde={eval_stats['fde_ft']:.4f}ft"
+            f"mask_ade={eval_stats['masked_ade_ft']:.4f}ft"
         )
 
         scheduler.step()
@@ -368,8 +366,7 @@ def main():
             "scheduler_state_dict": scheduler.state_dict(),
             "loss": train_stats["loss_total"],
             "eval_loss": eval_stats["loss"],
-            "eval_ade": eval_stats["ade_ft"],
-            "eval_fde": eval_stats["fde_ft"],
+            "eval_masked_ade": eval_stats["masked_ade_ft"],
             "best_loss": best_loss,
         }
 

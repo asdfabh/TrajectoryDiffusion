@@ -16,7 +16,7 @@ def get_args_parser():
     parser.add_argument("--mask_prob", default=0.4, type=float)
     parser.add_argument("--checkpoint_dir", default="./checkpoints", type=str)
     parser.add_argument("--resume_fut", default="none", type=str)
-    parser.add_argument("--resume_hist", default="best", type=str)
+    parser.add_argument("--resume_hist", default="none", type=str)
 
     # Joint train strategy
     parser.add_argument("--joint_freeze_hist", default=1, type=int)
