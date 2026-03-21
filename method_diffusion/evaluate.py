@@ -1,7 +1,6 @@
 import sys
 import os
 import torch
-import numpy as np
 from torch.utils.data import DataLoader
 from pathlib import Path
 from tqdm import tqdm
@@ -13,6 +12,15 @@ from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.dataset.ngsim_hist_dataset import NgsimHistDataset
 from method_diffusion.config import get_args_parser
 from method_diffusion.utils.mask_util import random_mask, continuous_mask
+
+METER_PER_FOOT = 0.3048
+
+
+def get_eval_args():
+    parser = get_args_parser()
+    parser.add_argument("--hist_eval_mask_type", default="random", type=str)
+    parser.add_argument("--hist_eval_mask_prob", default=0.5, type=float)
+    return parser.parse_args()
 
 
 def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.5, device='cuda'):
@@ -43,6 +51,23 @@ def prepare_input_data(batch, feature_dim, mask_type='random', mask_prob=0.5, de
     hist_masked = torch.cat([hist_masked_val, hist_mask], dim=-1)
 
     return hist, hist_masked, hist_mask
+
+
+def filter_valid_batch(batch):
+    sample_valid = batch.get("sample_valid", None)
+    if sample_valid is None:
+        return batch
+    sample_valid = sample_valid.bool()
+    if sample_valid.numel() == 0 or bool(sample_valid.all()):
+        return batch
+
+    filtered = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value) and value.dim() > 0 and value.shape[0] == sample_valid.shape[0]:
+            filtered[key] = value[sample_valid]
+        else:
+            filtered[key] = value
+    return filtered
 
 
 def load_checkpoint(model, resume_arg, default_dir, device, model_name="Model"):
@@ -89,13 +114,138 @@ def load_checkpoint(model, resume_arg, default_dir, device, model_name="Model"):
     return model
 
 
+class HistReconstructionMetrics:
+    def __init__(self, meter_per_foot=METER_PER_FOOT, hist_dt=0.2):
+        self.meter_per_foot = float(meter_per_foot)
+        self.hist_dt = float(hist_dt)
+
+        self.xy_dist_sum = {"all": 0.0, "known": 0.0, "masked": 0.0}
+        self.xy_point_count = {"all": 0.0, "known": 0.0, "masked": 0.0}
+        self.xy_coord_se = {"all": 0.0, "known": 0.0, "masked": 0.0}
+        self.xy_coord_count = {"all": 0.0, "known": 0.0, "masked": 0.0}
+
+        self.va_coord_se = {key: torch.zeros(2, dtype=torch.float64) for key in ("all", "known", "masked")}
+        self.va_point_count = {"all": 0.0, "known": 0.0, "masked": 0.0}
+
+        self.masked_fde_sum = 0.0
+        self.masked_fde_count = 0.0
+
+        self.dxy_coord_se = 0.0
+        self.dxy_coord_count = 0.0
+        self.v_cons_se = 0.0
+        self.v_cons_count = 0.0
+        self.a_cons_se = 0.0
+        self.a_cons_count = 0.0
+
+    def update(self, pred, target, mask):
+        pred = pred.detach()
+        target = target.detach()
+        known = (mask[..., 0] > 0.5)
+        masked = ~known
+        all_mask = torch.ones_like(known, dtype=torch.bool)
+        region_masks = {"all": all_mask, "known": known, "masked": masked}
+
+        xy_diff = pred[..., :2] - target[..., :2]
+        xy_dist = torch.norm(xy_diff, dim=-1)
+
+        for region, region_mask in region_masks.items():
+            region_float = region_mask.float()
+            coord_mask = region_float.unsqueeze(-1)
+            self.xy_dist_sum[region] += float((xy_dist * region_float).sum().item())
+            self.xy_point_count[region] += float(region_float.sum().item())
+            self.xy_coord_se[region] += float(((xy_diff ** 2) * coord_mask).sum().item())
+            self.xy_coord_count[region] += float(coord_mask.sum().item())
+
+        if pred.shape[-1] >= 4 and target.shape[-1] >= 4:
+            va_diff = pred[..., 2:4] - target[..., 2:4]
+            for region, region_mask in region_masks.items():
+                region_float = region_mask.float()
+                self.va_coord_se[region] += torch.sum((va_diff ** 2) * region_float.unsqueeze(-1), dim=(0, 1)).double().cpu()
+                self.va_point_count[region] += float(region_float.sum().item())
+
+            pair_mask = torch.maximum(masked[:, 1:].float(), masked[:, :-1].float())
+            pred_dxy = pred[:, 1:, :2] - pred[:, :-1, :2]
+            target_dxy = target[:, 1:, :2] - target[:, :-1, :2]
+            self.dxy_coord_se += float((((pred_dxy - target_dxy) ** 2) * pair_mask.unsqueeze(-1)).sum().item())
+            self.dxy_coord_count += float(pair_mask.sum().item() * 2.0)
+
+            pred_v = pred[..., 2]
+            pred_a = pred[..., 3]
+            pred_v_from_y = pred_dxy[..., 1] / self.hist_dt
+            pred_a_from_v = (pred_v[:, 1:] - pred_v[:, :-1]) / self.hist_dt
+            self.v_cons_se += float((((pred_v_from_y - pred_v[:, 1:]) ** 2) * pair_mask).sum().item())
+            self.v_cons_count += float(pair_mask.sum().item())
+            self.a_cons_se += float((((pred_a_from_v - pred_a[:, 1:]) ** 2) * pair_mask).sum().item())
+            self.a_cons_count += float(pair_mask.sum().item())
+
+        t_idx = torch.arange(masked.shape[1], device=masked.device).unsqueeze(0).expand_as(masked)
+        last_mask_idx = torch.where(masked, t_idx, t_idx.new_full(t_idx.shape, -1)).max(dim=1).values
+        has_masked = last_mask_idx >= 0
+        if bool(has_masked.any()):
+            last_err = xy_dist.gather(1, last_mask_idx.clamp(min=0).unsqueeze(1)).squeeze(1)
+            self.masked_fde_sum += float((last_err * has_masked.float()).sum().item())
+            self.masked_fde_count += float(has_masked.float().sum().item())
+
+    @staticmethod
+    def safe_div(numerator, denominator):
+        return numerator / denominator if denominator > 0 else 0.0
+
+    def summary(self):
+        xy_ade_m = {}
+        xy_rmse_m = {}
+        for region in ("all", "known", "masked"):
+            xy_ade_ft = self.safe_div(self.xy_dist_sum[region], self.xy_point_count[region])
+            xy_rmse_ft = self.safe_div(self.xy_coord_se[region], self.xy_coord_count[region]) ** 0.5
+            xy_ade_m[region] = xy_ade_ft * self.meter_per_foot
+            xy_rmse_m[region] = xy_rmse_ft * self.meter_per_foot
+
+        va_rmse = {}
+        for region in ("all", "known", "masked"):
+            point_count = self.va_point_count[region]
+            if point_count > 0:
+                rmse_ft = torch.sqrt(self.va_coord_se[region] / point_count)
+                va_rmse[region] = (rmse_ft * self.meter_per_foot).tolist()
+            else:
+                va_rmse[region] = [0.0, 0.0]
+
+        return {
+            "xy_ade_m": xy_ade_m,
+            "xy_rmse_m": xy_rmse_m,
+            "masked_fde_m": self.safe_div(self.masked_fde_sum, self.masked_fde_count) * self.meter_per_foot,
+            "dxy_rmse_m": self.safe_div(self.dxy_coord_se, self.dxy_coord_count) ** 0.5 * self.meter_per_foot,
+            "v_cons_rmse_mps": self.safe_div(self.v_cons_se, self.v_cons_count) ** 0.5 * self.meter_per_foot,
+            "a_cons_rmse_mps2": self.safe_div(self.a_cons_se, self.a_cons_count) ** 0.5 * self.meter_per_foot,
+            "va_rmse": va_rmse,
+        }
+
+
+def print_metrics(summary, title, mask_type, mask_prob):
+    print('\n' + '=' * 28 + f' {title} ' + '=' * 28)
+    print(f"Mask Type: {mask_type} | Mask Probability: {mask_prob:.4f}")
+    print(f"Masked XY ADE (m): {summary['xy_ade_m']['masked']:.6f}")
+    print(f"Masked XY FDE (m): {summary['masked_fde_m']:.6f}")
+    print(f"Masked XY RMSE (m): {summary['xy_rmse_m']['masked']:.6f}")
+    print('-' * 90)
+    print(f"{'XY Region':<12} | {'ADE (m)':<12} | {'RMSE (m)':<12}")
+    print('-' * 90)
+    print(f"{'All':<12} | {summary['xy_ade_m']['all']:<12.6f} | {summary['xy_rmse_m']['all']:<12.6f}")
+    print(f"{'Known':<12} | {summary['xy_ade_m']['known']:<12.6f} | {summary['xy_rmse_m']['known']:<12.6f}")
+    print(f"{'Masked':<12} | {summary['xy_ade_m']['masked']:<12.6f} | {summary['xy_rmse_m']['masked']:<12.6f}")
+    print('-' * 90)
+    print(f"{'VA Region':<12} | {'V RMSE (m/s)':<16} | {'A RMSE (m/s^2)':<16}")
+    print('-' * 90)
+    print(f"{'All':<12} | {summary['va_rmse']['all'][0]:<16.6f} | {summary['va_rmse']['all'][1]:<16.6f}")
+    print(f"{'Known':<12} | {summary['va_rmse']['known'][0]:<16.6f} | {summary['va_rmse']['known'][1]:<16.6f}")
+    print(f"{'Masked':<12} | {summary['va_rmse']['masked'][0]:<16.6f} | {summary['va_rmse']['masked'][1]:<16.6f}")
+    print('-' * 90)
+    print(f"Masked dXY RMSE (m): {summary['dxy_rmse_m']:.6f}")
+    print(f"V Consistency RMSE (m/s): {summary['v_cons_rmse_mps']:.6f}")
+    print(f"A Consistency RMSE (m/s^2): {summary['a_cons_rmse_mps2']:.6f}")
+    print('=' * 90)
+
+
 def main():
-    args = get_args_parser().parse_args()
-
-    args.batch_size = 512
-    args.num_workers = 8
-
-    EVAL_MASK_PROB = 0.5
+    args = get_eval_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -133,88 +283,37 @@ def main():
     model = DiffusionPast(args).to(device)
     resume_target = args.resume_hist if args.resume_hist != 'none' else 'best'
     load_checkpoint(model, resume_target, hist_ckpt_dir, device, model_name="HistModel")
-
-    # 指标统计
-    global_mse_sum = 0.0
-    global_count = 0
-    obs_mse_sum = 0.0
-    obs_count = 0
-    masked_mse_sum = 0.0
-    masked_count = 0
-    total_ade = 0.0
-    total_fde = 0.0
-    total_traj_count = 0
-
-    UNIT_CONVERSION = 0.3048
+    metrics = HistReconstructionMetrics(hist_dt=getattr(model, "hist_dt", 0.2))
+    eval_mask_type = str(args.hist_eval_mask_type).lower()
+    eval_mask_prob = float(args.hist_eval_mask_prob)
 
     with torch.no_grad():
-        pbar = tqdm(enumerate(test_loader), total=len(test_loader), desc="Eval Hist", ncols=120)
+        pbar = tqdm(enumerate(test_loader, start=1), total=len(test_loader), desc="Eval Hist Recon", ncols=120)
 
         for batch_idx, batch in pbar:
+            batch = filter_valid_batch(batch)
+            if batch["hist"].shape[0] == 0:
+                continue
+
             hist, hist_masked, hist_mask = prepare_input_data(
-                batch, args.feature_dim, mask_type='random', mask_prob=EVAL_MASK_PROB, device=device
+                batch, args.feature_dim, mask_type=eval_mask_type, mask_prob=eval_mask_prob, device=device
             )
 
-            _, pred, ade, fde = model.forward_eval(hist, hist_masked, device)
+            _, pred, _, _ = model.forward_eval(hist, hist_masked, device)
+            metrics.update(pred, hist, hist_mask)
 
-            pred_pos = pred[..., :2]
-            target_pos = hist[..., :2]
+            summary = metrics.summary()
+            pbar.set_postfix({
+                "xy_mask_ade": f"{summary['xy_ade_m']['masked']:.4f}",
+                "xy_mask_fde": f"{summary['masked_fde_m']:.4f}",
+                "xy_mask_rmse": f"{summary['xy_rmse_m']['masked']:.4f}",
+            })
 
-            diff_sq = (pred_pos - target_pos) ** 2
+            if batch_idx % 100 == 0:
+                print_metrics(summary, f"Hist Test Iteration {batch_idx}", eval_mask_type, eval_mask_prob)
 
-            mask_float = hist_mask.float().expand_as(diff_sq)
-
-            # 1. Global
-            global_mse_sum += diff_sq.sum().item()
-            global_count += diff_sq.numel()
-
-            # 2. Observed (mask == 1)
-            obs_diff_sq = diff_sq * mask_float
-            obs_mse_sum += obs_diff_sq.sum().item()
-            obs_count += mask_float.sum().item()
-
-            # 3. Masked (mask == 0)
-            inv_mask = 1.0 - mask_float
-            masked_diff_sq = diff_sq * inv_mask
-            masked_mse_sum += masked_diff_sq.sum().item()
-            masked_count += inv_mask.sum().item()
-
-            current_bs = hist.shape[0]
-            total_ade += ade.item() * current_bs
-            total_fde += fde.item() * current_bs
-            total_traj_count += current_bs
-
-    def safe_div(a, b):
-        return a / b if b > 0 else 0.0
-
-    final_global_mse = safe_div(global_mse_sum, global_count)
-    final_obs_mse = safe_div(obs_mse_sum, obs_count)
-    final_masked_mse = safe_div(masked_mse_sum, masked_count)
-
-    scale_sq = UNIT_CONVERSION ** 2
-    mse_m_global = final_global_mse * scale_sq
-    mse_m_obs = final_obs_mse * scale_sq
-    mse_m_masked = final_masked_mse * scale_sq
-
-    rmse_m_global = np.sqrt(mse_m_global)
-    rmse_m_obs = np.sqrt(mse_m_obs)
-    rmse_m_masked = np.sqrt(mse_m_masked)
-
-    ade_m = (total_ade / total_traj_count) * UNIT_CONVERSION
-    fde_m = (total_fde / total_traj_count) * UNIT_CONVERSION
-
-    print('\n' + '=' * 30 + ' Hist Reconstruction Results ' + '=' * 30)
-    print(f"Mask Probability (Keep Ratio): {EVAL_MASK_PROB}")
-    print('-' * 75)
-    print(f"{'Metric':<20} | {'MSE (m^2)':<15} | {'RMSE (m)':<15}")
-    print('-' * 75)
-    print(f"{'Global (All)':<20} | {mse_m_global:.6f}        | {rmse_m_global:.6f}")
-    print(f"{'Observed (Seen)':<20} | {mse_m_obs:.6f}        | {rmse_m_obs:.6f}")
-    print(f"{'Masked (Unseen)':<20} | {mse_m_masked:.6f}        | {rmse_m_masked:.6f}")
-    print('-' * 75)
-    print(f"Overall ADE (m): {ade_m:.6f}")
-    print(f"Overall FDE (m): {fde_m:.6f}")
-    print('=' * 75)
+    final_summary = metrics.summary()
+    print_metrics(final_summary, "Hist Reconstruction Result", eval_mask_type, eval_mask_prob)
 
 
 if __name__ == '__main__':

@@ -1,11 +1,10 @@
 from method_diffusion.models import dit_hist as dit
 from torch import nn
 from diffusers.schedulers import DDIMScheduler
-import numpy as np
 import torch
+import torch.nn.functional as F
 from method_diffusion.utils.position_encoding import SequentialPositionalEncoding
-from pathlib import Path
-from method_diffusion.utils.visualization import visualize_batch_trajectories, plot_traj_with_mask
+from method_diffusion.utils.visualization import maybe_visualize_hist_reconstruction
 
 class DiffusionPast(nn.Module):
 
@@ -13,7 +12,7 @@ class DiffusionPast(nn.Module):
         super(DiffusionPast, self).__init__()
         # Net parameters
         self.args = args
-        self.feature_dim = 2 * int(args.feature_dim) + 1# 输入特征维度 default: 6 (x, y, v, a, laneID, class)
+        self.feature_dim = 2 * int(args.feature_dim) + 1  # 输入特征维度 default: 6 (x, y, v, a, laneID, class)
         self.input_dim = int(args.input_dim)   # 输入到Dit的维度 default: 128
         self.hidden_dim = int(args.hidden_dim)
         self.output_dim = int(args.output_dim)
@@ -48,62 +47,102 @@ class DiffusionPast(nn.Module):
             model_type="x_start"
         )
 
-        self.norm_config_path = str(Path(__file__).resolve().parent.parent / 'dataset/ngsim_stats.npz')
-        self.norm_config = np.load(self.norm_config_path)
-        for key, value in self.norm_config.items():
-            self.register_buffer(key, torch.from_numpy(value).float())
+        self.register_buffer("pos_mean", torch.tensor([0.0507, -40.6957]).float(), persistent=False)
+        self.register_buffer("pos_std", torch.tensor([0.9411, 34.7048]).float(), persistent=False)
+        self.register_buffer("va_mean", torch.tensor([27.0654, 0.1219]).float(), persistent=False)
+        self.register_buffer("va_std", torch.tensor([13.8077, 4.6976]).float(), persistent=False)
+        self.hist_dt = 0.2  # NGSIM 10Hz and current hist pipeline uses d_s=2.
+        self.huber_delta = 1.0
+        self.loss_weights = {
+            "xy_unknown": 1.00,
+            "xy_known": 0.20,
+            "va_unknown": 0.45,
+            "va_known": 0.10,
+            "dxy": 0.20,
+            "v_cons": 0.15,
+            "a_cons": 0.08,
+        }
 
-    def build_condition(self, hist_masked_value, hist_mask):
-        """
-        将条件统一到归一化空间，避免与 x_t 的尺度不一致。
-        cond = [norm(masked_value), mask_bit]
-        """
-        cond_value = self.norm(hist_masked_value)
-        return torch.cat([cond_value, hist_mask.float()], dim=-1)
+    def masked_smooth_l1(self, pred, target, mask=None):
+        loss = F.smooth_l1_loss(pred, target, reduction="none", beta=self.huber_delta)
+        if mask is None:
+            return loss.mean()
+        mask = mask.to(pred.device).float()
+        while mask.dim() < loss.dim():
+            mask = mask.unsqueeze(-1)
+        mask = mask.expand_as(loss)
+        return (loss * mask).sum() / (mask.sum() + 1e-6)
 
-    def compute_motion_loss(self, pred, target, mask):
+    def compute_motion_loss(self, pred, target, mask, return_parts=False):
         """
         pred: [B, T, D]
         target: [B, T, D]
         mask: [B, T, 1] (1 for known/observed, 0 for unknown/masked)
         """
-        B, T, D = pred.shape
+        known_mask = mask.view(mask.shape[0], mask.shape[1], 1).to(pred.device).float()
+        unknown_mask = 1.0 - known_mask
 
-        mask = mask.view(B, T, -1)
-        if mask.shape[-1] == 1:
-            mask = mask.expand(B, T, D)
-        mask = mask.to(pred.device).float()
+        loss_xy_unknown = self.masked_smooth_l1(pred[..., :2], target[..., :2], unknown_mask)
+        loss_xy_known = self.masked_smooth_l1(pred[..., :2], target[..., :2], known_mask)
 
-        loss_mse = (pred - target) ** 2
+        zero = pred.new_tensor(0.0)
+        loss_va_unknown = zero
+        loss_va_known = zero
+        loss_dxy = zero
+        loss_v_cons = zero
+        loss_a_cons = zero
 
-        # Known (Observed) Loss
-        loss_known = (loss_mse * mask).sum() / (mask.sum() + 1e-6)
-        # Unknown (Masked) Loss
-        mask_unknown = 1.0 - mask
-        loss_unknown = (loss_mse * mask_unknown).sum() / (mask_unknown.sum() + 1e-6)
+        if pred.shape[-1] >= 4:
+            loss_va_unknown = self.masked_smooth_l1(pred[..., 2:4], target[..., 2:4], unknown_mask)
+            loss_va_known = self.masked_smooth_l1(pred[..., 2:4], target[..., 2:4], known_mask)
 
-        pred_pos = pred[..., :2]
-        target_pos = target[..., :2]
+            pred_phys = self.denorm(pred)
+            target_phys = self.denorm(target)
 
-        pred_vel = pred_pos[:, 1:, :] - pred_pos[:, :-1, :]
-        target_vel = target_pos[:, 1:, :] - target_pos[:, :-1, :]
-        loss_vel = ((pred_vel - target_vel) ** 2).mean()
+            pred_dxy = pred_phys[:, 1:, :2] - pred_phys[:, :-1, :2]
+            target_dxy = target_phys[:, 1:, :2] - target_phys[:, :-1, :2]
+            pair_unknown = torch.maximum(unknown_mask[:, 1:, :], unknown_mask[:, :-1, :])
+            loss_dxy = self.masked_smooth_l1(pred_dxy, target_dxy, pair_unknown)
 
-        pred_acc = pred_vel[:, 1:, :] - pred_vel[:, :-1, :]
-        target_acc = target_vel[:, 1:, :] - target_vel[:, :-1, :]
-        loss_acc = ((pred_acc - target_acc) ** 2).mean()
+            pred_v = pred_phys[..., 2]
+            pred_a = pred_phys[..., 3]
+            pred_v_from_y = pred_dxy[..., 1] / self.hist_dt
+            pred_a_from_v = (pred_v[:, 1:] - pred_v[:, :-1]) / self.hist_dt
+            loss_v_cons = self.masked_smooth_l1(pred_v_from_y, pred_v[:, 1:], None)
+            loss_a_cons = self.masked_smooth_l1(pred_a_from_v, pred_a[:, 1:], None)
 
-        # 按当前策略：先保留加速度损失计算，但不计入总损失
-        total_loss = loss_known + 1.5 * loss_unknown + 0.7 * loss_vel
-        return total_loss
+        total_loss = (
+            self.loss_weights["xy_unknown"] * loss_xy_unknown
+            + self.loss_weights["xy_known"] * loss_xy_known
+            + self.loss_weights["va_unknown"] * loss_va_unknown
+            + self.loss_weights["va_known"] * loss_va_known
+            + self.loss_weights["dxy"] * loss_dxy
+            + self.loss_weights["v_cons"] * loss_v_cons
+            + self.loss_weights["a_cons"] * loss_a_cons
+        )
+
+        if not return_parts:
+            return total_loss
+
+        parts = {
+            "loss_total": total_loss.detach(),
+            "loss_xy_unknown": loss_xy_unknown.detach(),
+            "loss_xy_known": loss_xy_known.detach(),
+            "loss_va_unknown": loss_va_unknown.detach(),
+            "loss_va_known": loss_va_known.detach(),
+            "loss_dxy": loss_dxy.detach(),
+            "loss_v_cons": loss_v_cons.detach(),
+            "loss_a_cons": loss_a_cons.detach(),
+        }
+        return total_loss, parts
 
     # hist: [B, T, dim], hist_masked: [B, T, dim+1]
-    def forward_train(self, hist, hist_masked, device):
+    def forward_train(self, hist, hist_masked, device, return_components=False):
         B, T,  _ = hist_masked.shape
 
         hist_mask = hist_masked[..., -1:].float()  # [B, T, 1]
         hist_masked_value = hist_masked[..., :-1]  # [B, T, dim]
-        cond = self.build_condition(hist_masked_value, hist_mask)  # [B, T, dim+1]
+        cond = torch.cat([self.norm(hist_masked_value), hist_mask], dim=-1)  # [B, T, dim+1]
 
         # 训练加噪对象改为 full x0，条件仍为 masked 轨迹
         x_start = self.norm(hist)  # [B, T, dim]
@@ -115,8 +154,7 @@ class DiffusionPast(nn.Module):
         input_embedded = self.input_embedding(model_input) + self.pos_embedding(model_input)
         pred_x0 = self.dit(x=input_embedded, t=timesteps)
 
-        loss = self.compute_motion_loss(pred_x0, x_start, hist_mask)
-        # loss = torch.nn.functional.mse_loss(pred_x0, self.norm(hist))
+        loss, loss_parts = self.compute_motion_loss(pred_x0, x_start, hist_mask, return_parts=True)
 
         pred = self.denorm(pred_x0)
         diff = pred[..., :2] - hist[..., :2]
@@ -124,18 +162,17 @@ class DiffusionPast(nn.Module):
 
         ade = dist.mean()
         fde = dist[:, -1].mean()
+        maybe_visualize_hist_reconstruction(
+            hist=hist,
+            hist_masked=hist_masked,
+            pred=pred,
+            stage="train",
+            enable_train_vis=int(getattr(self.args, "hist_enable_train_vis", 0)) > 0,
+            enable_eval_vis=int(getattr(self.args, "hist_enable_eval_vis", 0)) > 0,
+        )
 
-        # hist = hist[0, :, :2].detach().cpu().numpy()
-        # hist_masked = hist_masked[0, :, :2].detach().cpu().numpy()
-        # pred_ego = pred[0, :, :2].detach().cpu().numpy()
-        # plot_traj_with_mask(
-        #     hist_original=[hist],
-        #     hist_masked=[hist_masked],
-        #     hist_pred=[pred_ego],
-        #     fig_num1=1,
-        #     fig_num2=1,
-        # )
-
+        if return_components:
+            return loss, pred, ade, fde, loss_parts
         return loss, pred, ade, fde
 
     @torch.no_grad()
@@ -145,7 +182,7 @@ class DiffusionPast(nn.Module):
         hist_mask = hist_masked[..., -1:].float()
         mask_unknown = 1.0 - hist_mask
         hist_masked_value = hist_masked[..., :-1]
-        cond = self.build_condition(hist_masked_value, hist_mask)
+        cond = torch.cat([self.norm(hist_masked_value), hist_mask], dim=-1)
         known_x0 = self.norm(hist_masked_value)
 
         # Hybrid 初始化：已知位置来自 q(x_t | x0_known)，未知位置使用纯噪声
@@ -182,18 +219,14 @@ class DiffusionPast(nn.Module):
         dist = torch.norm(diff, dim=-1)  # [B, T]
         ade = dist.mean()  # Scalar
         fde = dist[:, -1].mean() # Scalar
-
-        # hist = hist[0, :, :2].detach().cpu().numpy()
-        # hist_masked = hist_masked[0, :, :2].detach().cpu().numpy()
-        # pred_ego = final_pred[0, :, :2].detach().cpu().numpy()
-        #
-        # plot_traj_with_mask(
-        #     hist_original=[hist],
-        #     hist_masked=[hist_masked],
-        #     hist_pred=[pred_ego],
-        #     fig_num1=1,
-        #     fig_num2=1,
-        # )
+        maybe_visualize_hist_reconstruction(
+            hist=hist,
+            hist_masked=hist_masked,
+            pred=final_pred,
+            stage="eval",
+            enable_train_vis=int(getattr(self.args, "hist_enable_train_vis", 0)) > 0,
+            enable_eval_vis=int(getattr(self.args, "hist_enable_eval_vis", 0)) > 0,
+        )
 
         return loss, final_pred, ade, fde
 

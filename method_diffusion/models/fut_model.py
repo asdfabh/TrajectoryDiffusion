@@ -5,7 +5,7 @@ from diffusers.schedulers import DDIMScheduler
 from method_diffusion.models import dit_fut as dit
 from method_diffusion.models.hist_encoder import HistEncoder
 from method_diffusion.utils.position_encoding import SequentialPositionalEncoding
-from method_diffusion.utils.visualization import visualize_batch_trajectories
+from method_diffusion.utils.visualization import maybe_visualize_future_prediction
 
 
 class DiffusionFut(nn.Module):
@@ -148,29 +148,6 @@ class DiffusionFut(nn.Module):
                 x_t = infer_scheduler.step(pred_vel_norm, t, x_t).prev_sample
         return pred_vel_cond
 
-    # 按需绘制单个 batch 的轨迹可视化结果。
-    def maybeVisualize(self, hist, hist_nbrs, temporal_mask, future, pred, valid_mask, stage, pred_all=None, pred_best_idx=None):
-        if stage == "train":
-            if not self.fut_enable_train_vis:
-                return
-        elif not self.fut_enable_eval_vis:
-            return
-
-        vis_batch_idx = 0
-        diff = pred[vis_batch_idx, :, :2] - future[vis_batch_idx, :, :2]
-        dist = torch.norm(diff, dim=-1)
-        vis_mask = valid_mask[vis_batch_idx]
-        vis_ade = (dist * vis_mask).sum() / (vis_mask.sum() + 1e-6)
-        valid_count = int(vis_mask.sum().item())
-        vis_fde = dist[valid_count - 1] if valid_count > 0 else dist.new_tensor(0.0)
-        metrics = {"ADE(vis traj)": {"ft": vis_ade.item(), "m": vis_ade.item() * self.meter_per_foot},
-                   "FDE(vis traj)": {"ft": vis_fde.item(), "m": vis_fde.item() * self.meter_per_foot}}
-        visualize_batch_trajectories(
-            hist=hist, hist_nbrs=hist_nbrs, temporal_mask=temporal_mask, future=future, pred=pred,
-            pred_all=pred_all, pred_best_idx=pred_best_idx, future_mask=valid_mask, batch_idx=vis_batch_idx,
-            save_path=None, metrics=metrics, input_unit="ft", show_plot=True,
-        )
-
     # 统一准备评估阶段所需的条件编码、掩码和调度器参数。
     def prepareEvalInputs(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
         bsz, t_len, _ = future.shape
@@ -237,7 +214,18 @@ class DiffusionFut(nn.Module):
             # 兼容多维度输出拼接
             pred_phys_abs = future_phys.clone()
             pred_phys_abs[..., :2] = pred_pos_phys
-            self.maybeVisualize(hist=hist, hist_nbrs=hist_nbrs, temporal_mask=temporal_mask, future=future, pred=pred_phys_abs, valid_mask=valid_mask, stage="train",)
+            maybe_visualize_future_prediction(
+                hist=hist,
+                hist_nbrs=hist_nbrs,
+                temporal_mask=temporal_mask,
+                future=future,
+                pred=pred_phys_abs,
+                valid_mask=valid_mask,
+                stage="train",
+                enable_train_vis=self.fut_enable_train_vis,
+                enable_eval_vis=self.fut_enable_eval_vis,
+                meter_per_foot=self.meter_per_foot,
+            )
 
         if return_components:
             return loss, loss_parts
@@ -259,7 +247,18 @@ class DiffusionFut(nn.Module):
         pred_phys_abs[..., :2] = pred_pos_phys
 
         ade, fde = self.computeAdeFde(pred_phys_abs, future, valid_mask)
-        self.maybeVisualize(hist=hist, hist_nbrs=hist_nbrs, temporal_mask=temporal_mask, future=future, pred=pred_phys_abs, valid_mask=valid_mask, stage="eval")
+        maybe_visualize_future_prediction(
+            hist=hist,
+            hist_nbrs=hist_nbrs,
+            temporal_mask=temporal_mask,
+            future=future,
+            pred=pred_phys_abs,
+            valid_mask=valid_mask,
+            stage="eval",
+            enable_train_vis=self.fut_enable_train_vis,
+            enable_eval_vis=self.fut_enable_eval_vis,
+            meter_per_foot=self.meter_per_foot,
+        )
         return pred_phys_abs, ade, fde
 
     @torch.no_grad()
@@ -308,8 +307,20 @@ class DiffusionFut(nn.Module):
         self.last_minade_best_idx = best_k_idx.detach()
 
         ade_batch, fde_batch = self.computeAdeFde(best_pred_phys, future, valid_mask)
-        self.maybeVisualize(hist=hist, hist_nbrs=hist_nbrs, temporal_mask=temporal_mask, future=future,
-                            pred=best_pred_phys, valid_mask=valid_mask, stage="eval", pred_all=all_preds)
+        maybe_visualize_future_prediction(
+            hist=hist,
+            hist_nbrs=hist_nbrs,
+            temporal_mask=temporal_mask,
+            future=future,
+            pred=best_pred_phys,
+            valid_mask=valid_mask,
+            stage="eval",
+            enable_train_vis=self.fut_enable_train_vis,
+            enable_eval_vis=self.fut_enable_eval_vis,
+            pred_all=all_preds,
+            pred_best_idx=best_k_idx,
+            meter_per_foot=self.meter_per_foot,
+        )
 
         return best_pred_phys, ade_batch, fde_batch
 

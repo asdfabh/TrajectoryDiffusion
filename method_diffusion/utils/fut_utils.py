@@ -72,9 +72,10 @@ class TrajectoryMetrics:
         """初始化固定预测长度的指标容器。"""
         self.pred_len = int(pred_len)
         self.meter_per_unit = float(meter_per_unit)
-        self.total_se = torch.zeros(self.pred_len, dtype=torch.float64)
+        self.total_coord_se = torch.zeros(self.pred_len, dtype=torch.float64)
         self.total_de = torch.zeros(self.pred_len, dtype=torch.float64)
         self.total_counts = torch.zeros(self.pred_len, dtype=torch.float64)
+        self.total_coord_counts = torch.zeros(self.pred_len, dtype=torch.float64)
         self.total_dist_sum = 0.0
         self.total_valid_points = 0.0
         self.total_fde_sum = 0.0
@@ -96,12 +97,15 @@ class TrajectoryMetrics:
         valid_mask = self.normalize_valid_mask(valid_mask, pred)[:, :pred.size(1)]
 
         diff = pred - target
+        coord_valid_mask = valid_mask.unsqueeze(-1)
+        coord_sq = diff ** 2
         dist_sq = torch.sum(diff ** 2, dim=-1)
         dist = torch.sqrt(dist_sq)
 
-        self.total_se += torch.sum(dist_sq * valid_mask, dim=0).double().cpu()
+        self.total_coord_se += torch.sum(coord_sq * coord_valid_mask, dim=(0, 2)).double().cpu()
         self.total_de += torch.sum(dist * valid_mask, dim=0).double().cpu()
         self.total_counts += torch.sum(valid_mask, dim=0).double().cpu()
+        self.total_coord_counts += torch.sum(coord_valid_mask, dim=(0, 2)).double().cpu()
         self.total_dist_sum += float(torch.sum(dist * valid_mask).item())
         self.total_valid_points += float(torch.sum(valid_mask).item())
 
@@ -116,7 +120,9 @@ class TrajectoryMetrics:
     def summary(self):
         """输出累计后的标量和逐时刻指标。"""
         counts = self.total_counts.clamp(min=1.0)
-        rmse_per_step_ft = torch.sqrt(self.total_se / counts)
+        coord_counts = self.total_coord_counts.clamp(min=1.0)
+        mse_per_step_ft2 = self.total_coord_se / coord_counts
+        rmse_per_step_ft = torch.sqrt(mse_per_step_ft2)
         de_per_step_ft = self.total_de / counts
         cumsum_de = torch.cumsum(self.total_de, dim=0)
         cumsum_counts = torch.cumsum(self.total_counts, dim=0).clamp(min=1.0)
@@ -124,10 +130,14 @@ class TrajectoryMetrics:
 
         overall_ade_ft = 0.0 if self.total_valid_points == 0 else self.total_dist_sum / self.total_valid_points
         overall_fde_ft = 0.0 if self.total_fde_count == 0 else self.total_fde_sum / self.total_fde_count
-        total_counts = self.total_counts.sum().clamp(min=1.0)
-        overall_rmse_ft = 0.0 if self.total_valid_points == 0 else float(torch.sqrt(self.total_se.sum() / total_counts).item())
+        total_coord_count_value = float(self.total_coord_counts.sum().item())
+        total_coord_counts = self.total_coord_counts.sum().clamp(min=1.0)
+        overall_mse_ft2 = 0.0 if total_coord_count_value == 0.0 else float((self.total_coord_se.sum() / total_coord_counts).item())
+        overall_rmse_ft = 0.0 if total_coord_count_value == 0.0 else float(torch.sqrt(self.total_coord_se.sum() / total_coord_counts).item())
 
         return {
+            "mse_per_step_ft2": mse_per_step_ft2,
+            "mse_per_step_m2": mse_per_step_ft2 * (self.meter_per_unit ** 2),
             "rmse_per_step_ft": rmse_per_step_ft,
             "rmse_per_step_m": rmse_per_step_ft * self.meter_per_unit,
             "de_per_step_ft": de_per_step_ft,
@@ -136,6 +146,8 @@ class TrajectoryMetrics:
             "ade_prefix_m": ade_prefix_ft * self.meter_per_unit,
             "overall_ade_ft": overall_ade_ft,
             "overall_fde_ft": overall_fde_ft,
+            "overall_mse_ft2": overall_mse_ft2,
+            "overall_mse_m2": overall_mse_ft2 * (self.meter_per_unit ** 2),
             "overall_rmse_ft": overall_rmse_ft,
             "overall_ade_m": overall_ade_ft * self.meter_per_unit,
             "overall_fde_m": overall_fde_ft * self.meter_per_unit,

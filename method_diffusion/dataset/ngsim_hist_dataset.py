@@ -95,6 +95,7 @@ class NgsimHistDataset(Dataset):
         va_batch = torch.zeros(batch_size, self.maxlen, 2, dtype=torch.float32)
         lane_batch = torch.zeros(batch_size, self.maxlen, 1, dtype=torch.float32)
         class_batch = torch.zeros(batch_size, self.maxlen, 1, dtype=torch.float32)
+        sample_valid_batch = torch.zeros(batch_size, dtype=torch.bool)
 
         for sample_id, (hist, va, lane, cclass) in enumerate(samples):
             if len(hist) == 0:
@@ -105,10 +106,12 @@ class NgsimHistDataset(Dataset):
             va_batch[sample_id, :cur_len, :] = torch.from_numpy(va[:cur_len])
             lane_batch[sample_id, :cur_len, :] = torch.from_numpy(lane[:cur_len])
             class_batch[sample_id, :cur_len, :] = torch.from_numpy(cclass[:cur_len])
+            sample_valid_batch[sample_id] = True
 
         return {
             "hist": hist_batch,
             "va": va_batch,
             "lane": lane_batch,
             "cclass": class_batch,
+            "sample_valid": sample_valid_batch,
         }
