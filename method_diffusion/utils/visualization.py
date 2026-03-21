@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 
-def plot_traj_with_mask(hist_original, hist_masked, hist_pred, fig_num1=3, fig_num2=3):
+def plot_traj_with_mask(hist_original, hist_masked, hist_pred, fig_num1=3, fig_num2=3, input_unit="ft"):
     """绘制 hist 重建结果：原始轨迹、掩码位置、预测轨迹。"""
     num_samples = len(hist_original)
     fig_num1 = num_samples // fig_num2 + (num_samples % fig_num2 > 0)
@@ -44,8 +44,8 @@ def plot_traj_with_mask(hist_original, hist_masked, hist_pred, fig_num1=3, fig_n
         )
         ax.add_patch(rect)
 
-        ax.set_xlabel('Lateral Position (m)')
-        ax.set_ylabel('Longitudinal Position (m)')
+        ax.set_xlabel(f'Lateral Position ({input_unit})')
+        ax.set_ylabel(f'Longitudinal Position ({input_unit})')
         ax.set_title(f'Sample {i + 1}')
         ax.legend(loc='upper right', fontsize=8)
         ax.grid(True, alpha=0.3)
@@ -58,7 +58,7 @@ def plot_traj_with_mask(hist_original, hist_masked, hist_pred, fig_num1=3, fig_n
 
 
 def maybe_visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_train_vis=False, enable_eval_vis=False,
-                                        batch_idx=0):
+                                        batch_idx=0, input_unit="ft"):
     """按配置开关控制 hist 重建可视化。"""
     if stage == "train":
         if not enable_train_vis:
@@ -76,6 +76,7 @@ def maybe_visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_t
         hist_pred=pred_vis,
         fig_num1=1,
         fig_num2=1,
+        input_unit=input_unit,
     )
 
 
