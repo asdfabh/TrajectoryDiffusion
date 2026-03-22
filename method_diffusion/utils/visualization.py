@@ -81,7 +81,6 @@ def maybe_visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_t
 
 
 def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, future=None, pred=None,
-                                 coarse_pred=None,
                                  pred_all=None, pred_best_idx=None,
                                  future_mask=None, batch_idx=0, metrics=None, input_unit="ft"):
     """绘制 future 预测结果，支持单模态与多模态最佳轨迹高亮。"""
@@ -198,7 +197,6 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
     gt_hist = normalize_traj2d(safe_get_batch(hist, idx, batch_ndim=3))
     gt_fut = normalize_traj2d(safe_get_batch(future, idx, batch_ndim=3))
     pred_single = normalize_traj2d(safe_get_batch(pred, idx, batch_ndim=3))
-    coarse_single = normalize_traj2d(safe_get_batch(coarse_pred, idx, batch_ndim=3))
     fut_mask_arr = safe_get_batch(future_mask, idx, batch_ndim=3)
     pred_modes = safe_get_batch(pred_all, idx, batch_ndim=4)
 
@@ -242,18 +240,6 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
         ax.plot(gt_hist[:, 1], gt_hist[:, 0], 'b-o', label='Hist', markersize=4, linewidth=2, alpha=0.8)
     if gt_fut is not None:
         ax.plot(gt_fut[:, 1], gt_fut[:, 0], 'g-o', label='GT Future', markersize=4, linewidth=2, alpha=0.8)
-    if coarse_single is not None:
-        ax.plot(
-            coarse_single[:, 1], coarse_single[:, 0],
-            linestyle='--',
-            marker='s',
-            markersize=3,
-            linewidth=1.6,
-            alpha=0.85,
-            color='#F39C12',
-            label='Coarse',
-            zorder=2,
-        )
     if pred_modes is not None:
         non_best_labeled = False
         for k in range(pred_modes.shape[0]):
@@ -303,8 +289,7 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
 
 def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pred, valid_mask, stage,
                                       enable_train_vis=False, enable_eval_vis=False,
-                                      coarse_pred=None, pred_all=None, pred_best_idx=None,
-                                      meter_per_foot=0.3048, batch_idx=0):
+                                      pred_all=None, pred_best_idx=None, meter_per_foot=0.3048, batch_idx=0):
     """按配置开关控制 future 预测可视化。"""
     if stage == "train":
         if not enable_train_vis:
@@ -329,7 +314,6 @@ def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pr
         temporal_mask=temporal_mask,
         future=future,
         pred=pred,
-        coarse_pred=coarse_pred,
         pred_all=pred_all,
         pred_best_idx=pred_best_idx,
         future_mask=valid_mask,

@@ -121,6 +121,10 @@ def train_epoch(
     total_fut_loss = 0.0
     total_vel_loss = 0.0
     total_pos_loss = 0.0
+    total_int_lat_loss = 0.0
+    total_int_lon_loss = 0.0
+    total_int_lat_acc = 0.0
+    total_int_lon_acc = 0.0
     num_batches = 0
 
     pbar = tqdm(
@@ -132,7 +136,7 @@ def train_epoch(
     )
 
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc = prepare_input_data(batch, feature_dim, device=device)
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
         loss_hist, hist_for_fut = build_hist_outputs(
             model_hist=model_hist,
             hist=hist,
@@ -148,8 +152,6 @@ def train_epoch(
             temporal_mask,
             fut,
             op_mask,
-            lat_enc,
-            lon_enc,
             device,
             return_components=True,
         )
@@ -172,6 +174,10 @@ def train_epoch(
         total_fut_loss += float(loss_fut.item())
         total_vel_loss += float(fut_parts["loss_vel"].item())
         total_pos_loss += float(fut_parts["loss_pos"].item())
+        total_int_lat_loss += float(fut_parts["loss_int_lat"].item())
+        total_int_lon_loss += float(fut_parts["loss_int_lon"].item())
+        total_int_lat_acc += float(fut_parts["acc_int_lat"].item())
+        total_int_lon_acc += float(fut_parts["acc_int_lon"].item())
         num_batches += 1
 
         if is_main_process(rank):
@@ -182,6 +188,10 @@ def train_epoch(
                 "fut": f"{(total_fut_loss / num_batches):.6f}",
                 "vel": f"{(total_vel_loss / num_batches):.6f}",
                 "pos": f"{(total_pos_loss / num_batches):.6f}",
+                "lat_ce": f"{(total_int_lat_loss / num_batches):.6f}",
+                "lon_ce": f"{(total_int_lon_loss / num_batches):.6f}",
+                "lat_acc": f"{(total_int_lat_acc / num_batches):.4f}",
+                "lon_acc": f"{(total_int_lon_acc / num_batches):.4f}",
             })
 
     stats = torch.tensor(
@@ -192,13 +202,17 @@ def train_epoch(
             total_fut_loss,
             total_vel_loss,
             total_pos_loss,
+            total_int_lat_loss,
+            total_int_lon_loss,
+            total_int_lat_acc,
+            total_int_lon_acc,
             float(num_batches),
         ],
         device=device,
         dtype=torch.float64,
     )
     stats = reduce_tensor(stats)
-    denom = max(int(stats[6].item()), 1)
+    denom = max(int(stats[10].item()), 1)
 
     return {
         "loss": float(stats[0].item()) / denom,
@@ -207,6 +221,10 @@ def train_epoch(
         "loss_fut": float(stats[3].item()) / denom,
         "loss_vel": float(stats[4].item()) / denom,
         "loss_pos": float(stats[5].item()) / denom,
+        "loss_int_lat": float(stats[6].item()) / denom,
+        "loss_int_lon": float(stats[7].item()) / denom,
+        "acc_int_lat": float(stats[8].item()) / denom,
+        "acc_int_lon": float(stats[9].item()) / denom,
     }
 
 
@@ -251,7 +269,7 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval
         if num_batches >= target_batches:
             break
 
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc = prepare_input_data(batch, feature_dim, device=device)
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
         _, hist_for_fut = build_hist_outputs(
             model_hist=model_hist,
             hist=hist,
@@ -423,6 +441,10 @@ def main():
             writer.add_scalar("Loss/TrainFut", train_stats["loss_fut"], epoch + 1)
             writer.add_scalar("Loss/TrainVel", train_stats["loss_vel"], epoch + 1)
             writer.add_scalar("Loss/TrainPos", train_stats["loss_pos"], epoch + 1)
+            writer.add_scalar("Loss/TrainIntentLat", train_stats["loss_int_lat"], epoch + 1)
+            writer.add_scalar("Loss/TrainIntentLon", train_stats["loss_int_lon"], epoch + 1)
+            writer.add_scalar("Acc/TrainIntentLat", train_stats["acc_int_lat"], epoch + 1)
+            writer.add_scalar("Acc/TrainIntentLon", train_stats["acc_int_lon"], epoch + 1)
             writer.add_scalar("Eval/ADE_ft", eval_ade, epoch + 1)
             writer.add_scalar("Eval/FDE_ft", eval_fde, epoch + 1)
             print(
@@ -430,6 +452,10 @@ def main():
                 f"train={train_stats['loss']:.6f} | "
                 f"hist={train_stats['loss_hist']:.6f} | "
                 f"fut={train_stats['loss_fut']:.6f} | "
+                f"lat={train_stats['loss_int_lat']:.6f} | "
+                f"lon={train_stats['loss_int_lon']:.6f} | "
+                f"lat_acc={train_stats['acc_int_lat']:.4f} | "
+                f"lon_acc={train_stats['acc_int_lon']:.4f} | "
                 f"ade={eval_ade:.4f}ft | "
                 f"fde={eval_fde:.4f}ft"
             )
