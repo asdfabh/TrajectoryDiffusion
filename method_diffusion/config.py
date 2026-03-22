@@ -15,7 +15,7 @@ def get_args_parser():
     parser.add_argument("--save_interval", default=5, type=int)
     parser.add_argument("--mask_prob", default=0.4, type=float)
     parser.add_argument("--checkpoint_dir", default="./checkpoints", type=str)
-    parser.add_argument("--resume_fut", default="none", type=str)
+    parser.add_argument("--resume_fut", default="best", type=str)
     parser.add_argument("--resume_hist", default="best", type=str)
 
     # Joint train strategy
@@ -69,14 +69,22 @@ def get_args_parser():
 
     # Fut train strategy
     parser.add_argument("--self_condition_prob", default=0.5, type=float)
+    parser.add_argument("--fut_use_intent_cond", default=1, type=int)
+    parser.add_argument("--fut_use_residual_diffusion", default=1, type=int)
+    parser.add_argument("--intent_teacher_forcing_prob", default=0.7, type=float)
+    parser.add_argument("--intent_cond_drop_prob", default=0.1, type=float)
 
     # Fut loss
     parser.add_argument("--fut_huber_delta", default=1.0, type=float)
     parser.add_argument("--fut_pos_loss_weight", default=1.5, type=float)
+    parser.add_argument("--intent_loss_weight", default=0.2, type=float)
+    parser.add_argument("--coarse_loss_weight", default=0.5, type=float)
+    parser.add_argument("--lat_intent_weight", default=1.0, type=float)
+    parser.add_argument("--lon_intent_weight", default=0.5, type=float)
 
     # Fut visualization
-    parser.add_argument("--fut_enable_train_vis", default=0, type=int)
-    parser.add_argument("--fut_enable_eval_vis", default=0, type=int)
+    parser.add_argument("--fut_enable_train_vis", default=1, type=int)
+    parser.add_argument("--fut_enable_eval_vis", default=1, type=int)
     parser.add_argument("--hist_enable_train_vis", default=0, type=int)
     parser.add_argument("--hist_enable_eval_vis", default=0, type=int)
 
@@ -85,5 +93,6 @@ def get_args_parser():
     parser.add_argument("--num_samples", default=5, type=int)
     parser.add_argument("--fut_use_attention_pooling", default=1, type=int)
     parser.add_argument("--fut_use_split_cond_adaln", default=1, type=int)
+    parser.add_argument("--semantic_fuse_hidden_dim", default=128, type=int)
 
     return parser
