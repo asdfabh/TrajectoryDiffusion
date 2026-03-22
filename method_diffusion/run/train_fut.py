@@ -18,6 +18,12 @@ from method_diffusion.models.fut_model import DiffusionFut
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
+BEST_MODEL_ADE_WEIGHT = 1.0
+BEST_MODEL_FDE_WEIGHT = 0.5
+
+
+def compute_selection_score(eval_ade, eval_fde):
+    return (BEST_MODEL_ADE_WEIGHT * float(eval_ade)) + (BEST_MODEL_FDE_WEIGHT * float(eval_fde))
 
 # 解析 resume 标识并返回对应的 checkpoint 路径。
 def resolve_resume_checkpoint(resume_arg, checkpoint_dir):
@@ -30,16 +36,16 @@ def resolve_resume_checkpoint(resume_arg, checkpoint_dir):
     print(f"[FutModel] Unsupported resume_fut='{resume_arg}', expected 'best' or 'epoch_i'.")
     return None
 
-# 按需恢复训练状态并返回起始 epoch 与最佳 ADE。
+# 按需恢复训练状态并返回起始 epoch 与最佳联合分数。
 def load_checkpoint(args, model, optimizer, scheduler, device):
     start_epoch = 0
-    best_ade = float("inf")
+    best_score = float("inf")
     ckpt_path = resolve_resume_checkpoint(args.resume_fut, Path(args.checkpoint_dir))
 
     if ckpt_path is not None:
         if not ckpt_path.exists():
             print(f"[FutModel] Checkpoint not found: {ckpt_path}")
-            return start_epoch, best_ade
+            return start_epoch, best_score
 
         state = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(state["model_state_dict"], strict=False)
@@ -50,13 +56,18 @@ def load_checkpoint(args, model, optimizer, scheduler, device):
         except Exception:
             pass
         start_epoch = int(state.get("epoch", 0))
-        best_ade = float(state.get("best_ade", state.get("best_loss", best_ade)))
+        if "best_score" in state:
+            best_score = float(state["best_score"])
+        elif "eval_ade" in state and "eval_fde" in state:
+            best_score = compute_selection_score(state["eval_ade"], state["eval_fde"])
+        else:
+            best_score = float(state.get("best_ade", state.get("best_loss", best_score)))
         print(f"Resumed from {ckpt_path} @ epoch {start_epoch}")
 
-    return start_epoch, best_ade
+    return start_epoch, best_score
 
 # 将单个 epoch 的训练和验证结果追加写入 CSV。
-def write_csv_log(csv_path, epoch, train_stats, val_stats, eval_ade, eval_fde, lr):
+def write_csv_log(csv_path, epoch, train_stats, val_stats, eval_ade, eval_fde, selection_score, lr):
     row = {
         "epoch": epoch,
         "train_loss": train_stats["loss"],
@@ -69,6 +80,7 @@ def write_csv_log(csv_path, epoch, train_stats, val_stats, eval_ade, eval_fde, l
         "val_fde_ft": eval_fde,
         "val_ade_m": eval_ade * 0.3048,
         "val_fde_m": eval_fde * 0.3048,
+        "val_score_ft": selection_score,
         "lr": lr,
     }
     with csv_path.open("a", newline="", encoding="utf-8") as f:
@@ -89,6 +101,7 @@ def init_csv_log(csv_path):
         "val_fde_ft",
         "val_ade_m",
         "val_fde_m",
+        "val_score_ft",
         "lr",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
@@ -106,7 +119,7 @@ def build_zero_loss_stats():
 
 
 # 将训练和验证指标统一写入 TensorBoard。
-def write_tensorboard_log(writer, epoch, train_stats, val_stats, eval_ade, eval_fde, lr):
+def write_tensorboard_log(writer, epoch, train_stats, val_stats, eval_ade, eval_fde, selection_score, lr):
     writer.add_scalar("Loss/Train", train_stats["loss"], epoch)
     writer.add_scalar("Loss/TrainVel", train_stats["loss_vel"], epoch)
     writer.add_scalar("Loss/TrainPos", train_stats["loss_pos"], epoch)
@@ -115,11 +128,12 @@ def write_tensorboard_log(writer, epoch, train_stats, val_stats, eval_ade, eval_
     writer.add_scalar("Loss/ValPos", val_stats["loss_pos"], epoch)
     writer.add_scalar("Eval/ADE_ft", eval_ade, epoch)
     writer.add_scalar("Eval/FDE_ft", eval_fde, epoch)
+    writer.add_scalar("Eval/SelectionScore_ft", selection_score, epoch)
     writer.add_scalar("LR", lr, epoch)
 
 
 # 打印每个 epoch 的训练与验证摘要。
-def print_eval_summary(epoch, total_epochs, train_stats, val_stats, eval_ade, eval_fde):
+def print_eval_summary(epoch, total_epochs, train_stats, val_stats, eval_ade, eval_fde, selection_score):
     print(
         f"Epoch {epoch}/{total_epochs} | "
         f"train={train_stats['loss']:.6f} | "
@@ -129,7 +143,8 @@ def print_eval_summary(epoch, total_epochs, train_stats, val_stats, eval_ade, ev
         f"val_vel={val_stats['loss_vel']:.6f} | "
         f"val_pos={val_stats['loss_pos']:.6f} | "
         f"ade={eval_ade:.4f}ft | "
-        f"fde={eval_fde:.4f}ft"
+        f"fde={eval_fde:.4f}ft | "
+        f"score={selection_score:.4f}"
     )
 
 # 整理 batch 数据并按特征维度拼接模型输入。
@@ -322,21 +337,22 @@ def main():
     model = DiffusionFut(args).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
-    start_epoch, best_ade = load_checkpoint(args, model, optimizer, scheduler, device)
+    start_epoch, best_score = load_checkpoint(args, model, optimizer, scheduler, device)
     eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
 
     for epoch in range(start_epoch, args.num_epochs):
         train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim)
         val_stats, eval_ade, eval_fde = evaluate(model, val_loader, device, epoch + 1, args.feature_dim, eval_ratio)
+        selection_score = compute_selection_score(eval_ade, eval_fde)
         current_lr = optimizer.param_groups[0]["lr"]
-        write_csv_log(log_csv_path, epoch + 1, train_stats, val_stats, eval_ade, eval_fde, current_lr)
-        write_tensorboard_log(writer, epoch + 1, train_stats, val_stats, eval_ade, eval_fde, current_lr)
-        print_eval_summary(epoch + 1, args.num_epochs, train_stats, val_stats, eval_ade, eval_fde)
+        write_csv_log(log_csv_path, epoch + 1, train_stats, val_stats, eval_ade, eval_fde, selection_score, current_lr)
+        write_tensorboard_log(writer, epoch + 1, train_stats, val_stats, eval_ade, eval_fde, selection_score, current_lr)
+        print_eval_summary(epoch + 1, args.num_epochs, train_stats, val_stats, eval_ade, eval_fde, selection_score)
 
         scheduler.step()
-        is_best = eval_ade < best_ade
+        is_best = selection_score < best_score
         if is_best:
-            best_ade = eval_ade
+            best_score = selection_score
 
         state = {
             "epoch": epoch + 1,
@@ -346,7 +362,8 @@ def main():
             "loss": train_stats["loss"],
             "eval_ade": eval_ade,
             "eval_fde": eval_fde,
-            "best_ade": best_ade,
+            "selection_score": selection_score,
+            "best_score": best_score,
         }
 
         if (epoch + 1) % args.save_interval == 0:

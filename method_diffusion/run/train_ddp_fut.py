@@ -19,6 +19,7 @@ from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.run.train_fut import (
     FUT_CHECKPOINT_DIR,
     build_zero_loss_stats,
+    compute_selection_score,
     init_csv_log,
     load_checkpoint,
     print_eval_summary,
@@ -303,7 +304,7 @@ def main():
     model = DiffusionFut(args).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
-    start_epoch, best_ade = load_checkpoint_for_rank(args, model, optimizer, scheduler, device, rank)
+    start_epoch, best_score = load_checkpoint_for_rank(args, model, optimizer, scheduler, device, rank)
 
     if dist.is_initialized():
         if device.type == "cuda":
@@ -318,17 +319,18 @@ def main():
 
         train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim, rank)
         val_stats, eval_ade, eval_fde = evaluate(model, val_loader, device, epoch + 1, args.feature_dim, eval_ratio, rank)
+        selection_score = compute_selection_score(eval_ade, eval_fde)
         current_lr = optimizer.param_groups[0]["lr"]
 
         if is_main_process(rank):
-            write_csv_log(log_csv_path, epoch + 1, train_stats, val_stats, eval_ade, eval_fde, current_lr)
-            write_tensorboard_log(writer, epoch + 1, train_stats, val_stats, eval_ade, eval_fde, current_lr)
-            print_eval_summary(epoch + 1, args.num_epochs, train_stats, val_stats, eval_ade, eval_fde)
+            write_csv_log(log_csv_path, epoch + 1, train_stats, val_stats, eval_ade, eval_fde, selection_score, current_lr)
+            write_tensorboard_log(writer, epoch + 1, train_stats, val_stats, eval_ade, eval_fde, selection_score, current_lr)
+            print_eval_summary(epoch + 1, args.num_epochs, train_stats, val_stats, eval_ade, eval_fde, selection_score)
 
         scheduler.step()
-        is_best = eval_ade < best_ade
+        is_best = selection_score < best_score
         if is_best:
-            best_ade = eval_ade
+            best_score = selection_score
 
         if is_main_process(rank):
             model_state = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
@@ -340,7 +342,8 @@ def main():
                 "loss": train_stats["loss"],
                 "eval_ade": eval_ade,
                 "eval_fde": eval_fde,
-                "best_ade": best_ade,
+                "selection_score": selection_score,
+                "best_score": best_score,
             }
 
             if (epoch + 1) % args.save_interval == 0:

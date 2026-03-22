@@ -9,7 +9,7 @@ def get_args_parser():
 
     # Train runtime
     parser.add_argument("--batch_size", default=512, type=int)
-    parser.add_argument("--num_epochs", default=50, type=int)
+    parser.add_argument("--num_epochs", default=35, type=int)
     parser.add_argument("--num_workers", default=10, type=int)
     parser.add_argument("--learning_rate", default=1e-4, type=float)
     parser.add_argument("--save_interval", default=5, type=int)
