@@ -6,7 +6,7 @@ def get_args_parser():
     # Data
     parser.add_argument("--dataset", default="ngsim", type=str, choices=["ngsim", "highd"])
     parser.add_argument("--data_root_ngsim", default="/mnt/datasets/ngsimdata", type=str)
-    parser.add_argument("--data_root_highd", default="/mnt/datasets/highD", type=str)
+    parser.add_argument("--data_root_highd", default="/mnt/datasets/highDdata", type=str)
 
     # Train runtime
     parser.add_argument("--batch_size", default=512, type=int)
@@ -54,7 +54,9 @@ def get_args_parser():
 
     # Fut diffusion model
     parser.add_argument("--hidden_dim_fut", default=128, type=int)
+    parser.add_argument("--input_dim_fut", default=2, type=int)
     parser.add_argument("--output_dim_fut", default=2, type=int)
+    parser.add_argument("--gaussian_param_dim_fut", default=5, type=int)
     parser.add_argument("--heads_fut", default=4, type=int)
     parser.add_argument("--depth_fut", default=3, type=int)
     parser.add_argument("--dropout_fut", default=0.1, type=float)
@@ -72,7 +74,7 @@ def get_args_parser():
 
     # Fut visualization
     parser.add_argument("--fut_enable_train_vis", default=0, type=int)
-    parser.add_argument("--fut_enable_eval_vis", default=1, type=int)
+    parser.add_argument("--fut_enable_eval_vis", default=0, type=int)
     parser.add_argument("--hist_enable_train_vis", default=0, type=int)
     parser.add_argument("--hist_enable_eval_vis", default=0, type=int)
 
