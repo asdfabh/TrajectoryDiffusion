@@ -75,8 +75,6 @@ def get_args_parser():
     parser.add_argument("--fut_pos_loss_weight", default=1.5, type=float)
     parser.add_argument("--intent_lat_loss_weight", default=0.3, type=float)
     parser.add_argument("--intent_lon_loss_weight", default=0.3, type=float)
-    parser.add_argument("--intent_tau_lat", default=0.8, type=float)
-    parser.add_argument("--intent_tau_lon", default=0.5, type=float)
     parser.add_argument("--intent_use_recent_bias", default=1, type=int)
     parser.add_argument("--intent_num_prototypes", default=9, type=int)
 
@@ -89,7 +87,5 @@ def get_args_parser():
     # Eval
     parser.add_argument("--eval_ratio", default=0.5, type=float)
     parser.add_argument("--num_samples", default=5, type=int)
-    # parser.add_argument("--fut_use_attention_pooling", default=1, type=int)
-    # parser.add_argument("--fut_use_split_cond_adaln", default=1, type=int)
 
     return parser

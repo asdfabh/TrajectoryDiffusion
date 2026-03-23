@@ -10,39 +10,6 @@ from method_diffusion.utils.position_encoding import SequentialPositionalEncodin
 from method_diffusion.utils.visualization import maybe_visualize_future_prediction
 
 
-def derive_intent_labels(hist, future, op_mask, tau_lat, tau_lon):
-    valid_mask = op_mask[..., 0] > 0.5
-    valid_counts = valid_mask.sum(dim=1).long()
-    has_valid = valid_counts > 0
-    last_idx = torch.clamp(valid_counts - 1, min=0)
-
-    anchor_x = hist[:, -1, 0]
-    final_x = future[..., 0].gather(1, last_idx.unsqueeze(1)).squeeze(1)
-    final_x = torch.where(has_valid, final_x, anchor_x)
-    dx = final_x - anchor_x
-
-    lat_labels = torch.full_like(last_idx, 1)
-    lat_labels = torch.where(dx < -float(tau_lat), torch.zeros_like(lat_labels), lat_labels)
-    lat_labels = torch.where(dx > float(tau_lat), torch.full_like(lat_labels, 2), lat_labels)
-
-    if hist.size(1) >= 2:
-        v_hist = hist[:, -1, 1] - hist[:, -2, 1]
-    else:
-        v_hist = torch.zeros_like(anchor_x)
-
-    shifted_future_y = torch.cat([hist[:, -1:, 1], future[:, :-1, 1]], dim=1)
-    future_dy = future[..., 1] - shifted_future_y
-    valid_steps = valid_mask.float()
-    v_future = (future_dy * valid_steps).sum(dim=1) / valid_steps.sum(dim=1).clamp_min(1.0)
-    v_future = torch.where(has_valid, v_future, v_hist)
-    dv = v_future - v_hist
-
-    lon_labels = torch.full_like(last_idx, 1)
-    lon_labels = torch.where(dv < -float(tau_lon), torch.zeros_like(lon_labels), lon_labels)
-    lon_labels = torch.where(dv > float(tau_lon), torch.full_like(lon_labels, 2), lon_labels)
-    return lat_labels.long(), lon_labels.long()
-
-
 class DiffusionFut(nn.Module):
 
     def __init__(self, args):
@@ -71,8 +38,6 @@ class DiffusionFut(nn.Module):
         self.pos_loss_weight = max(0.0, float(args.fut_pos_loss_weight))
         self.intent_lat_loss_weight = max(0.0, float(getattr(args, "intent_lat_loss_weight", 0.3)))
         self.intent_lon_loss_weight = max(0.0, float(getattr(args, "intent_lon_loss_weight", 0.3)))
-        self.intent_tau_lat = float(getattr(args, "intent_tau_lat", 0.8))
-        self.intent_tau_lon = float(getattr(args, "intent_tau_lon", 0.5))
         self.intent_use_recent_bias = int(getattr(args, "intent_use_recent_bias", 1)) > 0
         self.intent_num_prototypes = int(getattr(args, "intent_num_prototypes", 9))
 
@@ -249,7 +214,19 @@ class DiffusionFut(nn.Module):
         return bsz, t_len, valid_mask, anchor_phys, future_phys, context, e_int, z_hist, infer_scheduler, std_vel, mean_vel
 
     # 执行单个 batch 的 fut 训练前向与损失计算。
-    def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, return_components=False):
+    def forwardTrain(
+        self,
+        hist,
+        hist_nbrs,
+        mask,
+        temporal_mask,
+        future,
+        op_mask,
+        intent_lat_labels,
+        intent_lon_labels,
+        device,
+        return_components=False,
+    ):
         bsz, t_len, _ = future.shape  # [B, T, D]
         valid_mask = self.toValidMask(op_mask, device)  # [B, T]
 
@@ -272,13 +249,6 @@ class DiffusionFut(nn.Module):
         timesteps = torch.randint(0, self.num_train_timesteps, (bsz,), device=device).long()
         x_t = self.diffusion_scheduler.add_noise(target_vel_norm, noise, timesteps)
 
-        lat_labels, lon_labels = derive_intent_labels(
-            hist=hist,
-            future=future_phys,
-            op_mask=op_mask,
-            tau_lat=self.intent_tau_lat,
-            tau_lon=self.intent_tau_lon,
-        )
         context, lat_logits, lon_logits, p_lat, p_lon, p_joint, e_int, z_hist = self.encodeContext(
             hist,
             hist_nbrs,
@@ -307,12 +277,12 @@ class DiffusionFut(nn.Module):
             valid_mask,
             return_parts=True,
         )
-        ce_lat = F.cross_entropy(lat_logits, lat_labels)
-        ce_lon = F.cross_entropy(lon_logits, lon_labels)
+        ce_lat = F.cross_entropy(lat_logits, intent_lat_labels)
+        ce_lon = F.cross_entropy(lon_logits, intent_lon_labels)
         loss = diffusion_loss + (self.intent_lat_loss_weight * ce_lat) + (self.intent_lon_loss_weight * ce_lon)
 
-        acc_lat = (lat_logits.argmax(dim=-1) == lat_labels).float().mean()
-        acc_lon = (lon_logits.argmax(dim=-1) == lon_labels).float().mean()
+        acc_lat = (lat_logits.argmax(dim=-1) == intent_lat_labels).float().mean()
+        acc_lon = (lon_logits.argmax(dim=-1) == intent_lon_labels).float().mean()
         loss_parts.update(
             {
                 "loss_total": loss.detach(),
@@ -332,8 +302,8 @@ class DiffusionFut(nn.Module):
                 "p_lat": p_lat.detach(),
                 "p_lon": p_lon.detach(),
                 "p_joint": p_joint.detach(),
-                "intent_lat_labels": lat_labels.detach(),
-                "intent_lon_labels": lon_labels.detach(),
+                "intent_lat_labels": intent_lat_labels.detach(),
+                "intent_lon_labels": intent_lon_labels.detach(),
             }
         )
 
@@ -478,8 +448,31 @@ class DiffusionFut(nn.Module):
         return best_pred_phys, ade_batch, fde_batch
 
     # 统一前向入口，默认复用训练路径。
-    def forward(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, return_components=False):
-        return self.forwardTrain(hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, return_components=return_components)
+    def forward(
+        self,
+        hist,
+        hist_nbrs,
+        mask,
+        temporal_mask,
+        future,
+        op_mask,
+        intent_lat_labels,
+        intent_lon_labels,
+        device,
+        return_components=False,
+    ):
+        return self.forwardTrain(
+            hist,
+            hist_nbrs,
+            mask,
+            temporal_mask,
+            future,
+            op_mask,
+            intent_lat_labels,
+            intent_lon_labels,
+            device,
+            return_components=return_components,
+        )
 
     # 对历史输入的坐标与运动学特征做归一化。
     def normalize(self, x):

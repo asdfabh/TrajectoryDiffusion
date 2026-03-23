@@ -191,6 +191,8 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     cclass = batch["cclass"]
     fut = batch["fut"]
     op_mask = batch["op_mask"]
+    intent_lat_labels = batch["lat_enc"].argmax(dim=-1).long()
+    intent_lon_labels = batch["lon_enc"].argmax(dim=-1).long()
     hist_nbrs = batch["nbrs"]
     va_nbrs = batch["nbrs_va"]
     lane_nbrs = batch["nbrs_lane"]
@@ -215,7 +217,9 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     op_mask = op_mask.to(device)
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
-    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
+    intent_lat_labels = intent_lat_labels.to(device)
+    intent_lon_labels = intent_lon_labels.to(device)
+    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask, intent_lat_labels, intent_lon_labels
 
 # 执行单个训练 epoch 并汇总平均损失。
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
@@ -232,12 +236,27 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
         dataloader,
         total=len(dataloader),
         desc=f"Ep{epoch} Train",
-        ncols=120,
+        dynamic_ncols=True
     )
 
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        loss, loss_parts = model.forwardTrain( hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, return_components=True)
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, intent_lat_labels, intent_lon_labels = prepare_input_data(
+            batch,
+            feature_dim,
+            device=device,
+        )
+        loss, loss_parts = model.forwardTrain(
+            hist,
+            hist_nbrs,
+            mask,
+            temporal_mask,
+            fut,
+            op_mask,
+            intent_lat_labels,
+            intent_lon_labels,
+            device,
+            return_components=True,
+        )
         # _, eval_ade, eval_fde = model.forwardEval_minADE(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, K=5)
 
         optimizer.zero_grad()
@@ -305,11 +324,15 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio):
     else:
         target_batches = max(1, int(math.ceil(total_batches * float(eval_ratio))))
 
-    pbar = tqdm(dataloader, total=target_batches, desc=f"Ep{epoch} Val", ncols=120)
+    pbar = tqdm(dataloader, total=target_batches, desc=f"Ep{epoch} Val", dynamic_ncols=True)
     for batch in pbar:
         if num_batches >= target_batches:
             break
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, intent_lat_labels, intent_lon_labels = prepare_input_data(
+            batch,
+            feature_dim,
+            device=device,
+        )
         val_loss, val_parts = model.forwardTrain(
             hist,
             hist_nbrs,
@@ -317,6 +340,8 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio):
             temporal_mask,
             fut,
             op_mask,
+            intent_lat_labels,
+            intent_lon_labels,
             device,
             return_components=True,
         )

@@ -32,6 +32,8 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     cclass = batch["cclass"]
     fut = batch["fut"]
     op_mask = batch["op_mask"]
+    intent_lat_labels = batch["lat_enc"].argmax(dim=-1).long()
+    intent_lon_labels = batch["lon_enc"].argmax(dim=-1).long()
     hist_nbrs = batch["nbrs"]
     va_nbrs = batch["nbrs_va"]
     lane_nbrs = batch["nbrs_lane"]
@@ -56,7 +58,9 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     op_mask = op_mask.to(device)
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
-    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
+    intent_lat_labels = intent_lat_labels.to(device)
+    intent_lon_labels = intent_lon_labels.to(device)
+    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask, intent_lat_labels, intent_lon_labels
 
 
 def build_hist_masked(hist, mask_prob):
@@ -263,7 +267,11 @@ def train_epoch(
 
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Train", ncols=140)
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, intent_lat_labels, intent_lon_labels = prepare_input_data(
+            batch,
+            feature_dim,
+            device=device,
+        )
         loss_hist, hist_for_fut = build_hist_outputs(
             model_hist=model_hist,
             hist=hist,
@@ -279,6 +287,8 @@ def train_epoch(
             temporal_mask,
             fut,
             op_mask,
+            intent_lat_labels,
+            intent_lon_labels,
             device,
             return_components=True,
         )
@@ -364,7 +374,7 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval
         if num_batches >= target_batches:
             break
 
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, _, _ = prepare_input_data(batch, feature_dim, device=device)
         _, hist_for_fut = build_hist_outputs(
             model_hist=model_hist,
             hist=hist,

@@ -136,7 +136,11 @@ def train_epoch(
     )
 
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, intent_lat_labels, intent_lon_labels = prepare_input_data(
+            batch,
+            feature_dim,
+            device=device,
+        )
         loss_hist, hist_for_fut = build_hist_outputs(
             model_hist=model_hist,
             hist=hist,
@@ -152,6 +156,8 @@ def train_epoch(
             temporal_mask,
             fut,
             op_mask,
+            intent_lat_labels,
+            intent_lon_labels,
             device,
             return_components=True,
         )
@@ -269,7 +275,7 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval
         if num_batches >= target_batches:
             break
 
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, _, _ = prepare_input_data(batch, feature_dim, device=device)
         _, hist_for_fut = build_hist_outputs(
             model_hist=model_hist,
             hist=hist,
