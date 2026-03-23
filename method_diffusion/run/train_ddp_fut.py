@@ -14,6 +14,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.config import get_args_parser
+from method_diffusion.dataset.HighD_dataset import HighDDataset
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.run.train_fut import (
@@ -240,7 +241,17 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
             device,
             return_components=True,
         )
-        _, eval_ade, eval_fde = fut_model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+        _, eval_ade, eval_fde = fut_model.forwardEval(
+            hist,
+            hist_nbrs,
+            mask,
+            temporal_mask,
+            fut,
+            op_mask,
+            device,
+            intent_lat_labels=intent_lat_labels,
+            intent_lon_labels=intent_lon_labels,
+        )
 
         total_loss += float(val_loss.item())
         total_vel_loss += float(val_parts["loss_vel"].item())
@@ -315,11 +326,12 @@ def main():
         init_csv_log(log_csv_path)
         writer = SummaryWriter(log_dir=str(tensorboard_log_dir))
 
-    data_root = Path(args.data_root)
+    data_root = Path(args.data_root_highd if str(args.dataset).lower() == "highd" else args.data_root_ngsim)
     train_path = str(data_root / "TrainSet.mat")
     val_path = str(data_root / "ValSet.mat")
 
-    train_dataset = NgsimDataset(
+    dataset_cls = HighDDataset if str(args.dataset).lower() == "highd" else NgsimDataset
+    train_dataset = dataset_cls(
         train_path,
         t_h=30,
         t_f=50,
@@ -327,7 +339,7 @@ def main():
         enc_size=args.encoder_input_dim,
         feature_dim=args.feature_dim,
     )
-    val_dataset = NgsimDataset(
+    val_dataset = dataset_cls(
         val_path,
         t_h=30,
         t_f=50,

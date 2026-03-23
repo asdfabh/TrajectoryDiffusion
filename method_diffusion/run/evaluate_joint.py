@@ -9,6 +9,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.config import get_args_parser
+from method_diffusion.dataset.HighD_dataset import HighDDataset
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.models.hist_model import DiffusionPast
@@ -41,6 +42,8 @@ def prepare_joint_batch(batch, feature_dim, device="cuda"):
     cclass = batch["cclass"]
     fut = batch["fut"]
     op_mask = batch["op_mask"]
+    intent_lat_labels = batch["lat_enc"].argmax(dim=-1).long()
+    intent_lon_labels = batch["lon_enc"].argmax(dim=-1).long()
     hist_nbrs = batch["nbrs"]
     va_nbrs = batch["nbrs_va"]
     lane_nbrs = batch["nbrs_lane"]
@@ -65,7 +68,9 @@ def prepare_joint_batch(batch, feature_dim, device="cuda"):
     op_mask = op_mask.to(device)
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
-    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
+    intent_lat_labels = intent_lat_labels.to(device)
+    intent_lon_labels = intent_lon_labels.to(device)
+    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask, intent_lat_labels, intent_lon_labels
 
 
 def filter_valid_batch(batch):
@@ -109,12 +114,13 @@ def resolve_hist_checkpoint_dir(resume_hist):
 
 
 def build_test_loader(args):
-    data_root = Path(args.data_root)
+    data_root = Path(args.data_root_highd if str(args.dataset).lower() == "highd" else args.data_root_ngsim)
     test_path = data_root / "TestSet.mat"
     if not test_path.exists():
         test_path = data_root / "ValSet.mat"
     print(f"[JointEval] Loading test data from: {test_path}")
-    test_dataset = NgsimDataset(
+    dataset_cls = HighDDataset if str(args.dataset).lower() == "highd" else NgsimDataset
+    test_dataset = dataset_cls(
         str(test_path),
         t_h=30,
         t_f=50,
@@ -149,7 +155,11 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, num_samples
     pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc="Eval Joint", ncols=140)
     for batch_idx, batch in pbar:
         batch = filter_valid_batch(batch)
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_joint_batch(batch, feature_dim, device=device)
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, intent_lat_labels, intent_lon_labels = prepare_joint_batch(
+            batch,
+            feature_dim,
+            device=device,
+        )
 
         hist_masked, hist_mask = build_hist_mask(hist, hist_mask_type, hist_mask_prob)
         _, pred_hist = model_hist.forward_eval(hist, hist_masked, device)
@@ -157,11 +167,28 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, num_samples
 
         if k_samples > 1:
             pred_fut, _, _ = model_fut.forwardEval_minADE(
-                pred_hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, K=k_samples
+                pred_hist,
+                hist_nbrs,
+                mask,
+                temporal_mask,
+                fut,
+                op_mask,
+                device,
+                K=k_samples,
+                intent_lat_labels=intent_lat_labels,
+                intent_lon_labels=intent_lon_labels,
             )
         else:
             pred_fut, _, _ = model_fut.forwardEval(
-                pred_hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device
+                pred_hist,
+                hist_nbrs,
+                mask,
+                temporal_mask,
+                fut,
+                op_mask,
+                device,
+                intent_lat_labels=intent_lat_labels,
+                intent_lon_labels=intent_lon_labels,
             )
         fut_metrics.update(pred_fut, fut, op_mask)
 

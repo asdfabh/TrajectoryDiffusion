@@ -13,6 +13,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.config import get_args_parser
+from method_diffusion.dataset.HighD_dataset import HighDHistDataset
 from method_diffusion.dataset.ngsim_hist_dataset import NgsimHistDataset
 from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.utils.mask_util import random_mask, continuous_mask
@@ -290,12 +291,13 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    data_root = Path(args.data_root)
+    data_root = Path(args.data_root_highd if str(args.dataset).lower() == "highd" else args.data_root_ngsim)
     train_path = str(data_root / "TrainSet.mat")
     val_path = str(data_root / "ValSet.mat")
 
-    train_dataset = NgsimHistDataset(train_path, t_h=30, d_s=2)
-    val_dataset = NgsimHistDataset(val_path, t_h=30, d_s=2)
+    dataset_cls = HighDHistDataset if str(args.dataset).lower() == "highd" else NgsimHistDataset
+    train_dataset = dataset_cls(train_path, t_h=30, d_s=2)
+    val_dataset = dataset_cls(val_path, t_h=30, d_s=2)
 
     train_loader = DataLoader(
         train_dataset,

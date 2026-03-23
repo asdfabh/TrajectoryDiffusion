@@ -13,6 +13,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.config import get_args_parser
+from method_diffusion.dataset.HighD_dataset import HighDDataset
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.models.hist_model import DiffusionPast
@@ -275,7 +276,11 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval
         if num_batches >= target_batches:
             break
 
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, _, _ = prepare_input_data(batch, feature_dim, device=device)
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, intent_lat_labels, intent_lon_labels = prepare_input_data(
+            batch,
+            feature_dim,
+            device=device,
+        )
         _, hist_for_fut = build_hist_outputs(
             model_hist=model_hist,
             hist=hist,
@@ -292,6 +297,8 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval
             fut,
             op_mask,
             device,
+            intent_lat_labels=intent_lat_labels,
+            intent_lon_labels=intent_lon_labels,
         )
 
         total_ade += float(eval_ade.item())
@@ -340,11 +347,12 @@ def main():
     hist_loss_weight = 0.0 if freeze_hist else max(0.0, float(args.joint_hist_loss_weight))
     hist_lr_scale = max(0.0, float(args.joint_hist_lr_scale))
 
-    data_root = Path(args.data_root)
+    data_root = Path(args.data_root_highd if str(args.dataset).lower() == "highd" else args.data_root_ngsim)
     train_path = str(data_root / "TrainSet.mat")
     val_path = str(data_root / "ValSet.mat")
 
-    train_dataset = NgsimDataset(
+    dataset_cls = HighDDataset if str(args.dataset).lower() == "highd" else NgsimDataset
+    train_dataset = dataset_cls(
         train_path,
         t_h=30,
         t_f=50,
@@ -352,7 +360,7 @@ def main():
         enc_size=args.encoder_input_dim,
         feature_dim=args.feature_dim,
     )
-    val_dataset = NgsimDataset(
+    val_dataset = dataset_cls(
         val_path,
         t_h=30,
         t_f=50,

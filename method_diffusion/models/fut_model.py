@@ -325,6 +325,11 @@ class DiffusionFut(nn.Module):
                 enable_train_vis=self.fut_enable_train_vis,
                 enable_eval_vis=self.fut_enable_eval_vis,
                 meter_per_foot=self.meter_per_foot,
+                intent_lat_labels=intent_lat_labels,
+                intent_lon_labels=intent_lon_labels,
+                p_lat=self.last_intent_outputs.get("p_lat"),
+                p_lon=self.last_intent_outputs.get("p_lon"),
+                p_joint=self.last_intent_outputs.get("p_joint"),
             )
 
         if return_components:
@@ -333,7 +338,8 @@ class DiffusionFut(nn.Module):
 
     @torch.no_grad()
     # 执行单模态推理评估并返回轨迹与指标。
-    def forwardEval(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
+    def forwardEval(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device,
+                    intent_lat_labels=None, intent_lon_labels=None):
         (
             bsz,
             t_len,
@@ -369,12 +375,18 @@ class DiffusionFut(nn.Module):
             enable_train_vis=self.fut_enable_train_vis,
             enable_eval_vis=self.fut_enable_eval_vis,
             meter_per_foot=self.meter_per_foot,
+            intent_lat_labels=intent_lat_labels,
+            intent_lon_labels=intent_lon_labels,
+            p_lat=self.last_intent_outputs.get("p_lat"),
+            p_lon=self.last_intent_outputs.get("p_lon"),
+            p_joint=self.last_intent_outputs.get("p_joint"),
         )
         return pred_phys_abs, ade, fde
 
     @torch.no_grad()
     # 执行并行多模态推理评估并返回 minADE 对应结果。
-    def forwardEval_minADE(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, K=5):
+    def forwardEval_minADE(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, K=5,
+                           intent_lat_labels=None, intent_lon_labels=None):
         (
             bsz,
             t_len,
@@ -443,6 +455,11 @@ class DiffusionFut(nn.Module):
             pred_all=all_preds,
             pred_best_idx=best_k_idx,
             meter_per_foot=self.meter_per_foot,
+            intent_lat_labels=intent_lat_labels,
+            intent_lon_labels=intent_lon_labels,
+            p_lat=self.last_intent_outputs.get("p_lat"),
+            p_lon=self.last_intent_outputs.get("p_lon"),
+            p_joint=self.last_intent_outputs.get("p_joint"),
         )
 
         return best_pred_phys, ade_batch, fde_batch
