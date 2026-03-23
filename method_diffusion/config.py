@@ -4,7 +4,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser("Set diffusion predicter", add_help=False)
 
     # Data
-    parser.add_argument("--dataset", default="highd", type=str, choices=["ngsim", "highd"])
+    parser.add_argument("--dataset", default="ngsim", type=str, choices=["ngsim", "highd"])
     parser.add_argument("--data_root_ngsim", default="/mnt/datasets/ngsimdata", type=str)
     parser.add_argument("--data_root_highd", default="/mnt/datasets/highD", type=str)
 
@@ -16,7 +16,7 @@ def get_args_parser():
     parser.add_argument("--save_interval", default=5, type=int)
     parser.add_argument("--mask_prob", default=0.4, type=float)
     parser.add_argument("--checkpoint_dir", default="./checkpoints", type=str)
-    parser.add_argument("--resume_fut", default="best", type=str)
+    parser.add_argument("--resume_fut", default="none", type=str)
     parser.add_argument("--resume_hist", default="best", type=str)
 
     # Joint train strategy
@@ -63,21 +63,12 @@ def get_args_parser():
     parser.add_argument("--time_embedding_size_fut", default=256, type=int)
     parser.add_argument("--T_f", default=25, type=int)
 
-    # Fut inference sampler
+    # Fut train/inference
     parser.add_argument("--num_inference_steps", default=15, type=int)
     parser.add_argument("--ddim_eta", default=0.0, type=float)
     parser.add_argument("--x0_clip", default=5.0, type=float)
-
-    # Fut train strategy
     parser.add_argument("--self_condition_prob", default=0.5, type=float)
-
-    # Fut loss
-    parser.add_argument("--fut_huber_delta", default=1.0, type=float)
     parser.add_argument("--fut_pos_loss_weight", default=1.5, type=float)
-    parser.add_argument("--intent_lat_loss_weight", default=0.3, type=float)
-    parser.add_argument("--intent_lon_loss_weight", default=0.3, type=float)
-    parser.add_argument("--intent_use_recent_bias", default=1, type=int)
-    parser.add_argument("--intent_num_prototypes", default=9, type=int)
 
     # Fut visualization
     parser.add_argument("--fut_enable_train_vis", default=0, type=int)

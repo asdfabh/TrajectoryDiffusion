@@ -5,7 +5,6 @@ from diffusers.schedulers import DDIMScheduler
 
 from method_diffusion.models import dit_fut as dit
 from method_diffusion.models.hist_encoder import HistEncoder
-from method_diffusion.models.intent_extractor import IntentExtractor
 from method_diffusion.utils.position_encoding import SequentialPositionalEncoding
 from method_diffusion.utils.visualization import maybe_visualize_future_prediction
 
@@ -24,7 +23,6 @@ class DiffusionFut(nn.Module):
         self.mlp_ratio = int(args.mlp_ratio_fut)
         self.time_embedding_size = int(args.time_embedding_size_fut)
         self.T = int(args.T_f)
-        self.hist_context_len = int(getattr(args, "hist_length", getattr(args, "T", self.T)))
 
         # 扩散与推理参数：控制训练时间步、推理步数和 DDIM 采样行为。
         self.num_train_timesteps = int(args.num_train_timesteps_fut)
@@ -34,12 +32,7 @@ class DiffusionFut(nn.Module):
 
         # 训练策略与损失参数：控制自条件训练和损失项权重。
         self.self_condition_prob = min(max(float(args.self_condition_prob), 0.0), 1.0)
-        self.huber_delta = max(1e-4, float(args.fut_huber_delta))
         self.pos_loss_weight = max(0.0, float(args.fut_pos_loss_weight))
-        self.intent_lat_loss_weight = max(0.0, float(getattr(args, "intent_lat_loss_weight", 0.3)))
-        self.intent_lon_loss_weight = max(0.0, float(getattr(args, "intent_lon_loss_weight", 0.3)))
-        self.intent_use_recent_bias = int(getattr(args, "intent_use_recent_bias", 1)) > 0
-        self.intent_num_prototypes = int(getattr(args, "intent_num_prototypes", 9))
 
         # 可视化参数：仅决定训练和评估阶段是否绘图。
         self.fut_enable_train_vis = int(args.fut_enable_train_vis) > 0
@@ -51,12 +44,6 @@ class DiffusionFut(nn.Module):
         self.context_embedding = nn.Linear(self.hidden_dim, self.hidden_dim)
         self.pos_embedding = SequentialPositionalEncoding(self.hidden_dim)
         self.hist_encoder = HistEncoder(args)
-        self.intent_extractor = IntentExtractor(
-            hidden_dim=self.hidden_dim,
-            hist_len=self.hist_context_len,
-            use_recent_bias=self.intent_use_recent_bias,
-            num_prototypes=self.intent_num_prototypes,
-        )
 
         # DiT 主干与扩散调度器：负责时间嵌入、去噪建模和 DDIM 调度。
         self.timestep_embedder = dit.TimestepEmbedder(self.hidden_dim, self.time_embedding_size)
@@ -81,47 +68,33 @@ class DiffusionFut(nn.Module):
         self.register_buffer("vel_mean", torch.tensor([-0.004182, 5.041937], dtype=torch.float32).float(), persistent=False)
         self.register_buffer("vel_std", torch.tensor([0.150222, 2.951254], dtype=torch.float32).float(), persistent=False)
 
-        self.last_intent_outputs = {}
-
     # 将输出通道掩码转换为按时间步的有效帧掩码。
     @staticmethod
     def toValidMask(op_mask, device):
         return (op_mask[..., 0] > 0.5).float().to(device)
 
     # 基于当前噪声状态与历史条件预测归一化速度。
-    def predictX0(self, x_t, timesteps, context_aligned, e_int, z_hist, pred_x0_cond):
+    def predictX0(self, x_t, timesteps, context_aligned, pred_x0_cond):
         t_emb = self.timestep_embedder(timesteps)
         combined_input = torch.cat([x_t, pred_x0_cond], dim=-1)
         input_embedded = self.input_embedding(combined_input) + self.pos_embedding(x_t)
-        context_with_pos = self.context_embedding(context_aligned) + self.pos_embedding(context_aligned)
+        context_encoded = self.context_embedding(context_aligned)
         return self.dit(
             x=input_embedded,
             t_cond=t_emb,
-            intent_cond=e_int,
-            hist_cond=z_hist,
-            cross=context_with_pos,
+            cross=context_encoded,
         )
 
     def encodeContext(self, hist, hist_nbrs, mask, temporal_mask):
         hist_norm = self.normalize(hist)
         hist_nbrs_norm = self.normalize(hist_nbrs)
         context, _ = self.hist_encoder(hist_norm, hist_nbrs_norm, mask, temporal_mask)
-        lat_logits, lon_logits, p_lat, p_lon, p_joint, e_int, z_hist = self.intent_extractor(context)
-        self.last_intent_outputs = {
-            "lat_logits": lat_logits.detach(),
-            "lon_logits": lon_logits.detach(),
-            "p_lat": p_lat.detach(),
-            "p_lon": p_lon.detach(),
-            "p_joint": p_joint.detach(),
-            "e_int": e_int.detach(),
-            "z_hist": z_hist.detach(),
-        }
-        return context, lat_logits, lon_logits, p_lat, p_lon, p_joint, e_int, z_hist
+        return context
 
     # 计算训练使用的速度损失与物理位置损失。
     def computeLoss(self, pred_vel_norm, target_vel_norm, future_phys, anchor_phys, valid_mask, return_parts=False):
-        # 速度域微观约束 (Huber Loss)：在归一化空间算，梯度稳定，防高频抖动
-        loss_vel = F.smooth_l1_loss(pred_vel_norm, target_vel_norm, reduction="none", beta=self.huber_delta)
+        # 速度域微观约束：在归一化空间计算逐元素 L1 误差
+        loss_vel = F.l1_loss(pred_vel_norm, target_vel_norm, reduction="none")
 
         # 积分回物理位置域 (宏观绝对约束)
         std_vel = self.vel_std.view(1, 1, 2).to(pred_vel_norm.device)
@@ -130,8 +103,8 @@ class DiffusionFut(nn.Module):
         pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
         pred_pos_phys = torch.cumsum(pred_vel_phys, dim=1) + anchor_phys[..., :2]
 
-        # 物理空间位置损失
-        loss_pos = F.smooth_l1_loss(pred_pos_phys, future_phys[..., :2], reduction="none", beta=self.huber_delta)
+        # 物理空间位置损失：在绝对坐标空间计算逐元素 L1 误差
+        loss_pos = F.l1_loss(pred_pos_phys, future_phys[..., :2], reduction="none")
         total_loss = loss_vel + self.pos_loss_weight * loss_pos
 
         # 损失函数指标计算：仅在有效帧上平均，避免无效帧稀释梯度
@@ -168,14 +141,14 @@ class DiffusionFut(nn.Module):
         return ade, fde
 
     # 执行推理阶段的 DDIM 采样并输出最终预测结果（相对坐标系）。
-    def sampleFromXt(self, x_t, context_aligned, e_int, z_hist, infer_scheduler):
+    def sampleFromXt(self, x_t, context_aligned, infer_scheduler):
         bsz, t_len, _ = x_t.shape
         pred_vel_cond = torch.zeros((bsz, t_len, self.output_dim), device=x_t.device, dtype=x_t.dtype)
         for t in infer_scheduler.timesteps:
             t_scalar = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
             timesteps = torch.full((bsz,), t_scalar, device=x_t.device, dtype=torch.long)
 
-            pred_vel_norm = self.predictX0(x_t, timesteps, context_aligned, e_int, z_hist, pred_vel_cond)
+            pred_vel_norm = self.predictX0(x_t, timesteps, context_aligned, pred_vel_cond)
             if self.x0_clip is not None:
                 pred_vel_norm = torch.clamp(pred_vel_norm, -self.x0_clip, self.x0_clip)
 
@@ -192,7 +165,7 @@ class DiffusionFut(nn.Module):
         valid_mask = self.toValidMask(op_mask, device)
         anchor_phys = hist[..., -1:, :self.output_dim]
         future_phys = future[..., :self.output_dim]
-        context, lat_logits, lon_logits, p_lat, p_lon, p_joint, e_int, z_hist = self.encodeContext(
+        context = self.encodeContext(
             hist,
             hist_nbrs,
             mask,
@@ -202,16 +175,7 @@ class DiffusionFut(nn.Module):
         infer_scheduler.set_timesteps(self.num_inference_steps)
         std_vel = self.vel_std.view(1, 1, 2).to(device)
         mean_vel = self.vel_mean.view(1, 1, 2).to(device)
-        self.last_intent_outputs.update(
-            {
-                "lat_logits": lat_logits.detach(),
-                "lon_logits": lon_logits.detach(),
-                "p_lat": p_lat.detach(),
-                "p_lon": p_lon.detach(),
-                "p_joint": p_joint.detach(),
-            }
-        )
-        return bsz, t_len, valid_mask, anchor_phys, future_phys, context, e_int, z_hist, infer_scheduler, std_vel, mean_vel
+        return bsz, t_len, valid_mask, anchor_phys, future_phys, context, infer_scheduler, std_vel, mean_vel
 
     # 执行单个 batch 的 fut 训练前向与损失计算。
     def forwardTrain(
@@ -222,8 +186,6 @@ class DiffusionFut(nn.Module):
         temporal_mask,
         future,
         op_mask,
-        intent_lat_labels,
-        intent_lon_labels,
         device,
         return_components=False,
     ):
@@ -249,7 +211,7 @@ class DiffusionFut(nn.Module):
         timesteps = torch.randint(0, self.num_train_timesteps, (bsz,), device=device).long()
         x_t = self.diffusion_scheduler.add_noise(target_vel_norm, noise, timesteps)
 
-        context, lat_logits, lon_logits, p_lat, p_lon, p_joint, e_int, z_hist = self.encodeContext(
+        context = self.encodeContext(
             hist,
             hist_nbrs,
             mask,
@@ -262,13 +224,12 @@ class DiffusionFut(nn.Module):
             use_sc = (torch.rand(bsz, 1, 1, device=device) < self.self_condition_prob).float()
             if use_sc.any():
                 with torch.no_grad():
-                    prev_pred_vel = self.predictX0(x_t, timesteps, context, e_int, z_hist, pred_vel_cond)
+                    prev_pred_vel = self.predictX0(x_t, timesteps, context, pred_vel_cond)
                 pred_vel_cond = prev_pred_vel.detach() * use_sc
 
         # 网络输出：预测的归一化速度
-        pred_vel_norm_t = self.predictX0(x_t, timesteps, context, e_int, z_hist, pred_vel_cond)
+        pred_vel_norm_t = self.predictX0(x_t, timesteps, context, pred_vel_cond)
 
-        # 基础 diffusion loss 与 intent CE loss。
         diffusion_loss, loss_parts = self.computeLoss(
             pred_vel_norm_t,
             target_vel_norm,
@@ -277,33 +238,11 @@ class DiffusionFut(nn.Module):
             valid_mask,
             return_parts=True,
         )
-        ce_lat = F.cross_entropy(lat_logits, intent_lat_labels)
-        ce_lon = F.cross_entropy(lon_logits, intent_lon_labels)
-        loss = diffusion_loss + (self.intent_lat_loss_weight * ce_lat) + (self.intent_lon_loss_weight * ce_lon)
-
-        acc_lat = (lat_logits.argmax(dim=-1) == intent_lat_labels).float().mean()
-        acc_lon = (lon_logits.argmax(dim=-1) == intent_lon_labels).float().mean()
+        loss = diffusion_loss
         loss_parts.update(
             {
                 "loss_total": loss.detach(),
                 "loss_diffusion": diffusion_loss.detach(),
-                "loss_int_lat": ce_lat.detach(),
-                "loss_int_lon": ce_lon.detach(),
-                "acc_int_lat": acc_lat.detach(),
-                "acc_int_lon": acc_lon.detach(),
-                "lat_logits": lat_logits.detach(),
-                "lon_logits": lon_logits.detach(),
-            }
-        )
-        self.last_intent_outputs.update(
-            {
-                "lat_logits": lat_logits.detach(),
-                "lon_logits": lon_logits.detach(),
-                "p_lat": p_lat.detach(),
-                "p_lon": p_lon.detach(),
-                "p_joint": p_joint.detach(),
-                "intent_lat_labels": intent_lat_labels.detach(),
-                "intent_lon_labels": intent_lon_labels.detach(),
             }
         )
 
@@ -325,11 +264,6 @@ class DiffusionFut(nn.Module):
                 enable_train_vis=self.fut_enable_train_vis,
                 enable_eval_vis=self.fut_enable_eval_vis,
                 meter_per_foot=self.meter_per_foot,
-                intent_lat_labels=intent_lat_labels,
-                intent_lon_labels=intent_lon_labels,
-                p_lat=self.last_intent_outputs.get("p_lat"),
-                p_lon=self.last_intent_outputs.get("p_lon"),
-                p_joint=self.last_intent_outputs.get("p_joint"),
             )
 
         if return_components:
@@ -338,8 +272,7 @@ class DiffusionFut(nn.Module):
 
     @torch.no_grad()
     # 执行单模态推理评估并返回轨迹与指标。
-    def forwardEval(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device,
-                    intent_lat_labels=None, intent_lon_labels=None):
+    def forwardEval(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
         (
             bsz,
             t_len,
@@ -347,15 +280,13 @@ class DiffusionFut(nn.Module):
             anchor_phys,
             future_phys,
             context,
-            e_int,
-            z_hist,
             infer_scheduler,
             std_vel,
             mean_vel,
         ) = self.prepareEvalInputs(hist, hist_nbrs, mask, temporal_mask, future, op_mask, device)
 
         x_t = torch.randn((bsz, t_len, self.output_dim), device=device)
-        pred_vel_norm = self.sampleFromXt(x_t, context, e_int, z_hist, infer_scheduler)
+        pred_vel_norm = self.sampleFromXt(x_t, context, infer_scheduler)
 
         # 积分还原：解归一化 -> 累加 -> 拼接绝对锚点
         pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
@@ -375,18 +306,12 @@ class DiffusionFut(nn.Module):
             enable_train_vis=self.fut_enable_train_vis,
             enable_eval_vis=self.fut_enable_eval_vis,
             meter_per_foot=self.meter_per_foot,
-            intent_lat_labels=intent_lat_labels,
-            intent_lon_labels=intent_lon_labels,
-            p_lat=self.last_intent_outputs.get("p_lat"),
-            p_lon=self.last_intent_outputs.get("p_lon"),
-            p_joint=self.last_intent_outputs.get("p_joint"),
         )
         return pred_phys_abs, ade, fde
 
     @torch.no_grad()
     # 执行并行多模态推理评估并返回 minADE 对应结果。
-    def forwardEval_minADE(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, K=5,
-                           intent_lat_labels=None, intent_lon_labels=None):
+    def forwardEval_minADE(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, K=5):
         (
             bsz,
             t_len,
@@ -394,8 +319,6 @@ class DiffusionFut(nn.Module):
             anchor_phys,
             future_phys,
             context,
-            e_int,
-            z_hist,
             infer_scheduler,
             std_vel,
             mean_vel,
@@ -403,12 +326,10 @@ class DiffusionFut(nn.Module):
 
         # 核心提速优化：在 Batch 维度上并行展开 K 倍
         context_k = context.repeat_interleave(K, dim=0)
-        e_int_k = e_int.repeat_interleave(K, dim=0)
-        z_hist_k = z_hist.repeat_interleave(K, dim=0)
 
         # 一次性生成 bsz * K 份随机噪声，并行执行完整的去噪过程
         x_t_k = torch.randn((bsz * K, t_len, self.output_dim), device=device)
-        pred_vel_norm_k = self.sampleFromXt(x_t_k, context_k, e_int_k, z_hist_k, infer_scheduler)
+        pred_vel_norm_k = self.sampleFromXt(x_t_k, context_k, infer_scheduler)
 
         # 把并发结果 Reshape 回 [bsz, K, t_len, dim]
         pred_vel_norm = pred_vel_norm_k.view(bsz, K, t_len, self.output_dim)
@@ -455,11 +376,6 @@ class DiffusionFut(nn.Module):
             pred_all=all_preds,
             pred_best_idx=best_k_idx,
             meter_per_foot=self.meter_per_foot,
-            intent_lat_labels=intent_lat_labels,
-            intent_lon_labels=intent_lon_labels,
-            p_lat=self.last_intent_outputs.get("p_lat"),
-            p_lon=self.last_intent_outputs.get("p_lon"),
-            p_joint=self.last_intent_outputs.get("p_joint"),
         )
 
         return best_pred_phys, ade_batch, fde_batch
@@ -473,8 +389,6 @@ class DiffusionFut(nn.Module):
         temporal_mask,
         future,
         op_mask,
-        intent_lat_labels,
-        intent_lon_labels,
         device,
         return_components=False,
     ):
@@ -485,8 +399,6 @@ class DiffusionFut(nn.Module):
             temporal_mask,
             future,
             op_mask,
-            intent_lat_labels,
-            intent_lon_labels,
             device,
             return_components=return_components,
         )

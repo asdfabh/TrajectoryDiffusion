@@ -47,17 +47,9 @@ class SplitConditionModulator(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, output_size, bias=True),
         )
-        self.intent_mod = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, output_size, bias=True),
-        )
-        self.hist_mod = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, output_size, bias=True),
-        )
 
-    def forward(self, t_cond, intent_cond, hist_cond):
-        return self.time_mod(t_cond) + self.intent_mod(intent_cond) + self.hist_mod(hist_cond)
+    def forward(self, t_cond):
+        return self.time_mod(t_cond)
 
 
 class DiTBlock(nn.Module):
@@ -77,12 +69,8 @@ class DiTBlock(nn.Module):
 
         self.mlp2 = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
 
-    def forward(self, x, t_cond, intent_cond, hist_cond, cross, attn_mask=None):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(
-            t_cond,
-            intent_cond,
-            hist_cond,
-        ).chunk(6, dim=1)
+    def forward(self, x, t_cond, cross, attn_mask=None):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(t_cond).chunk(6, dim=1)
 
         modulated_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulated_x, modulated_x, modulated_x, key_padding_mask=attn_mask)[0]
@@ -113,8 +101,8 @@ class FinalLayer(nn.Module):
 
         self.adaLN_modulation = SplitConditionModulator(hidden_size, 2 * hidden_size)
 
-    def forward(self, x, t_cond, intent_cond, hist_cond):
-        shift, scale = self.adaLN_modulation(t_cond, intent_cond, hist_cond).chunk(2, dim=1)
+    def forward(self, x, t_cond):
+        shift, scale = self.adaLN_modulation(t_cond).chunk(2, dim=1)
         x = modulate(self.norm_final(x), shift, scale)
         x = self.proj(x)
         return x
@@ -134,9 +122,9 @@ class DiT(nn.Module):
     def model_type(self):
         return self._model_type
 
-    def forward(self, x, t_cond, intent_cond, hist_cond, cross):
+    def forward(self, x, t_cond, cross):
         for block in self.blocks:
-            x = block(x, t_cond, intent_cond, hist_cond, cross)
-        x = self.final_layer(x, t_cond, intent_cond, hist_cond)
+            x = block(x, t_cond, cross)
+        x = self.final_layer(x, t_cond)
 
         return x

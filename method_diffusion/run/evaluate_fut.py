@@ -25,8 +25,6 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     cclass = batch["cclass"]
     fut = batch["fut"]
     op_mask = batch["op_mask"]
-    intent_lat_labels = batch["lat_enc"].argmax(dim=-1).long()
-    intent_lon_labels = batch["lon_enc"].argmax(dim=-1).long()
     hist_nbrs = batch["nbrs"]
     va_nbrs = batch["nbrs_va"]
     lane_nbrs = batch["nbrs_lane"]
@@ -51,9 +49,7 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     op_mask = op_mask.to(device)
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
-    intent_lat_labels = intent_lat_labels.to(device)
-    intent_lon_labels = intent_lon_labels.to(device)
-    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask, intent_lat_labels, intent_lon_labels
+    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
 
 # 解析 fut checkpoint 标识并返回实际文件路径。
 def resolve_checkpoint_path(resume_arg, checkpoint_dir):
@@ -149,7 +145,7 @@ def evaluate(model, dataloader, device, feature_dim, num_samples):
 
     pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc=eval_name, ncols=120)
     for batch_idx, batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, intent_lat_labels, intent_lon_labels = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
             batch,
             feature_dim,
             device=device,
@@ -164,8 +160,6 @@ def evaluate(model, dataloader, device, feature_dim, num_samples):
                 op_mask,
                 device,
                 K=k_samples,
-                intent_lat_labels=intent_lat_labels,
-                intent_lon_labels=intent_lon_labels,
             )
         else:
             pred_fut, _, _ = model.forwardEval(
@@ -176,8 +170,6 @@ def evaluate(model, dataloader, device, feature_dim, num_samples):
                 fut,
                 op_mask,
                 device,
-                intent_lat_labels=intent_lat_labels,
-                intent_lon_labels=intent_lon_labels,
             )
 
         metrics.update(pred_fut, fut, op_mask)

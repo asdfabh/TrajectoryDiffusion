@@ -52,7 +52,6 @@ class DiffusionPast(nn.Module):
         self.register_buffer("va_mean", torch.tensor([27.0654, 0.1219]).float(), persistent=False)
         self.register_buffer("va_std", torch.tensor([13.8077, 4.6976]).float(), persistent=False)
         self.hist_dt = 0.2  # NGSIM 10Hz and current hist pipeline uses d_s=2.
-        self.huber_delta = 1.0
         self.loss_weights = {
             "xy_unknown": 1.00,
             "xy_known": 0.20,
@@ -63,8 +62,8 @@ class DiffusionPast(nn.Module):
             "a_cons": 0.00,
         }
 
-    def masked_smooth_l1(self, pred, target, mask=None):
-        loss = F.smooth_l1_loss(pred, target, reduction="none", beta=self.huber_delta)
+    def masked_l1(self, pred, target, mask=None):
+        loss = F.l1_loss(pred, target, reduction="none")
         if mask is None:
             return loss.mean()
         mask = mask.to(pred.device).float()
@@ -82,8 +81,8 @@ class DiffusionPast(nn.Module):
         known_mask = mask.view(mask.shape[0], mask.shape[1], 1).to(pred.device).float()
         unknown_mask = 1.0 - known_mask
 
-        loss_xy_unknown = self.masked_smooth_l1(pred[..., :2], target[..., :2], unknown_mask)
-        loss_xy_known = self.masked_smooth_l1(pred[..., :2], target[..., :2], known_mask)
+        loss_xy_unknown = self.masked_l1(pred[..., :2], target[..., :2], unknown_mask)
+        loss_xy_known = self.masked_l1(pred[..., :2], target[..., :2], known_mask)
 
         zero = pred.new_tensor(0.0)
         loss_va_unknown = zero
@@ -93,8 +92,8 @@ class DiffusionPast(nn.Module):
         loss_a_cons = zero
 
         if pred.shape[-1] >= 4:
-            loss_va_unknown = self.masked_smooth_l1(pred[..., 2:4], target[..., 2:4], unknown_mask)
-            loss_va_known = self.masked_smooth_l1(pred[..., 2:4], target[..., 2:4], known_mask)
+            loss_va_unknown = self.masked_l1(pred[..., 2:4], target[..., 2:4], unknown_mask)
+            loss_va_known = self.masked_l1(pred[..., 2:4], target[..., 2:4], known_mask)
 
             pred_phys = self.denorm(pred)
             target_phys = self.denorm(target)
@@ -103,16 +102,16 @@ class DiffusionPast(nn.Module):
             target_dxy = target_phys[:, 1:, :2] - target_phys[:, :-1, :2]
             pair_unknown = torch.maximum(unknown_mask[:, 1:, :], unknown_mask[:, :-1, :])
             # loss_dxy: 约束相邻时刻的位置增量 delta(x, y) 与 GT 一致，衡量局部轨迹形状是否平滑且正确。
-            loss_dxy = self.masked_smooth_l1(pred_dxy, target_dxy, pair_unknown)
+            loss_dxy = self.masked_l1(pred_dxy, target_dxy, pair_unknown)
 
             pred_v = pred_phys[..., 2]
             pred_a = pred_phys[..., 3]
             pred_v_from_y = pred_dxy[..., 1] / self.hist_dt
             pred_a_from_v = (pred_v[:, 1:] - pred_v[:, :-1]) / self.hist_dt
             # loss_v_cons: 用位置序列的纵向差分速度约束输出 v，衡量预测位置与预测速度是否自洽。
-            loss_v_cons = self.masked_smooth_l1(pred_v_from_y, pred_v[:, 1:], None)
+            loss_v_cons = self.masked_l1(pred_v_from_y, pred_v[:, 1:], None)
             # loss_a_cons: 用速度序列的一阶差分约束输出 a，衡量预测速度与预测加速度是否自洽。
-            loss_a_cons = self.masked_smooth_l1(pred_a_from_v, pred_a[:, 1:], None)
+            loss_a_cons = self.masked_l1(pred_a_from_v, pred_a[:, 1:], None)
 
         total_loss = (
             self.loss_weights["xy_unknown"] * loss_xy_unknown

@@ -94,10 +94,6 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
     total_loss = 0.0
     total_vel_loss = 0.0
     total_pos_loss = 0.0
-    total_int_lat_loss = 0.0
-    total_int_lon_loss = 0.0
-    total_int_lat_acc = 0.0
-    total_int_lon_acc = 0.0
     num_batches = 0
     pbar = tqdm(
         dataloader,
@@ -108,7 +104,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
     )
 
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, intent_lat_labels, intent_lon_labels = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
             batch,
             feature_dim,
             device=device,
@@ -120,8 +116,6 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
             temporal_mask,
             fut,
             op_mask,
-            intent_lat_labels,
-            intent_lon_labels,
             device,
             return_components=True,
         )
@@ -134,10 +128,6 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
         total_loss += float(loss.item())
         total_vel_loss += float(loss_parts["loss_vel"].item())
         total_pos_loss += float(loss_parts["loss_pos"].item())
-        total_int_lat_loss += float(loss_parts["loss_int_lat"].item())
-        total_int_lon_loss += float(loss_parts["loss_int_lon"].item())
-        total_int_lat_acc += float(loss_parts["acc_int_lat"].item())
-        total_int_lon_acc += float(loss_parts["acc_int_lon"].item())
         num_batches += 1
 
         if is_main_process(rank):
@@ -147,10 +137,6 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
                     "avg_loss": f"{(total_loss / num_batches):.6f}",
                     "vel_loss": f"{(total_vel_loss / num_batches):.6f}",
                     "pos_loss": f"{(total_pos_loss / num_batches):.6f}",
-                    "lat_ce": f"{(total_int_lat_loss / num_batches):.6f}",
-                    "lon_ce": f"{(total_int_lon_loss / num_batches):.6f}",
-                    "lat_acc": f"{(total_int_lat_acc / num_batches):.4f}",
-                    "lon_acc": f"{(total_int_lon_acc / num_batches):.4f}",
                 }
             )
 
@@ -159,26 +145,18 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
             total_loss,
             total_vel_loss,
             total_pos_loss,
-            total_int_lat_loss,
-            total_int_lon_loss,
-            total_int_lat_acc,
-            total_int_lon_acc,
             float(num_batches),
         ],
         device=device,
         dtype=torch.float64,
     )
     stats = reduce_tensor(stats)
-    denom = max(int(stats[7].item()), 1)
+    denom = max(int(stats[3].item()), 1)
 
     return {
         "loss": float(stats[0].item()) / denom,
         "loss_vel": float(stats[1].item()) / denom,
         "loss_pos": float(stats[2].item()) / denom,
-        "loss_int_lat": float(stats[3].item()) / denom,
-        "loss_int_lon": float(stats[4].item()) / denom,
-        "acc_int_lat": float(stats[5].item()) / denom,
-        "acc_int_lon": float(stats[6].item()) / denom,
     }
 
 
@@ -194,10 +172,6 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
     total_loss = 0.0
     total_vel_loss = 0.0
     total_pos_loss = 0.0
-    total_int_lat_loss = 0.0
-    total_int_lon_loss = 0.0
-    total_int_lat_acc = 0.0
-    total_int_lon_acc = 0.0
     total_ade = 0.0
     total_fde = 0.0
     num_batches = 0
@@ -224,7 +198,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
         if num_batches >= target_batches:
             break
 
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, intent_lat_labels, intent_lon_labels = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
             batch,
             feature_dim,
             device=device,
@@ -236,8 +210,6 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
             temporal_mask,
             fut,
             op_mask,
-            intent_lat_labels,
-            intent_lon_labels,
             device,
             return_components=True,
         )
@@ -249,17 +221,11 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
             fut,
             op_mask,
             device,
-            intent_lat_labels=intent_lat_labels,
-            intent_lon_labels=intent_lon_labels,
         )
 
         total_loss += float(val_loss.item())
         total_vel_loss += float(val_parts["loss_vel"].item())
         total_pos_loss += float(val_parts["loss_pos"].item())
-        total_int_lat_loss += float(val_parts["loss_int_lat"].item())
-        total_int_lon_loss += float(val_parts["loss_int_lon"].item())
-        total_int_lat_acc += float(val_parts["acc_int_lat"].item())
-        total_int_lon_acc += float(val_parts["acc_int_lon"].item())
         total_ade += float(eval_ade.item())
         total_fde += float(eval_fde.item())
         num_batches += 1
@@ -270,10 +236,6 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
                     "val_loss": f"{(total_loss / num_batches):.6f}",
                     "val_vel": f"{(total_vel_loss / num_batches):.6f}",
                     "val_pos": f"{(total_pos_loss / num_batches):.6f}",
-                    "val_lat": f"{(total_int_lat_loss / num_batches):.6f}",
-                    "val_lon": f"{(total_int_lon_loss / num_batches):.6f}",
-                    "lat_acc": f"{(total_int_lat_acc / num_batches):.4f}",
-                    "lon_acc": f"{(total_int_lon_acc / num_batches):.4f}",
                     "avg_ade_ft": f"{(total_ade / num_batches):.4f}",
                     "avg_fde_ft": f"{(total_fde / num_batches):.4f}",
                 }
@@ -284,10 +246,6 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
             total_loss,
             total_vel_loss,
             total_pos_loss,
-            total_int_lat_loss,
-            total_int_lon_loss,
-            total_int_lat_acc,
-            total_int_lon_acc,
             total_ade,
             total_fde,
             float(num_batches),
@@ -298,17 +256,13 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
     stats = reduce_tensor(stats)
     fut_model.train()
 
-    denom = max(int(stats[9].item()), 1)
+    denom = max(int(stats[5].item()), 1)
     val_stats = {
         "loss": float(stats[0].item()) / denom,
         "loss_vel": float(stats[1].item()) / denom,
         "loss_pos": float(stats[2].item()) / denom,
-        "loss_int_lat": float(stats[3].item()) / denom,
-        "loss_int_lon": float(stats[4].item()) / denom,
-        "acc_int_lat": float(stats[5].item()) / denom,
-        "acc_int_lon": float(stats[6].item()) / denom,
     }
-    return val_stats, float(stats[7].item()) / denom, float(stats[8].item()) / denom
+    return val_stats, float(stats[3].item()) / denom, float(stats[4].item()) / denom
 
 
 def main():

@@ -3,58 +3,6 @@ import matplotlib.patches as patches
 import numpy as np
 import torch
 
-
-def format_intent_overlay(intent_lat_labels=None, intent_lon_labels=None, p_lat=None, p_lon=None, p_joint=None, batch_idx=0):
-    """格式化左上角意图文本。"""
-    lines = []
-    idx = int(batch_idx)
-    lat_names = {1: "keep", 2: "change-", 3: "change+"}
-    lon_names = {1: "keep", 2: "decel", 3: "accel"}
-
-    lat_arr = None if intent_lat_labels is None else (
-        intent_lat_labels.detach().cpu().numpy()
-        if isinstance(intent_lat_labels, torch.Tensor)
-        else np.asarray(intent_lat_labels)
-    )
-    lon_arr = None if intent_lon_labels is None else (
-        intent_lon_labels.detach().cpu().numpy()
-        if isinstance(intent_lon_labels, torch.Tensor)
-        else np.asarray(intent_lon_labels)
-    )
-    p_lat_arr = None if p_lat is None else (
-        p_lat.detach().cpu().numpy()
-        if isinstance(p_lat, torch.Tensor)
-        else np.asarray(p_lat)
-    )
-    p_lon_arr = None if p_lon is None else (
-        p_lon.detach().cpu().numpy()
-        if isinstance(p_lon, torch.Tensor)
-        else np.asarray(p_lon)
-    )
-    def format_prob_vector(prob_arr):
-        arr = np.asarray(prob_arr).reshape(-1)
-        return "[" + ", ".join(f"{float(v):.3f}" for v in arr) + "]"
-
-    first_line_parts = []
-    if lat_arr is not None and lon_arr is not None:
-        if lat_arr.ndim >= 1 and lon_arr.ndim >= 1 and idx < lat_arr.shape[0] and idx < lon_arr.shape[0]:
-            lat_val = int(np.asarray(lat_arr[idx]).reshape(-1)[0]) + 1
-            lon_val = int(np.asarray(lon_arr[idx]).reshape(-1)[0]) + 1
-            first_line_parts.append(
-                f"GT Intent: lat={lat_val}({lat_names.get(lat_val, '?')}), "
-                f"lon={lon_val}({lon_names.get(lon_val, '?')})"
-            )
-
-    if p_lat_arr is not None and p_lat_arr.ndim >= 2 and idx < p_lat_arr.shape[0]:
-        first_line_parts.append(f"lat'={format_prob_vector(p_lat_arr[idx])}")
-    if p_lon_arr is not None and p_lon_arr.ndim >= 2 and idx < p_lon_arr.shape[0]:
-        first_line_parts.append(f"lon'={format_prob_vector(p_lon_arr[idx])}")
-    if first_line_parts:
-        lines.append(", ".join(first_line_parts))
-
-    return lines
-
-
 def plot_traj_with_mask(hist_original, hist_masked, hist_pred, fig_num1=3, fig_num2=3, input_unit="ft"):
     """绘制 hist 重建结果：原始轨迹、掩码位置、预测轨迹。"""
     num_samples = len(hist_original)
@@ -133,8 +81,7 @@ def maybe_visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_t
 
 def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, future=None, pred=None,
                                  pred_all=None, pred_best_idx=None,
-                                 future_mask=None, batch_idx=0, metrics=None, input_unit="ft",
-                                 intent_overlay_lines=None):
+                                 future_mask=None, batch_idx=0, metrics=None, input_unit="ft"):
     """绘制 future 预测结果，支持单模态与多模态最佳轨迹高亮。"""
 
     def to_numpy(data):
@@ -343,17 +290,6 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
     ax.set_title(title)
     ax.set_xlabel(f"Lateral Position ({unit})")
     ax.set_ylabel(f"Longitudinal Position ({unit})")
-    if intent_overlay_lines:
-        ax.text(
-            0.02,
-            0.98,
-            "\n".join(intent_overlay_lines),
-            transform=ax.transAxes,
-            ha="left",
-            va="top",
-            fontsize=10,
-            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85, "edgecolor": "gray"},
-        )
     ax.legend(loc='best')
     ax.grid(True, alpha=0.3)
     ax.set_aspect('auto')
@@ -364,9 +300,7 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
 
 def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pred, valid_mask, stage,
                                       enable_train_vis=False, enable_eval_vis=False,
-                                      pred_all=None, pred_best_idx=None, meter_per_foot=0.3048, batch_idx=0,
-                                      intent_lat_labels=None, intent_lon_labels=None, p_lat=None, p_lon=None,
-                                      p_joint=None):
+                                      pred_all=None, pred_best_idx=None, meter_per_foot=0.3048, batch_idx=0):
     """按配置开关控制 future 预测可视化。"""
     if stage == "train":
         if not enable_train_vis:
@@ -384,14 +318,6 @@ def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pr
         "ADE(vis traj)": {"ft": vis_ade.item(), "m": vis_ade.item() * meter_per_foot},
         "FDE(vis traj)": {"ft": vis_fde.item(), "m": vis_fde.item() * meter_per_foot},
     }
-    intent_overlay_lines = format_intent_overlay(
-        intent_lat_labels=intent_lat_labels,
-        intent_lon_labels=intent_lon_labels,
-        p_lat=p_lat,
-        p_lon=p_lon,
-        p_joint=p_joint,
-        batch_idx=batch_idx,
-    )
 
     visualize_batch_trajectories(
         hist=hist,
@@ -405,5 +331,4 @@ def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pr
         batch_idx=batch_idx,
         metrics=metrics,
         input_unit="ft",
-        intent_overlay_lines=intent_overlay_lines,
     )

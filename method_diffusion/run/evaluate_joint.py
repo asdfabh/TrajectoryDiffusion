@@ -42,8 +42,6 @@ def prepare_joint_batch(batch, feature_dim, device="cuda"):
     cclass = batch["cclass"]
     fut = batch["fut"]
     op_mask = batch["op_mask"]
-    intent_lat_labels = batch["lat_enc"].argmax(dim=-1).long()
-    intent_lon_labels = batch["lon_enc"].argmax(dim=-1).long()
     hist_nbrs = batch["nbrs"]
     va_nbrs = batch["nbrs_va"]
     lane_nbrs = batch["nbrs_lane"]
@@ -68,9 +66,7 @@ def prepare_joint_batch(batch, feature_dim, device="cuda"):
     op_mask = op_mask.to(device)
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
-    intent_lat_labels = intent_lat_labels.to(device)
-    intent_lon_labels = intent_lon_labels.to(device)
-    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask, intent_lat_labels, intent_lon_labels
+    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
 
 
 def filter_valid_batch(batch):
@@ -155,7 +151,7 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, num_samples
     pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc="Eval Joint", ncols=140)
     for batch_idx, batch in pbar:
         batch = filter_valid_batch(batch)
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, intent_lat_labels, intent_lon_labels = prepare_joint_batch(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_joint_batch(
             batch,
             feature_dim,
             device=device,
@@ -175,8 +171,6 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, num_samples
                 op_mask,
                 device,
                 K=k_samples,
-                intent_lat_labels=intent_lat_labels,
-                intent_lon_labels=intent_lon_labels,
             )
         else:
             pred_fut, _, _ = model_fut.forwardEval(
@@ -187,8 +181,6 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, num_samples
                 fut,
                 op_mask,
                 device,
-                intent_lat_labels=intent_lat_labels,
-                intent_lon_labels=intent_lon_labels,
             )
         fut_metrics.update(pred_fut, fut, op_mask)
 
