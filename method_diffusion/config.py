@@ -56,7 +56,6 @@ def get_args_parser():
     parser.add_argument("--hidden_dim_fut", default=128, type=int)
     parser.add_argument("--input_dim_fut", default=2, type=int)
     parser.add_argument("--output_dim_fut", default=2, type=int)
-    parser.add_argument("--gaussian_param_dim_fut", default=5, type=int)
     parser.add_argument("--heads_fut", default=4, type=int)
     parser.add_argument("--depth_fut", default=3, type=int)
     parser.add_argument("--dropout_fut", default=0.1, type=float)

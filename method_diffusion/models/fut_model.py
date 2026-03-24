@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from torch import nn
 from diffusers.schedulers import DDIMScheduler
 
@@ -23,7 +24,6 @@ class DiffusionFut(nn.Module):
         self.mlp_ratio = int(args.mlp_ratio_fut)
         self.time_embedding_size = int(args.time_embedding_size_fut)
         self.T = int(args.T_f)
-        self.gaussian_param_dim = int(args.gaussian_param_dim_fut)
 
         # 扩散与推理参数：控制训练时间步、推理步数和 DDIM 采样行为。
         self.num_train_timesteps = int(args.num_train_timesteps_fut)
@@ -56,7 +56,7 @@ class DiffusionFut(nn.Module):
         )
 
         dit_block = dit.DiTBlock(self.hidden_dim, self.heads, self.dropout, self.mlp_ratio)
-        final_layer = dit.FinalLayer(self.hidden_dim, self.T, self.gaussian_param_dim)
+        final_layer = dit.FinalLayer(self.hidden_dim, self.T, self.output_dim)
         self.dit = dit.DiT(dit_block=dit_block, final_layer=final_layer, depth=self.depth, model_type="x_start")
 
         # 双空间归一化参数
@@ -74,21 +74,17 @@ class DiffusionFut(nn.Module):
     def toValidMask(op_mask, device):
         return (op_mask[..., 0] > 0.5).float().to(device)
 
-    # 基于当前噪声状态与历史条件预测二维高斯参数。
+    # 基于当前噪声状态与历史条件预测归一化速度。
     def predictX0(self, x_t, timesteps, context_aligned, pred_x0_cond):
         t_emb = self.timestep_embedder(timesteps)
         combined_input = torch.cat([x_t, pred_x0_cond], dim=-1)
         input_embedded = self.input_embedding(combined_input) + self.pos_embedding(x_t)
         context_encoded = self.context_embedding(context_aligned)
-        gaussian_raw = self.dit(
+        return self.dit(
             x=input_embedded,
             t_cond=t_emb,
             cross=context_encoded,
         )
-        mu = gaussian_raw[..., 0:2]
-        prec = torch.exp(gaussian_raw[..., 2:4])
-        rho = torch.tanh(gaussian_raw[..., 4:5])
-        return torch.cat([mu, prec, rho], dim=-1)
 
     def encodeContext(self, hist, hist_nbrs, mask, temporal_mask):
         hist_norm = self.normalize(hist)
@@ -96,87 +92,32 @@ class DiffusionFut(nn.Module):
         context, _ = self.hist_encoder(hist_norm, hist_nbrs_norm, mask, temporal_mask)
         return context
 
-    @staticmethod
-    def gaussianNllWithPrecision(pred_gaussian, target_xy, add_const_term=True):
-        mu_x = pred_gaussian[..., 0]
-        mu_y = pred_gaussian[..., 1]
-        prec_x = torch.clamp(pred_gaussian[..., 2], min=1e-6)
-        prec_y = torch.clamp(pred_gaussian[..., 3], min=1e-6)
-        rho = torch.clamp(pred_gaussian[..., 4], min=-0.99, max=0.99)
-        x = target_xy[..., 0]
-        y = target_xy[..., 1]
+    # 计算训练使用的速度损失与物理位置损失。
+    def computeLoss(self, pred_vel_norm, target_vel_norm, future_phys, anchor_phys, valid_mask, return_parts=False):
+        loss_vel = F.l1_loss(pred_vel_norm, target_vel_norm, reduction="none")
 
-        ohr = torch.rsqrt(1.0 - rho.pow(2) + 1e-6)
-        loss_nll = 0.5 * ohr.pow(2) * (
-            prec_x.pow(2) * (x - mu_x).pow(2)
-            + prec_y.pow(2) * (y - mu_y).pow(2)
-            - 2.0 * rho * prec_x * prec_y * (x - mu_x) * (y - mu_y)
-        ) - torch.log(prec_x * prec_y * ohr + 1e-6)
-        if add_const_term:
-            loss_nll = loss_nll - 1.8379
-        return loss_nll
+        std_vel = self.vel_std.view(1, 1, 2).to(pred_vel_norm.device)
+        mean_vel = self.vel_mean.view(1, 1, 2).to(pred_vel_norm.device)
+        pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
+        pred_pos_phys = torch.cumsum(pred_vel_phys, dim=1) + anchor_phys[..., :2]
+        loss_pos = F.l1_loss(pred_pos_phys, future_phys[..., :2], reduction="none")
+        total_loss = loss_vel + self.pos_loss_weight * loss_pos
 
-    def integrateGaussianToAbsolute(self, pred_gaussian, anchor_phys):
-        std_vel = self.vel_std.view(1, 1, 2).to(pred_gaussian.device)
-        mean_vel = self.vel_mean.view(1, 1, 2).to(pred_gaussian.device)
-
-        mu_vel_phys = pred_gaussian[..., 0:2] * std_vel + mean_vel
-        prec_vel = torch.clamp(pred_gaussian[..., 2:4], min=1e-6)
-        rho_vel = torch.clamp(pred_gaussian[..., 4:5], min=-0.99, max=0.99)
-
-        sigma_vel = std_vel / prec_vel
-        var_vel = sigma_vel.pow(2)
-        cov_vel = rho_vel * sigma_vel[..., 0:1] * sigma_vel[..., 1:2]
-
-        # 在当前实现里，各时间步增量只显式建模各自的二维边缘协方差；
-        # 积分到绝对位置时默认忽略跨时间协方差，只做前缀累加。
-        mu_pos_phys = torch.cumsum(mu_vel_phys, dim=1) + anchor_phys[..., :2]
-        var_pos_x = torch.cumsum(var_vel[..., 0:1], dim=1)
-        var_pos_y = torch.cumsum(var_vel[..., 1:2], dim=1)
-        cov_pos = torch.cumsum(cov_vel, dim=1)
-
-        sigma_pos_x = torch.sqrt(torch.clamp(var_pos_x, min=1e-6))
-        sigma_pos_y = torch.sqrt(torch.clamp(var_pos_y, min=1e-6))
-        rho_pos = cov_pos / torch.clamp(sigma_pos_x * sigma_pos_y, min=1e-6)
-        rho_pos = torch.clamp(rho_pos, min=-0.99, max=0.99)
-        prec_pos_x = 1.0 / sigma_pos_x
-        prec_pos_y = 1.0 / sigma_pos_y
-
-        pred_abs_gaussian = torch.cat(
-            [mu_pos_phys, prec_pos_x, prec_pos_y, rho_pos],
-            dim=-1,
-        )
-        return pred_abs_gaussian
-
-    # 计算训练使用的绝对坐标高斯 NLL；相对空间 NLL 仅作为诊断项保留。
-    def computeLoss(self, pred_gaussian, target_vel_norm, future_phys, anchor_phys, valid_mask, return_parts=False):
-        rel_nll = self.gaussianNllWithPrecision(
-            pred_gaussian,
-            target_vel_norm,
-            add_const_term=False,
-        )
-        pred_abs_gaussian = self.integrateGaussianToAbsolute(pred_gaussian, anchor_phys)
-        abs_nll = self.gaussianNllWithPrecision(
-            pred_abs_gaussian,
-            future_phys[..., :2],
-            add_const_term=True,
-        )
-
-        valid = valid_mask.float()
-        loss_rel_mean = (rel_nll * valid).sum() / (valid.sum() + 1e-6)
-        loss_abs_mean = (abs_nll * valid).sum() / (valid.sum() + 1e-6)
-        total_mean = loss_abs_mean
+        valid = valid_mask.unsqueeze(-1)
+        numer = (total_loss * valid).sum(dim=(1, 2))
+        denom = valid.sum(dim=(1, 2)) + 1e-6
+        total_mean = (numer / denom).mean()
 
         if not return_parts:
             return total_mean
 
+        vel_mean = ((loss_vel * valid).sum(dim=(1, 2)) / denom).mean()
+        pos_mean = ((loss_pos * valid).sum(dim=(1, 2)) / denom).mean()
         parts = {
             "loss_total": total_mean.detach(),
-            "loss_diffusion": loss_abs_mean.detach(),
-            "loss_vel": loss_rel_mean.detach(),
-            "loss_pos": loss_abs_mean.detach(),
-            "loss_rel_nll": loss_rel_mean.detach(),
-            "loss_abs_nll": loss_abs_mean.detach(),
+            "loss_diffusion": total_mean.detach(),
+            "loss_vel": vel_mean.detach(),
+            "loss_pos": pos_mean.detach(),
         }
         return total_mean, parts
 
@@ -196,21 +137,20 @@ class DiffusionFut(nn.Module):
     # 执行推理阶段的 DDIM 采样并输出最终预测结果（相对坐标系）。
     def sampleFromXt(self, x_t, context_aligned, infer_scheduler):
         bsz, t_len, _ = x_t.shape
-        pred_vel_cond = torch.zeros((bsz, t_len, self.input_dim), device=x_t.device, dtype=x_t.dtype)
+        pred_vel_cond = torch.zeros((bsz, t_len, self.output_dim), device=x_t.device, dtype=x_t.dtype)
         for t in infer_scheduler.timesteps:
             t_scalar = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
             timesteps = torch.full((bsz,), t_scalar, device=x_t.device, dtype=torch.long)
 
-            pred_gaussian = self.predictX0(x_t, timesteps, context_aligned, pred_vel_cond)
-            pred_vel_mean = pred_gaussian[..., 0:2]
+            pred_vel_norm = self.predictX0(x_t, timesteps, context_aligned, pred_vel_cond)
             if self.x0_clip is not None:
-                pred_vel_mean = torch.clamp(pred_vel_mean, -self.x0_clip, self.x0_clip)
+                pred_vel_norm = torch.clamp(pred_vel_norm, -self.x0_clip, self.x0_clip)
 
-            pred_vel_cond = pred_vel_mean.detach()
+            pred_vel_cond = pred_vel_norm.detach()
             try:
-                x_t = infer_scheduler.step(pred_vel_mean, t, x_t, eta=self.ddim_eta).prev_sample
+                x_t = infer_scheduler.step(pred_vel_norm, t, x_t, eta=self.ddim_eta).prev_sample
             except TypeError:
-                x_t = infer_scheduler.step(pred_vel_mean, t, x_t).prev_sample
+                x_t = infer_scheduler.step(pred_vel_norm, t, x_t).prev_sample
         return pred_vel_cond
 
     # 统一准备评估阶段所需的条件编码、掩码和调度器参数。
@@ -278,15 +218,14 @@ class DiffusionFut(nn.Module):
             use_sc = (torch.rand(bsz, 1, 1, device=device) < self.self_condition_prob).float()
             if use_sc.any():
                 with torch.no_grad():
-                    prev_pred_gaussian = self.predictX0(x_t, timesteps, context, pred_vel_cond)
-                pred_vel_cond = prev_pred_gaussian[..., 0:2].detach() * use_sc
+                    prev_pred_vel = self.predictX0(x_t, timesteps, context, pred_vel_cond)
+                pred_vel_cond = prev_pred_vel.detach() * use_sc
 
-        # 网络输出：预测的二维高斯分布参数
-        pred_gaussian_t = self.predictX0(x_t, timesteps, context, pred_vel_cond)
-        pred_vel_mean_t = pred_gaussian_t[..., 0:2]
+        # 网络输出：预测的归一化速度
+        pred_vel_norm_t = self.predictX0(x_t, timesteps, context, pred_vel_cond)
 
         diffusion_loss, loss_parts = self.computeLoss(
-            pred_gaussian_t,
+            pred_vel_norm_t,
             target_vel_norm,
             future_phys,
             anchor_phys,
@@ -302,7 +241,7 @@ class DiffusionFut(nn.Module):
         )
 
         if self.fut_enable_train_vis:
-            pred_vel_phys_t = pred_vel_mean_t * std_vel + mean_vel
+            pred_vel_phys_t = pred_vel_norm_t * std_vel + mean_vel
             pred_pos_phys = torch.cumsum(pred_vel_phys_t, dim=1) + anchor_phys[..., :2]
 
             # 兼容多维度输出拼接
