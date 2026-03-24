@@ -10,7 +10,6 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.models.hist_model import DiffusionPast
-from method_diffusion.dataset.HighD_dataset import HighDHistDataset
 from method_diffusion.dataset.ngsim_hist_dataset import NgsimHistDataset
 from method_diffusion.config import get_args_parser
 from method_diffusion.utils.mask_util import random_mask, continuous_mask
@@ -240,14 +239,15 @@ def main():
     print(f"Using device: {device}")
     print(f"[HistEval] Checkpoint dir: {args.checkpoint_dir}")
 
-    data_root = Path(args.data_root_highd if str(args.dataset).lower() == "highd" else args.data_root_ngsim)
+    dataset_name = str(args.dataset).lower()
+    data_root = Path(args.data_root_highd if dataset_name == "highd" else args.data_root_ngsim)
     test_path = data_root / "TestSet.mat"
     if not test_path.exists():
         test_path = data_root / "ValSet.mat"
-    print(f"[HistEval] Loading test data from: {test_path}")
+    print(f"[HistEval] Dataset: {dataset_name}")
+    print(f"[HistEval] Test path: {test_path}")
 
-    dataset_cls = HighDHistDataset if str(args.dataset).lower() == "highd" else NgsimHistDataset
-    test_dataset = dataset_cls(str(test_path), t_h=30, d_s=2)
+    test_dataset = NgsimHistDataset(str(test_path), t_h=30, d_s=2)
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,

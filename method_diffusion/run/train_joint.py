@@ -13,7 +13,6 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.config import get_args_parser
-from method_diffusion.dataset.HighD_dataset import HighDDataset
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.models.hist_model import DiffusionPast
@@ -397,12 +396,15 @@ def main():
     writer = SummaryWriter(log_dir=str(tensorboard_log_dir))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    data_root = Path(args.data_root_highd if str(args.dataset).lower() == "highd" else args.data_root_ngsim)
+    dataset_name = str(args.dataset).lower()
+    data_root = Path(args.data_root_highd if dataset_name == "highd" else args.data_root_ngsim)
     train_path = str(data_root / "TrainSet.mat")
     val_path = str(data_root / "ValSet.mat")
+    print(f"[JointTrain] Dataset: {dataset_name}")
+    print(f"[JointTrain] Train path: {train_path}")
+    print(f"[JointTrain] Val path: {val_path}")
 
-    dataset_cls = HighDDataset if str(args.dataset).lower() == "highd" else NgsimDataset
-    train_dataset = dataset_cls(
+    train_dataset = NgsimDataset(
         train_path,
         t_h=30,
         t_f=50,
@@ -410,7 +412,7 @@ def main():
         enc_size=args.encoder_input_dim,
         feature_dim=args.feature_dim,
     )
-    val_dataset = dataset_cls(
+    val_dataset = NgsimDataset(
         val_path,
         t_h=30,
         t_f=50,

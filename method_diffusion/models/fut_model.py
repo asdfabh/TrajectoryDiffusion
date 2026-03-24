@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 from torch import nn
 from diffusers.schedulers import DDIMScheduler
 
@@ -97,15 +96,15 @@ class DiffusionFut(nn.Module):
         context, _ = self.hist_encoder(hist_norm, hist_nbrs_norm, mask, temporal_mask)
         return context
 
-    # 计算训练使用的高斯 NLL 速度损失与物理位置损失。
-    def computeLoss(self, pred_gaussian, target_vel_norm, future_phys, anchor_phys, valid_mask, return_parts=False):
+    @staticmethod
+    def gaussianNllWithPrecision(pred_gaussian, target_xy, add_const_term=True):
         mu_x = pred_gaussian[..., 0]
         mu_y = pred_gaussian[..., 1]
-        prec_x = pred_gaussian[..., 2]
-        prec_y = pred_gaussian[..., 3]
+        prec_x = torch.clamp(pred_gaussian[..., 2], min=1e-6)
+        prec_y = torch.clamp(pred_gaussian[..., 3], min=1e-6)
         rho = torch.clamp(pred_gaussian[..., 4], min=-0.99, max=0.99)
-        x = target_vel_norm[..., 0]
-        y = target_vel_norm[..., 1]
+        x = target_xy[..., 0]
+        y = target_xy[..., 1]
 
         ohr = torch.rsqrt(1.0 - rho.pow(2) + 1e-6)
         loss_nll = 0.5 * ohr.pow(2) * (
@@ -113,32 +112,71 @@ class DiffusionFut(nn.Module):
             + prec_y.pow(2) * (y - mu_y).pow(2)
             - 2.0 * rho * prec_x * prec_y * (x - mu_x) * (y - mu_y)
         ) - torch.log(prec_x * prec_y * ohr + 1e-6)
+        if add_const_term:
+            loss_nll = loss_nll - 1.8379
+        return loss_nll
 
-        # 积分回物理位置域 (宏观绝对约束)
+    def integrateGaussianToAbsolute(self, pred_gaussian, anchor_phys):
         std_vel = self.vel_std.view(1, 1, 2).to(pred_gaussian.device)
         mean_vel = self.vel_mean.view(1, 1, 2).to(pred_gaussian.device)
 
-        pred_vel_phys = pred_gaussian[..., :2] * std_vel + mean_vel
-        pred_pos_phys = torch.cumsum(pred_vel_phys, dim=1) + anchor_phys[..., :2]
+        mu_vel_phys = pred_gaussian[..., 0:2] * std_vel + mean_vel
+        prec_vel = torch.clamp(pred_gaussian[..., 2:4], min=1e-6)
+        rho_vel = torch.clamp(pred_gaussian[..., 4:5], min=-0.99, max=0.99)
 
-        # 物理空间位置损失：在绝对坐标空间计算逐元素 L1 误差
-        loss_pos = F.l1_loss(pred_pos_phys, future_phys[..., :2], reduction="none")
+        sigma_vel = std_vel / prec_vel
+        var_vel = sigma_vel.pow(2)
+        cov_vel = rho_vel * sigma_vel[..., 0:1] * sigma_vel[..., 1:2]
 
-        # 损失函数指标计算：仅在有效帧上平均，避免无效帧稀释梯度
+        # 在当前实现里，各时间步增量只显式建模各自的二维边缘协方差；
+        # 积分到绝对位置时默认忽略跨时间协方差，只做前缀累加。
+        mu_pos_phys = torch.cumsum(mu_vel_phys, dim=1) + anchor_phys[..., :2]
+        var_pos_x = torch.cumsum(var_vel[..., 0:1], dim=1)
+        var_pos_y = torch.cumsum(var_vel[..., 1:2], dim=1)
+        cov_pos = torch.cumsum(cov_vel, dim=1)
+
+        sigma_pos_x = torch.sqrt(torch.clamp(var_pos_x, min=1e-6))
+        sigma_pos_y = torch.sqrt(torch.clamp(var_pos_y, min=1e-6))
+        rho_pos = cov_pos / torch.clamp(sigma_pos_x * sigma_pos_y, min=1e-6)
+        rho_pos = torch.clamp(rho_pos, min=-0.99, max=0.99)
+        prec_pos_x = 1.0 / sigma_pos_x
+        prec_pos_y = 1.0 / sigma_pos_y
+
+        pred_abs_gaussian = torch.cat(
+            [mu_pos_phys, prec_pos_x, prec_pos_y, rho_pos],
+            dim=-1,
+        )
+        return pred_abs_gaussian
+
+    # 计算训练使用的绝对坐标高斯 NLL；相对空间 NLL 仅作为诊断项保留。
+    def computeLoss(self, pred_gaussian, target_vel_norm, future_phys, anchor_phys, valid_mask, return_parts=False):
+        rel_nll = self.gaussianNllWithPrecision(
+            pred_gaussian,
+            target_vel_norm,
+            add_const_term=False,
+        )
+        pred_abs_gaussian = self.integrateGaussianToAbsolute(pred_gaussian, anchor_phys)
+        abs_nll = self.gaussianNllWithPrecision(
+            pred_abs_gaussian,
+            future_phys[..., :2],
+            add_const_term=True,
+        )
+
         valid = valid_mask.float()
-        valid_xy = valid.unsqueeze(-1)
-        loss_vel_mean = (loss_nll * valid).sum() / (valid.sum() + 1e-6)
-        loss_pos_mean = (loss_pos * valid_xy).sum() / (valid_xy.sum() + 1e-6)
-        total_mean = loss_vel_mean + self.pos_loss_weight * loss_pos_mean
+        loss_rel_mean = (rel_nll * valid).sum() / (valid.sum() + 1e-6)
+        loss_abs_mean = (abs_nll * valid).sum() / (valid.sum() + 1e-6)
+        total_mean = loss_abs_mean
 
         if not return_parts:
             return total_mean
 
         parts = {
             "loss_total": total_mean.detach(),
-            "loss_diffusion": loss_vel_mean.detach(),
-            "loss_vel": loss_vel_mean.detach(),
-            "loss_pos": loss_pos_mean.detach(),
+            "loss_diffusion": loss_abs_mean.detach(),
+            "loss_vel": loss_rel_mean.detach(),
+            "loss_pos": loss_abs_mean.detach(),
+            "loss_rel_nll": loss_rel_mean.detach(),
+            "loss_abs_nll": loss_abs_mean.detach(),
         }
         return total_mean, parts
 

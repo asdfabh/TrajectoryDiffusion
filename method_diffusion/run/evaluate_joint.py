@@ -9,7 +9,6 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.config import get_args_parser
-from method_diffusion.dataset.HighD_dataset import HighDDataset
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.models.hist_model import DiffusionPast
@@ -110,13 +109,14 @@ def resolve_hist_checkpoint_dir(resume_hist):
 
 
 def build_test_loader(args):
-    data_root = Path(args.data_root_highd if str(args.dataset).lower() == "highd" else args.data_root_ngsim)
+    dataset_name = str(args.dataset).lower()
+    data_root = Path(args.data_root_highd if dataset_name == "highd" else args.data_root_ngsim)
     test_path = data_root / "TestSet.mat"
     if not test_path.exists():
         test_path = data_root / "ValSet.mat"
-    print(f"[JointEval] Loading test data from: {test_path}")
-    dataset_cls = HighDDataset if str(args.dataset).lower() == "highd" else NgsimDataset
-    test_dataset = dataset_cls(
+    print(f"[JointEval] Dataset: {dataset_name}")
+    print(f"[JointEval] Test path: {test_path}")
+    test_dataset = NgsimDataset(
         str(test_path),
         t_h=30,
         t_f=50,
