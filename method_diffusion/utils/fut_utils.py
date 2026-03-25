@@ -3,7 +3,7 @@ import inspect
 import torch
 
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
-from method_diffusion.utils.mask_util import continuous_mask, random_mask
+from method_diffusion.utils.mask_util import mixed_mask
 
 
 def build_ngsim_dataset(mat_path, args):
@@ -24,16 +24,25 @@ def build_ngsim_dataset(mat_path, args):
     return NgsimDataset(mat_path, **filtered)
 
 
-def build_hist_mask(hist, mask_type="random", mask_prob=0.4):
-    """为 joint 评估构造历史观测掩码。"""
-    if mask_type == "random":
-        return random_mask(hist, p=mask_prob)
-    if mask_type == "block":
-        return continuous_mask(hist, p=mask_prob)
-    return random_mask(hist, p=mask_prob)
+def build_hist_mask(hist, mask_ratio=0.4, random_mask_ratio=0.7, block_mask_start=False):
+    """为 future / joint 工具构造历史观测掩码。"""
+    return mixed_mask(
+        hist,
+        p=mask_ratio,
+        random_ratio=random_mask_ratio,
+        block_start=block_mask_start,
+    )
 
 
-def prepare_fut_batch(batch, feature_dim, device="cuda", include_hist_mask=False, mask_type="random", mask_prob=0.4):
+def prepare_fut_batch(
+    batch,
+    feature_dim,
+    device="cuda",
+    include_hist_mask=False,
+    mask_ratio=0.4,
+    random_mask_ratio=0.7,
+    block_mask_start=False,
+):
     """整理 future 分支所需的 batch 字段。"""
     if int(feature_dim) != 4:
         raise ValueError("future 分支当前仅支持 feature_dim=4: [rel_x, rel_y, v, a]。")
@@ -55,7 +64,12 @@ def prepare_fut_batch(batch, feature_dim, device="cuda", include_hist_mask=False
     }
 
     if include_hist_mask:
-        hist_mask = build_hist_mask(hist, mask_type=mask_type, mask_prob=mask_prob).to(device)
+        hist_mask = build_hist_mask(
+            hist,
+            mask_ratio=mask_ratio,
+            random_mask_ratio=random_mask_ratio,
+            block_mask_start=block_mask_start,
+        ).to(device)
         hist_masked = torch.cat((hist_mask * hist, hist_mask), dim=-1).to(device)
         prepared["hist_mask"] = hist_mask
         prepared["hist_masked"] = hist_masked

@@ -104,7 +104,9 @@ def train_epoch(
     epoch,
     feature_dim,
     rank,
-    mask_prob,
+    mask_ratio,
+    random_mask_ratio,
+    block_mask_start,
     freeze_hist,
     hist_loss_weight,
     detach_hist_for_fut,
@@ -140,7 +142,9 @@ def train_epoch(
         loss_hist, hist_for_fut = build_hist_outputs(
             model_hist=model_hist,
             hist=hist,
-            mask_prob=mask_prob,
+            mask_ratio=mask_ratio,
+            random_mask_ratio=random_mask_ratio,
+            block_mask_start=block_mask_start,
             device=device,
             freeze_hist=freeze_hist,
             detach_hist_for_fut=detach_hist_for_fut,
@@ -213,7 +217,7 @@ def train_epoch(
 
 
 @torch.no_grad()
-def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval_ratio, rank, mask_prob):
+def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval_ratio, rank, mask_ratio, random_mask_ratio, block_mask_start):
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
@@ -261,7 +265,9 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval
         _, hist_for_fut = build_hist_outputs(
             model_hist=model_hist,
             hist=hist,
-            mask_prob=mask_prob,
+            mask_ratio=mask_ratio,
+            random_mask_ratio=random_mask_ratio,
+            block_mask_start=block_mask_start,
             device=device,
             freeze_hist=True,
             detach_hist_for_fut=True,
@@ -387,6 +393,9 @@ def main():
             model_fut = DDP(model_fut, find_unused_parameters=False)
 
     eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
+    mask_ratio = max(0.0, min(1.0, float(args.mask_prob)))
+    random_mask_ratio = max(0.0, min(1.0, float(args.random_mask_ratio)))
+    block_mask_start = int(args.block_mask_start) > 0
 
     if is_main_process(rank):
         print(
@@ -409,7 +418,9 @@ def main():
             epoch=epoch + 1,
             feature_dim=args.feature_dim,
             rank=rank,
-            mask_prob=args.mask_prob,
+            mask_ratio=mask_ratio,
+            random_mask_ratio=random_mask_ratio,
+            block_mask_start=block_mask_start,
             freeze_hist=freeze_hist,
             hist_loss_weight=hist_loss_weight,
             detach_hist_for_fut=detach_hist_for_fut,
@@ -423,7 +434,9 @@ def main():
             feature_dim=args.feature_dim,
             eval_ratio=eval_ratio,
             rank=rank,
-            mask_prob=args.mask_prob,
+            mask_ratio=mask_ratio,
+            random_mask_ratio=random_mask_ratio,
+            block_mask_start=block_mask_start,
         )
 
         if is_main_process(rank):

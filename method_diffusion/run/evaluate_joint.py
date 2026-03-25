@@ -24,14 +24,11 @@ from method_diffusion.run.evaluate_fut import (
 )
 from method_diffusion.run.train_joint import JOINT_FUT_CHECKPOINT_DIR, JOINT_HIST_CHECKPOINT_DIR
 from method_diffusion.utils.fut_utils import TrajectoryMetrics
-from method_diffusion.utils.mask_util import random_mask, continuous_mask
+from method_diffusion.utils.mask_util import mixed_mask
 
 
 def get_eval_args():
-    parser = get_args_parser()
-    parser.add_argument("--hist_eval_mask_type", default="random", type=str)
-    parser.add_argument("--hist_eval_mask_prob", default=0.5, type=float)
-    return parser.parse_args()
+    return get_args_parser().parse_args()
 
 
 def prepare_joint_batch(batch, feature_dim, device="cuda"):
@@ -85,13 +82,13 @@ def filter_valid_batch(batch):
     return filtered
 
 
-def build_hist_mask(hist, mask_type, mask_prob):
-    if mask_type == "random":
-        hist_mask = random_mask(hist, p=mask_prob)
-    elif mask_type == "block":
-        hist_mask = continuous_mask(hist, p=mask_prob)
-    else:
-        hist_mask = random_mask(hist, p=mask_prob)
+def build_hist_mask(hist, mask_ratio, random_mask_ratio, block_mask_start):
+    hist_mask = mixed_mask(
+        hist,
+        p=mask_ratio,
+        random_ratio=random_mask_ratio,
+        block_start=block_mask_start,
+    )
     hist_mask = hist_mask.to(hist.device)
     hist_masked = torch.cat([hist_mask * hist, hist_mask], dim=-1)
     return hist_masked, hist_mask
@@ -137,7 +134,7 @@ def build_test_loader(args):
 
 
 @torch.no_grad()
-def evaluate(model_hist, model_fut, dataloader, device, feature_dim, num_samples, hist_mask_type, hist_mask_prob):
+def evaluate(model_hist, model_fut, dataloader, device, feature_dim, num_samples, mask_ratio, random_mask_ratio, block_mask_start):
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
@@ -157,7 +154,7 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, num_samples
             device=device,
         )
 
-        hist_masked, hist_mask = build_hist_mask(hist, hist_mask_type, hist_mask_prob)
+        hist_masked, hist_mask = build_hist_mask(hist, mask_ratio, random_mask_ratio, block_mask_start)
         _, pred_hist = model_hist.forward_eval(hist, hist_masked, device)
         hist_metrics.update(pred_hist, hist, hist_mask)
 
@@ -194,12 +191,12 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, num_samples
         })
 
         if batch_idx % 100 == 0:
-            print_hist_metrics(hist_summary, f"Joint Hist Iteration {batch_idx}", hist_mask_type, hist_mask_prob)
+            print_hist_metrics(hist_summary, f"Joint Hist Iteration {batch_idx}", mask_ratio, random_mask_ratio, block_mask_start)
             print_fut_metrics(fut_summary, f"Joint Fut Iteration {batch_idx}")
 
     final_hist = hist_metrics.summary()
     final_fut = fut_metrics.summary()
-    print_hist_metrics(final_hist, "Joint Hist Reconstruction Result", hist_mask_type, hist_mask_prob)
+    print_hist_metrics(final_hist, "Joint Hist Reconstruction Result", mask_ratio, random_mask_ratio, block_mask_start)
     print_fut_metrics(final_fut, "Joint Fut Prediction Result")
     return final_hist, final_fut
 
@@ -227,8 +224,9 @@ def main():
         device=device,
         feature_dim=args.feature_dim,
         num_samples=args.num_samples,
-        hist_mask_type=str(args.hist_eval_mask_type).lower(),
-        hist_mask_prob=float(args.hist_eval_mask_prob),
+        mask_ratio=max(0.0, min(1.0, float(args.mask_prob))),
+        random_mask_ratio=max(0.0, min(1.0, float(args.random_mask_ratio))),
+        block_mask_start=int(args.block_mask_start) > 0,
     )
 
 

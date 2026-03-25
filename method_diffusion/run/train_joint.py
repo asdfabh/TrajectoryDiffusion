@@ -16,7 +16,7 @@ from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.models.hist_model import DiffusionPast
-from method_diffusion.utils.mask_util import random_mask
+from method_diffusion.utils.mask_util import mixed_mask
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 HIST_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "hist"
@@ -59,8 +59,13 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
 
 
-def build_hist_masked(hist, mask_prob):
-    hist_mask = random_mask(hist, p=mask_prob).to(hist.device)
+def build_hist_masked(hist, mask_ratio, random_mask_ratio, block_mask_start):
+    hist_mask = mixed_mask(
+        hist,
+        p=mask_ratio,
+        random_ratio=random_mask_ratio,
+        block_start=block_mask_start,
+    ).to(hist.device)
     hist_masked_val = hist_mask * hist
     return torch.cat([hist_masked_val, hist_mask], dim=-1)
 
@@ -201,9 +206,14 @@ def write_csv_log(csv_path, epoch, train_stats, eval_ade, eval_fde, lr_fut, lr_h
         writer.writerow(row)
 
 
-def build_hist_outputs(model_hist, hist, mask_prob, device, freeze_hist, detach_hist_for_fut):
+def build_hist_outputs(model_hist, hist, mask_ratio, random_mask_ratio, block_mask_start, device, freeze_hist, detach_hist_for_fut):
     hist_model = model_hist.module if hasattr(model_hist, "module") else model_hist
-    hist_masked = build_hist_masked(hist, mask_prob=mask_prob)
+    hist_masked = build_hist_masked(
+        hist,
+        mask_ratio=mask_ratio,
+        random_mask_ratio=random_mask_ratio,
+        block_mask_start=block_mask_start,
+    )
 
     if freeze_hist:
         with torch.no_grad():
@@ -230,7 +240,9 @@ def train_epoch(
     device,
     epoch,
     feature_dim,
-    mask_prob,
+    mask_ratio,
+    random_mask_ratio,
+    block_mask_start,
     freeze_hist,
     hist_loss_weight,
     detach_hist_for_fut,
@@ -259,7 +271,9 @@ def train_epoch(
         loss_hist, hist_for_fut = build_hist_outputs(
             model_hist=model_hist,
             hist=hist,
-            mask_prob=mask_prob,
+            mask_ratio=mask_ratio,
+            random_mask_ratio=random_mask_ratio,
+            block_mask_start=block_mask_start,
             device=device,
             freeze_hist=freeze_hist,
             detach_hist_for_fut=detach_hist_for_fut,
@@ -316,7 +330,7 @@ def train_epoch(
 
 
 @torch.no_grad()
-def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval_ratio, mask_prob):
+def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval_ratio, mask_ratio, random_mask_ratio, block_mask_start):
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
@@ -352,7 +366,9 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval
         _, hist_for_fut = build_hist_outputs(
             model_hist=model_hist,
             hist=hist,
-            mask_prob=mask_prob,
+            mask_ratio=mask_ratio,
+            random_mask_ratio=random_mask_ratio,
+            block_mask_start=block_mask_start,
             device=device,
             freeze_hist=True,
             detach_hist_for_fut=True,
@@ -462,6 +478,9 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
     start_epoch, best_ade = load_fut_checkpoint(args, model_fut, optimizer, scheduler, device)
     eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
+    mask_ratio = max(0.0, min(1.0, float(args.mask_prob)))
+    random_mask_ratio = max(0.0, min(1.0, float(args.random_mask_ratio)))
+    block_mask_start = int(args.block_mask_start) > 0
 
     print(
         f"[JointTrain] freeze_hist={freeze_hist} | "
@@ -479,7 +498,9 @@ def main():
             device=device,
             epoch=epoch + 1,
             feature_dim=args.feature_dim,
-            mask_prob=args.mask_prob,
+            mask_ratio=mask_ratio,
+            random_mask_ratio=random_mask_ratio,
+            block_mask_start=block_mask_start,
             freeze_hist=freeze_hist,
             hist_loss_weight=hist_loss_weight,
             detach_hist_for_fut=detach_hist_for_fut,
@@ -492,7 +513,9 @@ def main():
             epoch=epoch + 1,
             feature_dim=args.feature_dim,
             eval_ratio=eval_ratio,
-            mask_prob=args.mask_prob,
+            mask_ratio=mask_ratio,
+            random_mask_ratio=random_mask_ratio,
+            block_mask_start=block_mask_start,
         )
 
         write_csv_log(log_csv_path, epoch + 1, train_stats, eval_ade, eval_fde, fut_lr, hist_lr)

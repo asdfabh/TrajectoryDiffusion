@@ -15,12 +15,10 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.ngsim_hist_dataset import NgsimHistDataset
 from method_diffusion.models.hist_model import DiffusionPast
-from method_diffusion.utils.mask_util import random_mask, continuous_mask
+from method_diffusion.utils.mask_util import mixed_mask
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 HIST_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "hist"
-TRAIN_BLOCK_MASK_RATIO = 0.3
-VAL_MASK_TYPE = "random"
 
 
 def resolve_resume_checkpoint(resume_arg, checkpoint_dir):
@@ -140,24 +138,16 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     return hist
 
 
-def build_hist_mask(hist, mask_type, mask_prob):
-    if mask_type == "random":
-        return random_mask(hist, p=mask_prob)
-    if mask_type == "block":
-        return continuous_mask(hist, p=mask_prob)
-    print(f"[HistModel] Unknown mask type '{mask_type}', fallback to random.")
-    return random_mask(hist, p=mask_prob)
-
-
-def build_masked_history(hist, mask_type, mask_prob):
-    hist_mask = build_hist_mask(hist, mask_type=mask_type, mask_prob=mask_prob)
+def build_masked_history(hist, mask_ratio, random_mask_ratio, block_mask_start):
+    hist_mask = mixed_mask(
+        hist,
+        p=mask_ratio,
+        random_ratio=random_mask_ratio,
+        block_start=block_mask_start,
+    )
     hist_masked_value = hist_mask * hist
     hist_masked = torch.cat([hist_masked_value, hist_mask], dim=-1)
     return hist_masked, hist_mask
-
-
-def sample_train_mask_type():
-    return "block" if torch.rand(1).item() < TRAIN_BLOCK_MASK_RATIO else "random"
 
 
 def compute_masked_xy_ade(pred, target, hist_mask):
@@ -168,7 +158,7 @@ def compute_masked_xy_ade(pred, target, hist_mask):
     return xy_dist[masked].mean()
 
 
-def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, mask_prob):
+def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, mask_ratio, random_mask_ratio, block_mask_start):
     model.train()
     total_stats = {
         "loss_total": 0.0,
@@ -186,8 +176,12 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, mask_p
         if hist.shape[0] == 0:
             continue
 
-        mask_type = sample_train_mask_type()
-        hist_masked, _ = build_masked_history(hist, mask_type=mask_type, mask_prob=mask_prob)
+        hist_masked, _ = build_masked_history(
+            hist,
+            mask_ratio=mask_ratio,
+            random_mask_ratio=random_mask_ratio,
+            block_mask_start=block_mask_start,
+        )
         loss, pred, loss_parts = model.forward_train(hist, hist_masked, device, return_components=True)
         masked_ade = compute_masked_xy_ade(pred, hist, hist_masked[..., -1:])
         # _, _, _, _ = model.forward_train(hist, hist_masked, device)
@@ -214,7 +208,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, mask_p
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, mask_prob):
+def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, mask_ratio, random_mask_ratio, block_mask_start):
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
@@ -244,7 +238,12 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, mask_pro
         if hist.shape[0] == 0:
             continue
 
-        hist_masked, hist_mask = build_masked_history(hist, mask_type=VAL_MASK_TYPE, mask_prob=mask_prob)
+        hist_masked, hist_mask = build_masked_history(
+            hist,
+            mask_ratio=mask_ratio,
+            random_mask_ratio=random_mask_ratio,
+            block_mask_start=block_mask_start,
+        )
         loss, pred = model.forward_eval(hist, hist_masked, device)
         masked_ade = compute_masked_xy_ade(pred, hist, hist_mask)
 
@@ -318,10 +317,33 @@ def main():
 
     start_epoch, best_loss = load_checkpoint(args, model, optimizer, scheduler, device)
     eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
+    mask_ratio = max(0.0, min(1.0, float(args.mask_prob)))
+    random_mask_ratio = max(0.0, min(1.0, float(args.random_mask_ratio)))
+    block_mask_start = int(args.block_mask_start) > 0
 
     for epoch in range(start_epoch, args.num_epochs):
-        train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim, args.mask_prob)
-        eval_stats = evaluate(model, val_loader, device, epoch + 1, args.feature_dim, eval_ratio, args.mask_prob)
+        train_stats = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            epoch + 1,
+            args.feature_dim,
+            mask_ratio,
+            random_mask_ratio,
+            block_mask_start,
+        )
+        eval_stats = evaluate(
+            model,
+            val_loader,
+            device,
+            epoch + 1,
+            args.feature_dim,
+            eval_ratio,
+            mask_ratio,
+            random_mask_ratio,
+            block_mask_start,
+        )
         current_lr = optimizer.param_groups[0]["lr"]
 
         write_csv_log(log_csv_path, epoch + 1, train_stats, eval_stats, current_lr)
@@ -341,6 +363,8 @@ def main():
             f"xy_k={train_stats['loss_xy_known']:.6f} | "
             f"va_u={train_stats['loss_va_unknown']:.6f} | "
             f"va_k={train_stats['loss_va_known']:.6f} | "
+            f"mask_ratio={mask_ratio:.2f} | "
+            f"rand_ratio={random_mask_ratio:.2f} | "
             f"val_loss={eval_stats['loss']:.6f} | "
             f"mask_ade={eval_stats['masked_ade_ft']:.4f}ft"
         )
