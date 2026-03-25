@@ -115,32 +115,26 @@ def load_checkpoint(model, resume_arg, checkpoint_dir, device, model_name="Model
 
 
 class HistReconstructionMetrics:
-    def __init__(self, meter_per_foot=METER_PER_FOOT, hist_dt=0.2):
+    def __init__(self, meter_per_foot=METER_PER_FOOT):
         self.meter_per_foot = float(meter_per_foot)
-        self.hist_dt = float(hist_dt)
+        self.regions = ("all", "unmasked", "masked")
 
-        self.xy_dist_sum = {"all": 0.0, "known": 0.0, "masked": 0.0}
-        self.xy_point_count = {"all": 0.0, "known": 0.0, "masked": 0.0}
-        self.xy_coord_se = {"all": 0.0, "known": 0.0, "masked": 0.0}
-        self.xy_coord_count = {"all": 0.0, "known": 0.0, "masked": 0.0}
+        self.xy_dist_sum = {key: 0.0 for key in self.regions}
+        self.xy_point_count = {key: 0.0 for key in self.regions}
+        self.xy_coord_se = {key: 0.0 for key in self.regions}
+        self.xy_coord_count = {key: 0.0 for key in self.regions}
 
-        self.va_coord_se = {key: torch.zeros(2, dtype=torch.float64) for key in ("all", "known", "masked")}
-        self.va_point_count = {"all": 0.0, "known": 0.0, "masked": 0.0}
-
-        self.dxy_coord_se = 0.0
-        self.dxy_coord_count = 0.0
-        self.v_cons_se = 0.0
-        self.v_cons_count = 0.0
-        self.a_cons_se = 0.0
-        self.a_cons_count = 0.0
+        self.va_abs_sum = {key: torch.zeros(2, dtype=torch.float64) for key in self.regions}
+        self.va_coord_se = {key: torch.zeros(2, dtype=torch.float64) for key in self.regions}
+        self.va_point_count = {key: 0.0 for key in self.regions}
 
     def update(self, pred, target, mask):
         pred = pred.detach()
         target = target.detach()
-        known = (mask[..., 0] > 0.5)
-        masked = ~known
-        all_mask = torch.ones_like(known, dtype=torch.bool)
-        region_masks = {"all": all_mask, "known": known, "masked": masked}
+        unmasked = (mask[..., 0] > 0.5)
+        masked = ~unmasked
+        all_mask = torch.ones_like(unmasked, dtype=torch.bool)
+        region_masks = {"all": all_mask, "unmasked": unmasked, "masked": masked}
 
         xy_diff = pred[..., :2] - target[..., :2]
         xy_dist = torch.norm(xy_diff, dim=-1)
@@ -157,23 +151,10 @@ class HistReconstructionMetrics:
             va_diff = pred[..., 2:4] - target[..., 2:4]
             for region, region_mask in region_masks.items():
                 region_float = region_mask.float()
-                self.va_coord_se[region] += torch.sum((va_diff ** 2) * region_float.unsqueeze(-1), dim=(0, 1)).double().cpu()
+                coord_mask = region_float.unsqueeze(-1)
+                self.va_abs_sum[region] += torch.sum(torch.abs(va_diff) * coord_mask, dim=(0, 1)).double().cpu()
+                self.va_coord_se[region] += torch.sum((va_diff ** 2) * coord_mask, dim=(0, 1)).double().cpu()
                 self.va_point_count[region] += float(region_float.sum().item())
-
-            pair_mask = torch.maximum(masked[:, 1:].float(), masked[:, :-1].float())
-            pred_dxy = pred[:, 1:, :2] - pred[:, :-1, :2]
-            target_dxy = target[:, 1:, :2] - target[:, :-1, :2]
-            self.dxy_coord_se += float((((pred_dxy - target_dxy) ** 2) * pair_mask.unsqueeze(-1)).sum().item())
-            self.dxy_coord_count += float(pair_mask.sum().item() * 2.0)
-
-            pred_v = pred[..., 2]
-            pred_a = pred[..., 3]
-            pred_v_from_y = pred_dxy[..., 1] / self.hist_dt
-            pred_a_from_v = (pred_v[:, 1:] - pred_v[:, :-1]) / self.hist_dt
-            self.v_cons_se += float((((pred_v_from_y - pred_v[:, 1:]) ** 2) * pair_mask).sum().item())
-            self.v_cons_count += float(pair_mask.sum().item())
-            self.a_cons_se += float((((pred_a_from_v - pred_a[:, 1:]) ** 2) * pair_mask).sum().item())
-            self.a_cons_count += float(pair_mask.sum().item())
 
     @staticmethod
     def safe_div(numerator, denominator):
@@ -182,53 +163,56 @@ class HistReconstructionMetrics:
     def summary(self):
         xy_ade_m = {}
         xy_rmse_m = {}
-        for region in ("all", "known", "masked"):
+        for region in self.regions:
             xy_ade_ft = self.safe_div(self.xy_dist_sum[region], self.xy_point_count[region])
             xy_rmse_ft = self.safe_div(self.xy_coord_se[region], self.xy_coord_count[region]) ** 0.5
             xy_ade_m[region] = xy_ade_ft * self.meter_per_foot
             xy_rmse_m[region] = xy_rmse_ft * self.meter_per_foot
 
+        va_l1 = {}
         va_rmse = {}
-        for region in ("all", "known", "masked"):
+        for region in self.regions:
             point_count = self.va_point_count[region]
             if point_count > 0:
+                l1_ft = self.va_abs_sum[region] / point_count
                 rmse_ft = torch.sqrt(self.va_coord_se[region] / point_count)
+                va_l1[region] = (l1_ft * self.meter_per_foot).tolist()
                 va_rmse[region] = (rmse_ft * self.meter_per_foot).tolist()
             else:
+                va_l1[region] = [0.0, 0.0]
                 va_rmse[region] = [0.0, 0.0]
+
+        xy_ade_m["known"] = xy_ade_m["unmasked"]
+        xy_rmse_m["known"] = xy_rmse_m["unmasked"]
+        va_l1["known"] = va_l1["unmasked"]
+        va_rmse["known"] = va_rmse["unmasked"]
 
         return {
             "xy_ade_m": xy_ade_m,
             "xy_rmse_m": xy_rmse_m,
-            "dxy_rmse_m": self.safe_div(self.dxy_coord_se, self.dxy_coord_count) ** 0.5 * self.meter_per_foot,
-            "v_cons_rmse_mps": self.safe_div(self.v_cons_se, self.v_cons_count) ** 0.5 * self.meter_per_foot,
-            "a_cons_rmse_mps2": self.safe_div(self.a_cons_se, self.a_cons_count) ** 0.5 * self.meter_per_foot,
+            "va_l1": va_l1,
             "va_rmse": va_rmse,
         }
 
 
 def print_metrics(summary, title, mask_type, mask_prob):
-    print('\n' + '=' * 28 + f' {title} ' + '=' * 28)
+    print('\n' + '=' * 20 + f' {title} ' + '=' * 20)
     print(f"Mask Type: {mask_type} | Mask Probability: {mask_prob:.4f}")
     print(f"Masked XY ADE (m): {summary['xy_ade_m']['masked']:.6f}")
     print(f"Masked XY RMSE (m): {summary['xy_rmse_m']['masked']:.6f}")
-    print('-' * 90)
+    print('-' * 96)
     print(f"{'XY Region':<12} | {'ADE (m)':<12} | {'RMSE (m)':<12}")
-    print('-' * 90)
+    print('-' * 96)
     print(f"{'All':<12} | {summary['xy_ade_m']['all']:<12.6f} | {summary['xy_rmse_m']['all']:<12.6f}")
-    print(f"{'Known':<12} | {summary['xy_ade_m']['known']:<12.6f} | {summary['xy_rmse_m']['known']:<12.6f}")
+    print(f"{'Unmasked':<12} | {summary['xy_ade_m']['unmasked']:<12.6f} | {summary['xy_rmse_m']['unmasked']:<12.6f}")
     print(f"{'Masked':<12} | {summary['xy_ade_m']['masked']:<12.6f} | {summary['xy_rmse_m']['masked']:<12.6f}")
-    print('-' * 90)
-    print(f"{'VA Region':<12} | {'V RMSE (m/s)':<16} | {'A RMSE (m/s^2)':<16}")
-    print('-' * 90)
-    print(f"{'All':<12} | {summary['va_rmse']['all'][0]:<16.6f} | {summary['va_rmse']['all'][1]:<16.6f}")
-    print(f"{'Known':<12} | {summary['va_rmse']['known'][0]:<16.6f} | {summary['va_rmse']['known'][1]:<16.6f}")
-    print(f"{'Masked':<12} | {summary['va_rmse']['masked'][0]:<16.6f} | {summary['va_rmse']['masked'][1]:<16.6f}")
-    print('-' * 90)
-    print(f"Masked dXY RMSE (m): {summary['dxy_rmse_m']:.6f}")
-    print(f"V Consistency RMSE (m/s): {summary['v_cons_rmse_mps']:.6f}")
-    print(f"A Consistency RMSE (m/s^2): {summary['a_cons_rmse_mps2']:.6f}")
-    print('=' * 90)
+    print('-' * 96)
+    print(f"{'VA Region':<12} | {'V L1 (m/s)':<14} | {'V RMSE (m/s)':<16} | {'A L1 (m/s^2)':<16} | {'A RMSE (m/s^2)':<16}")
+    print('-' * 96)
+    print(f"{'All':<12} | {summary['va_l1']['all'][0]:<14.6f} | {summary['va_rmse']['all'][0]:<16.6f} | {summary['va_l1']['all'][1]:<16.6f} | {summary['va_rmse']['all'][1]:<16.6f}")
+    print(f"{'Unmasked':<12} | {summary['va_l1']['unmasked'][0]:<14.6f} | {summary['va_rmse']['unmasked'][0]:<16.6f} | {summary['va_l1']['unmasked'][1]:<16.6f} | {summary['va_rmse']['unmasked'][1]:<16.6f}")
+    print(f"{'Masked':<12} | {summary['va_l1']['masked'][0]:<14.6f} | {summary['va_rmse']['masked'][0]:<16.6f} | {summary['va_l1']['masked'][1]:<16.6f} | {summary['va_rmse']['masked'][1]:<16.6f}")
+    print('=' * 96)
 
 
 def main():
@@ -259,12 +243,12 @@ def main():
 
     model = DiffusionPast(args).to(device)
     load_checkpoint(model, args.resume_hist, args.checkpoint_dir, device, model_name="HistModel")
-    metrics = HistReconstructionMetrics(hist_dt=getattr(model, "hist_dt", 0.2))
+    metrics = HistReconstructionMetrics()
     eval_mask_type = str(args.hist_eval_mask_type).lower()
     eval_mask_prob = float(args.hist_eval_mask_prob)
 
     with torch.no_grad():
-        pbar = tqdm(enumerate(test_loader, start=1), total=len(test_loader), desc="Eval Hist Recon", ncols=120)
+        pbar = tqdm(enumerate(test_loader, start=1), total=len(test_loader), desc="Eval Hist Recon", dynamic_ncols=True)
 
         for batch_idx, batch in pbar:
             batch = filter_valid_batch(batch)
@@ -282,6 +266,8 @@ def main():
             pbar.set_postfix({
                 "xy_mask_ade": f"{summary['xy_ade_m']['masked']:.4f}",
                 "xy_mask_rmse": f"{summary['xy_rmse_m']['masked']:.4f}",
+                "v_mask_l1": f"{summary['va_l1']['masked'][0]:.4f}",
+                "a_mask_l1": f"{summary['va_l1']['masked'][1]:.4f}",
             })
 
             if batch_idx % 100 == 0:

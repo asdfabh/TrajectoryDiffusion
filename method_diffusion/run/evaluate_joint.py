@@ -144,7 +144,7 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, num_samples
 
     model_hist.eval()
     model_fut.eval()
-    hist_metrics = HistReconstructionMetrics(hist_dt=getattr(model_hist, "hist_dt", 0.2))
+    hist_metrics = HistReconstructionMetrics()
     fut_metrics = TrajectoryMetrics(model_fut.T)
     k_samples = max(1, int(num_samples))
 

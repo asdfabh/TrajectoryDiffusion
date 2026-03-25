@@ -7,23 +7,6 @@ from method_diffusion.utils.position_encoding import SequentialPositionalEncodin
 from method_diffusion.utils.visualization import maybe_visualize_hist_reconstruction
 
 
-_HIST_NORMALIZATION_PRESETS = {
-    "ngsim": {
-        "pos_mean": [0.049275586306451916, -37.23250272465904],
-        "pos_std": [0.8998403636714408, 33.7460443040218],
-        "va_mean": [24.77257929333611, 0.08585249191100579],
-        "va_std": [14.214159448243082, 4.626550411651881],
-    },
-    # highD 先保留占位值，收到统计参数后直接替换这一组常量即可。
-    "highd": {
-        "pos_mean": [-0.03517636323581014, -127.6782104010702],
-        "pos_std": [0.8697201631848155, 89.44988951201532],
-        "va_mean": [85.15262720834814, -0.060102165990297766],
-        "va_std": [24.390956800543215, 1.0738574975912054],
-    },
-}
-
-
 class DiffusionPast(nn.Module):
 
     def __init__(self, args):
@@ -66,32 +49,26 @@ class DiffusionPast(nn.Module):
             model_type="x_start"
         )
 
-        norm_params = self.load_normalization_params()
-        self.register_buffer("pos_mean", norm_params["pos_mean"], persistent=False)
-        self.register_buffer("pos_std", norm_params["pos_std"], persistent=False)
-        self.register_buffer("va_mean", norm_params["va_mean"], persistent=False)
-        self.register_buffer("va_std", norm_params["va_std"], persistent=False)
+        if self.dataset_name == "ngsim":
+            self.register_buffer("pos_mean", torch.tensor([0.049275586306451916, -37.23250272465904], dtype=torch.float32), persistent=False)
+            self.register_buffer("pos_std", torch.tensor([0.8998403636714408, 33.7460443040218], dtype=torch.float32), persistent=False)
+            self.register_buffer("va_mean", torch.tensor([24.77257929333611, 0.08585249191100579], dtype=torch.float32), persistent=False)
+            self.register_buffer("va_std", torch.tensor([14.214159448243082, 4.626550411651881], dtype=torch.float32), persistent=False)
+        elif self.dataset_name == "highd":
+            self.register_buffer("pos_mean", torch.tensor([-0.03517636323581014, -127.6782104010702], dtype=torch.float32), persistent=False)
+            self.register_buffer("pos_std", torch.tensor([0.8697201631848155, 89.44988951201532], dtype=torch.float32), persistent=False)
+            self.register_buffer("va_mean", torch.tensor([85.15262720834814, -0.060102165990297766], dtype=torch.float32), persistent=False)
+            self.register_buffer("va_std", torch.tensor([24.390956800543215, 1.0738574975912054], dtype=torch.float32), persistent=False)
+        else:
+            raise ValueError(
+                f"Unsupported dataset '{self.dataset_name}' for hist normalization. Supported: highd, ngsim"
+            )
         self.hist_dt = 0.2  # NGSIM 10Hz and current hist pipeline uses d_s=2.
         self.loss_weights = {
-            "xy_unknown": 1.00,
-            "xy_known": 0.20,
-            "va_unknown": 0.45,
-            "va_known": 0.10,
-            "dxy": 0.00,
-            "v_cons": 0.00,
-            "a_cons": 0.00,
-        }
-
-    def load_normalization_params(self):
-        params = _HIST_NORMALIZATION_PRESETS.get(self.dataset_name)
-        if params is None:
-            supported = ", ".join(sorted(_HIST_NORMALIZATION_PRESETS.keys()))
-            raise ValueError(
-                f"Unsupported dataset '{self.dataset_name}' for hist normalization. Supported: {supported}"
-            )
-        return {
-            key: torch.tensor(value, dtype=torch.float32)
-            for key, value in params.items()
+            "xy_unknown": 1.50,
+            "xy_known": 0.40,
+            "va_unknown": 1.0,
+            "va_known": 0.20,
         }
 
     def masked_l1(self, pred, target, mask=None):
@@ -115,44 +92,14 @@ class DiffusionPast(nn.Module):
 
         loss_xy_unknown = self.masked_l1(pred[..., :2], target[..., :2], unknown_mask)
         loss_xy_known = self.masked_l1(pred[..., :2], target[..., :2], known_mask)
-
-        zero = pred.new_tensor(0.0)
-        loss_va_unknown = zero
-        loss_va_known = zero
-        loss_dxy = zero
-        loss_v_cons = zero
-        loss_a_cons = zero
-
-        if pred.shape[-1] >= 4:
-            loss_va_unknown = self.masked_l1(pred[..., 2:4], target[..., 2:4], unknown_mask)
-            loss_va_known = self.masked_l1(pred[..., 2:4], target[..., 2:4], known_mask)
-
-            pred_phys = self.denorm(pred)
-            target_phys = self.denorm(target)
-
-            pred_dxy = pred_phys[:, 1:, :2] - pred_phys[:, :-1, :2]
-            target_dxy = target_phys[:, 1:, :2] - target_phys[:, :-1, :2]
-            pair_unknown = torch.maximum(unknown_mask[:, 1:, :], unknown_mask[:, :-1, :])
-            # loss_dxy: 约束相邻时刻的位置增量 delta(x, y) 与 GT 一致，衡量局部轨迹形状是否平滑且正确。
-            loss_dxy = self.masked_l1(pred_dxy, target_dxy, pair_unknown)
-
-            pred_v = pred_phys[..., 2]
-            pred_a = pred_phys[..., 3]
-            pred_v_from_y = pred_dxy[..., 1] / self.hist_dt
-            pred_a_from_v = (pred_v[:, 1:] - pred_v[:, :-1]) / self.hist_dt
-            # loss_v_cons: 用位置序列的纵向差分速度约束输出 v，衡量预测位置与预测速度是否自洽。
-            loss_v_cons = self.masked_l1(pred_v_from_y, pred_v[:, 1:], None)
-            # loss_a_cons: 用速度序列的一阶差分约束输出 a，衡量预测速度与预测加速度是否自洽。
-            loss_a_cons = self.masked_l1(pred_a_from_v, pred_a[:, 1:], None)
+        loss_va_unknown = self.masked_l1(pred[..., 2:4], target[..., 2:4], unknown_mask)
+        loss_va_known = self.masked_l1(pred[..., 2:4], target[..., 2:4], known_mask)
 
         total_loss = (
             self.loss_weights["xy_unknown"] * loss_xy_unknown
             + self.loss_weights["xy_known"] * loss_xy_known
             + self.loss_weights["va_unknown"] * loss_va_unknown
             + self.loss_weights["va_known"] * loss_va_known
-            + self.loss_weights["dxy"] * loss_dxy
-            + self.loss_weights["v_cons"] * loss_v_cons
-            + self.loss_weights["a_cons"] * loss_a_cons
         )
 
         if not return_parts:
@@ -164,9 +111,6 @@ class DiffusionPast(nn.Module):
             "loss_xy_known": loss_xy_known.detach(),
             "loss_va_unknown": loss_va_unknown.detach(),
             "loss_va_known": loss_va_known.detach(),
-            "loss_dxy": loss_dxy.detach(),
-            "loss_v_cons": loss_v_cons.detach(),
-            "loss_a_cons": loss_a_cons.detach(),
         }
         return total_loss, parts
 

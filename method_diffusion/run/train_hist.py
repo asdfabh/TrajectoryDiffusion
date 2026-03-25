@@ -76,9 +76,6 @@ def init_csv_log(csv_path):
         "train_xy_known",
         "train_va_unknown",
         "train_va_known",
-        "train_dxy",
-        "train_v_cons",
-        "train_a_cons",
         "val_loss",
         "val_masked_ade_ft",
         "val_masked_ade_m",
@@ -97,9 +94,6 @@ def write_csv_log(csv_path, epoch, train_stats, eval_stats, lr):
         "train_xy_known": train_stats["loss_xy_known"],
         "train_va_unknown": train_stats["loss_va_unknown"],
         "train_va_known": train_stats["loss_va_known"],
-        "train_dxy": train_stats["loss_dxy"],
-        "train_v_cons": train_stats["loss_v_cons"],
-        "train_a_cons": train_stats["loss_a_cons"],
         "val_loss": eval_stats["loss"],
         "val_masked_ade_ft": eval_stats["masked_ade_ft"],
         "val_masked_ade_m": eval_stats["masked_ade_ft"] * 0.3048,
@@ -182,9 +176,6 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, mask_p
         "loss_xy_known": 0.0,
         "loss_va_unknown": 0.0,
         "loss_va_known": 0.0,
-        "loss_dxy": 0.0,
-        "loss_v_cons": 0.0,
-        "loss_a_cons": 0.0,
     }
     num_batches = 0
 
@@ -215,7 +206,6 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, mask_p
             "avg_loss": f"{(total_stats['loss_total'] / num_batches):.6f}",
             "xy_u": f"{(total_stats['loss_xy_unknown'] / num_batches):.5f}",
             "va_u": f"{(total_stats['loss_va_unknown'] / num_batches):.5f}",
-            "dxy": f"{(total_stats['loss_dxy'] / num_batches):.5f}",
             "mask_ade": f"{masked_ade.item():.4f}",
         })
 
@@ -341,9 +331,6 @@ def main():
         writer.add_scalar("Loss/TrainXYKnown", train_stats["loss_xy_known"], epoch + 1)
         writer.add_scalar("Loss/TrainVAUnknown", train_stats["loss_va_unknown"], epoch + 1)
         writer.add_scalar("Loss/TrainVAKnown", train_stats["loss_va_known"], epoch + 1)
-        writer.add_scalar("Loss/TrainDXY", train_stats["loss_dxy"], epoch + 1)
-        writer.add_scalar("Loss/TrainVConsistency", train_stats["loss_v_cons"], epoch + 1)
-        writer.add_scalar("Loss/TrainAConsistency", train_stats["loss_a_cons"], epoch + 1)
         writer.add_scalar("Eval/Loss", eval_stats["loss"], epoch + 1)
         writer.add_scalar("Eval/MaskedADE_ft", eval_stats["masked_ade_ft"], epoch + 1)
 
