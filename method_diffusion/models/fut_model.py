@@ -9,10 +9,33 @@ from method_diffusion.utils.position_encoding import SequentialPositionalEncodin
 from method_diffusion.utils.visualization import maybe_visualize_future_prediction
 
 
+_FUT_NORMALIZATION_PRESETS = {
+    "ngsim": {
+        "pos_mean": [0.05076411229651117, -31.318518632454474],
+        "pos_std": [9.67614343193339, 59.53730335210165],
+        "va_mean": [21.150308365503957, 0.006041414014469039],
+        "va_std": [13.598306447881924, 4.505736504111998],
+        "vel_mean": [-0.004181504611623526, 5.041936610524995],
+        "vel_std": [0.1502223350250087, 2.951254134709027],
+    },
+    # highD 先保留占位值，收到统计参数后直接替换这一组常量即可。
+    "highd": {
+        "pos_mean": [-0.39106148272179536, -115.63853904936501],
+        "pos_std": [9.266579303046143, 98.49671326349531],
+        "va_mean": [78.09292302772707, -0.04991240184019581],
+        "va_std": [29.215909315170098, 1.1700240860076556],
+        "vel_mean": [0.004845835373614644, 17.01558226555126],
+        "vel_std": [0.10621210903901461, 4.838376260255577],
+    },
+}
+
+
 class DiffusionFut(nn.Module):
 
     def __init__(self, args):
         super(DiffusionFut, self).__init__()
+        self.args = args
+        self.dataset_name = str(getattr(args, "dataset", "ngsim")).strip().lower()
 
         # 模型结构参数：控制 DiT 主干维度、层数和 future 序列长度。
         self.hidden_dim = int(args.hidden_dim_fut)
@@ -59,15 +82,28 @@ class DiffusionFut(nn.Module):
         final_layer = dit.FinalLayer(self.hidden_dim, self.T, self.output_dim)
         self.dit = dit.DiT(dit_block=dit_block, final_layer=final_layer, depth=self.depth, model_type="x_start")
 
+        norm_params = self.loadNormalizationParams()
         # 双空间归一化参数
         # 物理坐标归一化参数 (给历史轨迹编码和宏观位置 Loss 使用)
-        self.register_buffer("pos_mean", torch.tensor([0.0330, -15.9150]).float(), persistent=False)
-        self.register_buffer("pos_std", torch.tensor([8.8866, 68.8105]).float(), persistent=False)
-        self.register_buffer("va_mean", torch.tensor([21.1503, 0.0060]).float(), persistent=False)
-        self.register_buffer("va_std", torch.tensor([13.5983, 4.5057]).float(), persistent=False)
+        self.register_buffer("pos_mean", norm_params["pos_mean"], persistent=False)
+        self.register_buffer("pos_std", norm_params["pos_std"], persistent=False)
+        self.register_buffer("va_mean", norm_params["va_mean"], persistent=False)
+        self.register_buffer("va_std", norm_params["va_std"], persistent=False)
         # 帧间相对位移归一化参数 (Velocity)
-        self.register_buffer("vel_mean", torch.tensor([-0.004182, 5.041937], dtype=torch.float32).float(), persistent=False)
-        self.register_buffer("vel_std", torch.tensor([0.150222, 2.951254], dtype=torch.float32).float(), persistent=False)
+        self.register_buffer("vel_mean", norm_params["vel_mean"], persistent=False)
+        self.register_buffer("vel_std", norm_params["vel_std"], persistent=False)
+
+    def loadNormalizationParams(self):
+        params = _FUT_NORMALIZATION_PRESETS.get(self.dataset_name)
+        if params is None:
+            supported = ", ".join(sorted(_FUT_NORMALIZATION_PRESETS.keys()))
+            raise ValueError(
+                f"Unsupported dataset '{self.dataset_name}' for fut normalization. Supported: {supported}"
+            )
+        return {
+            key: torch.tensor(value, dtype=torch.float32)
+            for key, value in params.items()
+        }
 
     # 将输出通道掩码转换为按时间步的有效帧掩码。
     @staticmethod

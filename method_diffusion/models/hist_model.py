@@ -6,12 +6,31 @@ import torch.nn.functional as F
 from method_diffusion.utils.position_encoding import SequentialPositionalEncoding
 from method_diffusion.utils.visualization import maybe_visualize_hist_reconstruction
 
+
+_HIST_NORMALIZATION_PRESETS = {
+    "ngsim": {
+        "pos_mean": [0.049275586306451916, -37.23250272465904],
+        "pos_std": [0.8998403636714408, 33.7460443040218],
+        "va_mean": [24.77257929333611, 0.08585249191100579],
+        "va_std": [14.214159448243082, 4.626550411651881],
+    },
+    # highD 先保留占位值，收到统计参数后直接替换这一组常量即可。
+    "highd": {
+        "pos_mean": [-0.03517636323581014, -127.6782104010702],
+        "pos_std": [0.8697201631848155, 89.44988951201532],
+        "va_mean": [85.15262720834814, -0.060102165990297766],
+        "va_std": [24.390956800543215, 1.0738574975912054],
+    },
+}
+
+
 class DiffusionPast(nn.Module):
 
     def __init__(self, args):
         super(DiffusionPast, self).__init__()
         # Net parameters
         self.args = args
+        self.dataset_name = str(getattr(args, "dataset", "ngsim")).strip().lower()
         self.feature_dim = 2 * int(args.feature_dim) + 1  # 输入特征维度 default: 6 (x, y, v, a, laneID, class)
         self.input_dim = int(args.input_dim)   # 输入到Dit的维度 default: 128
         self.hidden_dim = int(args.hidden_dim)
@@ -47,10 +66,11 @@ class DiffusionPast(nn.Module):
             model_type="x_start"
         )
 
-        self.register_buffer("pos_mean", torch.tensor([0.0507, -40.6957]).float(), persistent=False)
-        self.register_buffer("pos_std", torch.tensor([0.9411, 34.7048]).float(), persistent=False)
-        self.register_buffer("va_mean", torch.tensor([27.0654, 0.1219]).float(), persistent=False)
-        self.register_buffer("va_std", torch.tensor([13.8077, 4.6976]).float(), persistent=False)
+        norm_params = self.load_normalization_params()
+        self.register_buffer("pos_mean", norm_params["pos_mean"], persistent=False)
+        self.register_buffer("pos_std", norm_params["pos_std"], persistent=False)
+        self.register_buffer("va_mean", norm_params["va_mean"], persistent=False)
+        self.register_buffer("va_std", norm_params["va_std"], persistent=False)
         self.hist_dt = 0.2  # NGSIM 10Hz and current hist pipeline uses d_s=2.
         self.loss_weights = {
             "xy_unknown": 1.00,
@@ -60,6 +80,18 @@ class DiffusionPast(nn.Module):
             "dxy": 0.00,
             "v_cons": 0.00,
             "a_cons": 0.00,
+        }
+
+    def load_normalization_params(self):
+        params = _HIST_NORMALIZATION_PRESETS.get(self.dataset_name)
+        if params is None:
+            supported = ", ".join(sorted(_HIST_NORMALIZATION_PRESETS.keys()))
+            raise ValueError(
+                f"Unsupported dataset '{self.dataset_name}' for hist normalization. Supported: {supported}"
+            )
+        return {
+            key: torch.tensor(value, dtype=torch.float32)
+            for key, value in params.items()
         }
 
     def masked_l1(self, pred, target, mask=None):
