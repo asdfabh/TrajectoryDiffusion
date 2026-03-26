@@ -20,6 +20,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
 BEST_MODEL_ADE_WEIGHT = 1.0
 BEST_MODEL_FDE_WEIGHT = 0.5
+LOSS_STAT_KEYS = [
+    "loss",
+    "loss_vel",
+    "loss_pos",
+    "loss_intent",
+    "loss_bridge",
+]
 
 
 def compute_selection_score(eval_ade, eval_fde):
@@ -73,9 +80,13 @@ def write_csv_log(csv_path, epoch, train_stats, val_stats, eval_ade, eval_fde, s
         "train_loss": train_stats["loss"],
         "train_vel_loss": train_stats["loss_vel"],
         "train_pos_loss": train_stats["loss_pos"],
+        "train_loss_intent": train_stats["loss_intent"],
+        "train_loss_bridge": train_stats["loss_bridge"],
         "val_loss": val_stats["loss"],
         "val_vel_loss": val_stats["loss_vel"],
         "val_pos_loss": val_stats["loss_pos"],
+        "val_loss_intent": val_stats["loss_intent"],
+        "val_loss_bridge": val_stats["loss_bridge"],
         "val_ade_ft": eval_ade,
         "val_fde_ft": eval_fde,
         "val_ade_m": eval_ade * 0.3048,
@@ -94,9 +105,13 @@ def init_csv_log(csv_path):
         "train_loss",
         "train_vel_loss",
         "train_pos_loss",
+        "train_loss_intent",
+        "train_loss_bridge",
         "val_loss",
         "val_vel_loss",
         "val_pos_loss",
+        "val_loss_intent",
+        "val_loss_bridge",
         "val_ade_ft",
         "val_fde_ft",
         "val_ade_m",
@@ -111,11 +126,7 @@ def init_csv_log(csv_path):
 
 # 返回统一格式的空损失统计。
 def build_zero_loss_stats():
-    return {
-        "loss": 0.0,
-        "loss_vel": 0.0,
-        "loss_pos": 0.0,
-    }
+    return {key: 0.0 for key in LOSS_STAT_KEYS}
 
 
 # 将训练和验证指标统一写入 TensorBoard。
@@ -123,9 +134,13 @@ def write_tensorboard_log(writer, epoch, train_stats, val_stats, eval_ade, eval_
     writer.add_scalar("Loss/Train", train_stats["loss"], epoch)
     writer.add_scalar("Loss/TrainVel", train_stats["loss_vel"], epoch)
     writer.add_scalar("Loss/TrainPos", train_stats["loss_pos"], epoch)
+    writer.add_scalar("Loss/TrainIntent", train_stats["loss_intent"], epoch)
+    writer.add_scalar("Loss/TrainBridge", train_stats["loss_bridge"], epoch)
     writer.add_scalar("Loss/Val", val_stats["loss"], epoch)
     writer.add_scalar("Loss/ValVel", val_stats["loss_vel"], epoch)
     writer.add_scalar("Loss/ValPos", val_stats["loss_pos"], epoch)
+    writer.add_scalar("Loss/ValIntent", val_stats["loss_intent"], epoch)
+    writer.add_scalar("Loss/ValBridge", val_stats["loss_bridge"], epoch)
     writer.add_scalar("Eval/ADE_ft", eval_ade, epoch)
     writer.add_scalar("Eval/FDE_ft", eval_fde, epoch)
     writer.add_scalar("Eval/SelectionScore_ft", selection_score, epoch)
@@ -139,9 +154,13 @@ def print_eval_summary(epoch, total_epochs, train_stats, val_stats, eval_ade, ev
         f"train={train_stats['loss']:.6f} | "
         f"train_vel={train_stats['loss_vel']:.6f} | "
         f"train_pos={train_stats['loss_pos']:.6f} | "
+        f"train_intent={train_stats['loss_intent']:.6f} | "
+        f"train_bridge={train_stats['loss_bridge']:.6f} | "
         f"val={val_stats['loss']:.6f} | "
         f"val_vel={val_stats['loss_vel']:.6f} | "
         f"val_pos={val_stats['loss_pos']:.6f} | "
+        f"val_intent={val_stats['loss_intent']:.6f} | "
+        f"val_bridge={val_stats['loss_bridge']:.6f} | "
         f"ade={eval_ade:.4f}ft | "
         f"fde={eval_fde:.4f}ft | "
         f"score={selection_score:.4f}"
@@ -161,6 +180,8 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     cclass_nbrs = batch["nbrs_class"]
     mask = batch["mask"]
     temporal_mask = batch["temporal_mask"]
+    lat_enc = batch["lat_enc"]
+    lon_enc = batch["lon_enc"]
 
     if feature_dim == 6:
         hist = torch.cat((hist, va, lane, cclass), dim=-1).to(device)
@@ -179,14 +200,14 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     op_mask = op_mask.to(device)
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
-    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
+    lat_enc = lat_enc.to(device)
+    lon_enc = lon_enc.to(device)
+    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc
 
 # 执行单个训练 epoch 并汇总平均损失。
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
     model.train()
-    total_loss = 0.0
-    total_vel_loss = 0.0
-    total_pos_loss = 0.0
+    totals = {key: 0.0 for key in LOSS_STAT_KEYS}
     num_batches = 0
     pbar = tqdm(
         dataloader,
@@ -196,7 +217,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
     )
 
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc = prepare_input_data(
             batch,
             feature_dim,
             device=device,
@@ -209,6 +230,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
             fut,
             op_mask,
             device,
+            lat_enc=lat_enc,
+            lon_enc=lon_enc,
             return_components=True,
         )
         optimizer.zero_grad()
@@ -216,23 +239,21 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        total_loss += float(loss.item())
-        total_vel_loss += float(loss_parts["loss_vel"].item())
-        total_pos_loss += float(loss_parts["loss_pos"].item())
+        totals["loss"] += float(loss.item())
+        for key in LOSS_STAT_KEYS:
+            if key == "loss":
+                continue
+            totals[key] += float(loss_parts[key].item())
         num_batches += 1
         pbar.set_postfix({
             "loss": f"{loss.item():.6f}",
-            "avg_loss": f"{(total_loss / num_batches):.6f}",
-            "vel_loss": f"{(total_vel_loss / num_batches):.6f}",
-            "pos_loss": f"{(total_pos_loss / num_batches):.6f}",
+            "avg_loss": f"{(totals['loss'] / num_batches):.6f}",
+            "intent": f"{(totals['loss_intent'] / num_batches):.6f}",
+            "bridge": f"{(totals['loss_bridge'] / num_batches):.6f}",
         })
 
     denom = max(num_batches, 1)
-    return {
-        "loss": total_loss / denom,
-        "loss_vel": total_vel_loss / denom,
-        "loss_pos": total_pos_loss / denom,
-    }
+    return {key: totals[key] / denom for key in LOSS_STAT_KEYS}
 
 @torch.no_grad()
 # 按验证集比例评估模型并返回平均指标。
@@ -243,9 +264,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio):
         torch.cuda.manual_seed_all(42)
 
     model.eval()
-    total_loss = 0.0
-    total_vel_loss = 0.0
-    total_pos_loss = 0.0
+    totals = {key: 0.0 for key in LOSS_STAT_KEYS}
     total_ade = 0.0
     total_fde = 0.0
     num_batches = 0
@@ -264,7 +283,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio):
     for batch in pbar:
         if num_batches >= target_batches:
             break
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc = prepare_input_data(
             batch,
             feature_dim,
             device=device,
@@ -277,6 +296,8 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio):
             fut,
             op_mask,
             device,
+            lat_enc=lat_enc,
+            lon_enc=lon_enc,
             return_components=True,
         )
         _, eval_ade, eval_fde = model.forwardEval(
@@ -289,16 +310,18 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio):
             device,
         )
 
-        total_loss += float(val_loss.item())
-        total_vel_loss += float(val_parts["loss_vel"].item())
-        total_pos_loss += float(val_parts["loss_pos"].item())
+        totals["loss"] += float(val_loss.item())
+        for key in LOSS_STAT_KEYS:
+            if key == "loss":
+                continue
+            totals[key] += float(val_parts[key].item())
         total_ade += float(eval_ade.item())
         total_fde += float(eval_fde.item())
         num_batches += 1
         pbar.set_postfix({
-            "val_loss": f"{(total_loss / num_batches):.6f}",
-            "val_vel": f"{(total_vel_loss / num_batches):.6f}",
-            "val_pos": f"{(total_pos_loss / num_batches):.6f}",
+            "val_loss": f"{(totals['loss'] / num_batches):.6f}",
+            "val_intent": f"{(totals['loss_intent'] / num_batches):.6f}",
+            "val_bridge": f"{(totals['loss_bridge'] / num_batches):.6f}",
             "avg_ade_ft": f"{(total_ade / num_batches):.4f}",
             "avg_fde_ft": f"{(total_fde / num_batches):.4f}",
         })
@@ -308,11 +331,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio):
         return build_zero_loss_stats(), 0.0, 0.0
 
     denom = float(num_batches)
-    val_stats = {
-        "loss": total_loss / denom,
-        "loss_vel": total_vel_loss / denom,
-        "loss_pos": total_pos_loss / denom,
-    }
+    val_stats = {key: totals[key] / denom for key in LOSS_STAT_KEYS}
     return val_stats, total_ade / denom, total_fde / denom
 
 

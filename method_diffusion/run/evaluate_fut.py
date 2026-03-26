@@ -30,6 +30,8 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     cclass_nbrs = batch["nbrs_class"]
     mask = batch["mask"]
     temporal_mask = batch["temporal_mask"]
+    lat_enc = batch["lat_enc"]
+    lon_enc = batch["lon_enc"]
 
     if feature_dim == 6:
         hist = torch.cat((hist, va, lane, cclass), dim=-1).to(device)
@@ -48,7 +50,9 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     op_mask = op_mask.to(device)
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
-    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
+    lat_enc = lat_enc.to(device)
+    lon_enc = lon_enc.to(device)
+    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc
 
 # 解析 fut checkpoint 标识并返回实际文件路径。
 def resolve_checkpoint_path(resume_arg, checkpoint_dir):
@@ -76,14 +80,18 @@ def load_checkpoint(model, resume_arg, checkpoint_dir, device):
     return model
 
 # 按 TAME 风格打印阶段性评估摘要。
-def print_metrics(metrics, title):
+def print_metrics(metrics, title, intent_metrics=None, metric_name="Future"):
     time_pairs = [("1s", 4), ("2s", 9), ("3s", 14), ("4s", 19), ("5s", 24)]
     valid_pairs = [(label, idx) for label, idx in time_pairs if idx < len(metrics["rmse_per_step_m"])]
 
     print("\n" + "=" * 30 + f" {title} " + "=" * 30)
-    print(f"Average ADE (m): {metrics['overall_ade_m']:.6f}")
-    print(f"Average FDE (m): {metrics['overall_fde_m']:.6f}")
-    print(f"Average RMSE (m): {metrics['overall_rmse_m']:.6f}")
+    print(f"{metric_name} Average ADE (m): {metrics['overall_ade_m']:.6f}")
+    print(f"{metric_name} Average FDE (m): {metrics['overall_fde_m']:.6f}")
+    print(f"{metric_name} Average RMSE (m): {metrics['overall_rmse_m']:.6f}")
+    if intent_metrics is not None:
+        print(f"Intent Lat Acc: {intent_metrics['lat_acc']:.6f}")
+        print(f"Intent Lon Acc: {intent_metrics['lon_acc']:.6f}")
+        print(f"Intent Joint Acc: {intent_metrics['joint_acc']:.6f}")
     print("-" * 75)
 
     if not valid_pairs:
@@ -140,18 +148,24 @@ def evaluate(model, dataloader, device, feature_dim, num_samples):
 
     model.eval()
     metrics = TrajectoryMetrics(model.T)
+    instant_metrics = TrajectoryMetrics(model.bridge_tau)
+    intent_total = 0.0
+    intent_lat_correct = 0.0
+    intent_lon_correct = 0.0
+    intent_joint_correct = 0.0
     k_samples = max(1, int(num_samples))
     eval_name = f"Fut minADE@{k_samples}" if k_samples > 1 else "Fut single-mode"
 
     pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc=eval_name, ncols=120)
     for batch_idx, batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc = prepare_input_data(
             batch,
             feature_dim,
             device=device,
         )
+
         if k_samples > 1:
-            pred_fut, _, _ = model.forwardEval_minADE(
+            pred_fut, _, _, eval_aux = model.forwardEval_minADE(
                 hist,
                 hist_nbrs,
                 mask,
@@ -160,9 +174,10 @@ def evaluate(model, dataloader, device, feature_dim, num_samples):
                 op_mask,
                 device,
                 K=k_samples,
+                return_aux=True,
             )
         else:
-            pred_fut, _, _ = model.forwardEval(
+            pred_fut, _, _, eval_aux = model.forwardEval(
                 hist,
                 hist_nbrs,
                 mask,
@@ -170,21 +185,58 @@ def evaluate(model, dataloader, device, feature_dim, num_samples):
                 fut,
                 op_mask,
                 device,
+                return_aux=True,
             )
 
         metrics.update(pred_fut, fut, op_mask)
+        pred_instant = None if eval_aux is None else eval_aux.get("pred_instant")
+        intent_probs = {} if eval_aux is None else eval_aux.get("intent_probs", {})
+        pred_lat_probs = intent_probs.get("lat")
+        pred_lon_probs = intent_probs.get("lon")
+        if pred_lat_probs is not None and pred_lon_probs is not None:
+            pred_lat = pred_lat_probs.argmax(dim=-1)
+            pred_lon = pred_lon_probs.argmax(dim=-1)
+            gt_lat = lat_enc.argmax(dim=-1)
+            gt_lon = lon_enc.argmax(dim=-1)
+            lat_correct = pred_lat.eq(gt_lat)
+            lon_correct = pred_lon.eq(gt_lon)
+            intent_total += float(hist.size(0))
+            intent_lat_correct += float(lat_correct.sum().item())
+            intent_lon_correct += float(lon_correct.sum().item())
+            intent_joint_correct += float((lat_correct & lon_correct).sum().item())
+        if pred_instant is not None:
+            instant_metrics.update(pred_instant, fut, op_mask)
         summary = metrics.summary()
+        instant_summary = instant_metrics.summary()
+        current_intent = {
+            "lat_acc": intent_lat_correct / max(intent_total, 1.0),
+            "lon_acc": intent_lon_correct / max(intent_total, 1.0),
+            "joint_acc": intent_joint_correct / max(intent_total, 1.0),
+        }
         pbar.set_postfix({
             "ade_m": f"{summary['overall_ade_m']:.4f}",
             "fde_m": f"{summary['overall_fde_m']:.4f}",
             "rmse_m": f"{summary['overall_rmse_m']:.4f}",
+            "inst_ade_m": f"{instant_summary['overall_ade_m']:.4f}",
+            "inst_fde_m": f"{instant_summary['overall_fde_m']:.4f}",
+            "inst_rmse_m": f"{instant_summary['overall_rmse_m']:.4f}",
+            "lat_acc": f"{current_intent['lat_acc']:.4f}",
+            "lon_acc": f"{current_intent['lon_acc']:.4f}",
         })
 
         if batch_idx % 100 == 0:
-            print_metrics(summary, f"Test Iteration {batch_idx}")
+            print_metrics(summary, f"Test Iteration {batch_idx} - Future", current_intent, metric_name="Future")
+            print_metrics(instant_summary, f"Test Iteration {batch_idx} - Instant", metric_name="Instant")
 
     final_metrics = metrics.summary()
-    print_metrics(final_metrics, "Final Test Result")
+    final_instant = instant_metrics.summary()
+    final_intent = {
+        "lat_acc": intent_lat_correct / max(intent_total, 1.0),
+        "lon_acc": intent_lon_correct / max(intent_total, 1.0),
+        "joint_acc": intent_joint_correct / max(intent_total, 1.0),
+    }
+    print_metrics(final_metrics, "Final Test Result - Future", final_intent, metric_name="Future")
+    print_metrics(final_instant, "Final Test Result - Instant", metric_name="Instant")
     return final_metrics
 
 
