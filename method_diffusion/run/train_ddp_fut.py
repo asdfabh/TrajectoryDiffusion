@@ -18,6 +18,7 @@ from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.run.train_fut import (
     FUT_CHECKPOINT_DIR,
+    LOSS_STAT_KEYS,
     build_zero_loss_stats,
     compute_selection_score,
     init_csv_log,
@@ -90,9 +91,7 @@ def reduce_tensor(tensor):
 
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
     model.train()
-    total_loss = 0.0
-    total_vel_loss = 0.0
-    total_pos_loss = 0.0
+    totals = {key: 0.0 for key in LOSS_STAT_KEYS}
     num_batches = 0
     pbar = tqdm(
         dataloader,
@@ -103,7 +102,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
     )
 
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc = prepare_input_data(
             batch,
             feature_dim,
             device=device,
@@ -116,6 +115,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
             fut,
             op_mask,
             device,
+            lat_enc=lat_enc,
+            lon_enc=lon_enc,
             return_components=True,
         )
 
@@ -124,38 +125,34 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        total_loss += float(loss.item())
-        total_vel_loss += float(loss_parts["loss_vel"].item())
-        total_pos_loss += float(loss_parts["loss_pos"].item())
+        totals["loss"] += float(loss.item())
+        for key in LOSS_STAT_KEYS:
+            if key == "loss":
+                continue
+            totals[key] += float(loss_parts[key].item())
         num_batches += 1
 
         if is_main_process(rank):
             pbar.set_postfix(
                 {
                     "loss": f"{loss.item():.6f}",
-                    "avg_loss": f"{(total_loss / num_batches):.6f}",
-                    "vel_loss": f"{(total_vel_loss / num_batches):.6f}",
-                    "pos_loss": f"{(total_pos_loss / num_batches):.6f}",
+                    "avg_loss": f"{(totals['loss'] / num_batches):.6f}",
+                    "intent": f"{(totals['loss_intent'] / num_batches):.6f}",
+                    "bridge": f"{(totals['loss_bridge'] / num_batches):.6f}",
                 }
             )
 
     stats = torch.tensor(
-        [
-            total_loss,
-            total_vel_loss,
-            total_pos_loss,
-            float(num_batches),
-        ],
+        [totals[key] for key in LOSS_STAT_KEYS] + [float(num_batches)],
         device=device,
         dtype=torch.float64,
     )
     stats = reduce_tensor(stats)
-    denom = max(int(stats[3].item()), 1)
+    denom = max(int(stats[len(LOSS_STAT_KEYS)].item()), 1)
 
     return {
-        "loss": float(stats[0].item()) / denom,
-        "loss_vel": float(stats[1].item()) / denom,
-        "loss_pos": float(stats[2].item()) / denom,
+        key: float(stats[idx].item()) / denom
+        for idx, key in enumerate(LOSS_STAT_KEYS)
     }
 
 
@@ -168,9 +165,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
     fut_model = model.module if hasattr(model, "module") else model
     fut_model.eval()
 
-    total_loss = 0.0
-    total_vel_loss = 0.0
-    total_pos_loss = 0.0
+    totals = {key: 0.0 for key in LOSS_STAT_KEYS}
     total_ade = 0.0
     total_fde = 0.0
     num_batches = 0
@@ -197,7 +192,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
         if num_batches >= target_batches:
             break
 
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc = prepare_input_data(
             batch,
             feature_dim,
             device=device,
@@ -210,6 +205,8 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
             fut,
             op_mask,
             device,
+            lat_enc=lat_enc,
+            lon_enc=lon_enc,
             return_components=True,
         )
         _, eval_ade, eval_fde = fut_model.forwardEval(
@@ -222,9 +219,11 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
             device,
         )
 
-        total_loss += float(val_loss.item())
-        total_vel_loss += float(val_parts["loss_vel"].item())
-        total_pos_loss += float(val_parts["loss_pos"].item())
+        totals["loss"] += float(val_loss.item())
+        for key in LOSS_STAT_KEYS:
+            if key == "loss":
+                continue
+            totals[key] += float(val_parts[key].item())
         total_ade += float(eval_ade.item())
         total_fde += float(eval_fde.item())
         num_batches += 1
@@ -232,36 +231,29 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
         if is_main_process(rank):
             pbar.set_postfix(
                 {
-                    "val_loss": f"{(total_loss / num_batches):.6f}",
-                    "val_vel": f"{(total_vel_loss / num_batches):.6f}",
-                    "val_pos": f"{(total_pos_loss / num_batches):.6f}",
+                    "val_loss": f"{(totals['loss'] / num_batches):.6f}",
+                    "val_intent": f"{(totals['loss_intent'] / num_batches):.6f}",
+                    "val_bridge": f"{(totals['loss_bridge'] / num_batches):.6f}",
                     "avg_ade_ft": f"{(total_ade / num_batches):.4f}",
                     "avg_fde_ft": f"{(total_fde / num_batches):.4f}",
                 }
             )
 
     stats = torch.tensor(
-        [
-            total_loss,
-            total_vel_loss,
-            total_pos_loss,
-            total_ade,
-            total_fde,
-            float(num_batches),
-        ],
+        [totals[key] for key in LOSS_STAT_KEYS] + [total_ade, total_fde, float(num_batches)],
         device=device,
         dtype=torch.float64,
     )
     stats = reduce_tensor(stats)
     fut_model.train()
 
-    denom = max(int(stats[5].item()), 1)
+    offset = len(LOSS_STAT_KEYS)
+    denom = max(int(stats[offset + 2].item()), 1)
     val_stats = {
-        "loss": float(stats[0].item()) / denom,
-        "loss_vel": float(stats[1].item()) / denom,
-        "loss_pos": float(stats[2].item()) / denom,
+        key: float(stats[idx].item()) / denom
+        for idx, key in enumerate(LOSS_STAT_KEYS)
     }
-    return val_stats, float(stats[3].item()) / denom, float(stats[4].item()) / denom
+    return val_stats, float(stats[offset].item()) / denom, float(stats[offset + 1].item()) / denom
 
 
 def main():

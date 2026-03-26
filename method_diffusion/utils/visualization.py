@@ -3,6 +3,64 @@ import matplotlib.patches as patches
 import numpy as np
 import torch
 
+
+def _to_numpy(data):
+    if data is None:
+        return None
+    if isinstance(data, torch.Tensor):
+        return data.detach().cpu().numpy()
+    return np.asarray(data)
+
+
+def _compute_vis_metrics(pred_traj, target_traj, valid_mask):
+    pred_arr = _to_numpy(pred_traj)
+    target_arr = _to_numpy(target_traj)
+    mask_arr = _to_numpy(valid_mask)
+    if pred_arr is None or target_arr is None:
+        return None
+
+    pred_arr = np.asarray(pred_arr)
+    target_arr = np.asarray(target_arr)
+    if pred_arr.ndim != 2 or target_arr.ndim != 2 or pred_arr.shape[-1] < 2 or target_arr.shape[-1] < 2:
+        return None
+
+    time_steps = min(pred_arr.shape[0], target_arr.shape[0])
+    if time_steps <= 0:
+        return None
+
+    if mask_arr is None:
+        valid = np.ones(time_steps, dtype=bool)
+    else:
+        mask_arr = np.asarray(mask_arr).squeeze()
+        if mask_arr.ndim > 1:
+            mask_arr = mask_arr[..., 0]
+        valid = mask_arr[:time_steps] > 0.5
+
+    if not np.any(valid):
+        return None
+
+    diff = pred_arr[:time_steps, :2] - target_arr[:time_steps, :2]
+    dist = np.linalg.norm(diff, axis=-1)
+    dist_valid = dist[valid]
+    if dist_valid.size == 0:
+        return None
+
+    coord_sq = diff[valid] ** 2
+    return {
+        "ade": float(dist_valid.mean()),
+        "fde": float(dist_valid[-1]),
+        "rmse": float(np.sqrt(coord_sq.mean())),
+    }
+
+
+def _format_prob_list(prob_values):
+    prob_arr = _to_numpy(prob_values)
+    if prob_arr is None:
+        return "[]"
+    prob_arr = np.asarray(prob_arr).reshape(-1)
+    return "[" + ", ".join(f"{float(v):.2f}" for v in prob_arr) + "]"
+
+
 def plot_traj_with_mask(hist_original, hist_masked, hist_pred, fig_num1=3, fig_num2=3, input_unit="ft"):
     """绘制 hist 重建结果：原始轨迹、掩码位置、预测轨迹。"""
     num_samples = len(hist_original)
@@ -81,18 +139,12 @@ def maybe_visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_t
 
 def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, future=None, pred=None,
                                  pred_all=None, pred_best_idx=None,
-                                 future_mask=None, batch_idx=0, metrics=None, input_unit="ft"):
+                                 future_mask=None, pred_instant=None, intent_probs=None,
+                                 batch_idx=0, metrics=None, input_unit="ft"):
     """绘制 future 预测结果，支持单模态与多模态最佳轨迹高亮。"""
 
-    def to_numpy(data):
-        if data is None:
-            return None
-        if isinstance(data, torch.Tensor):
-            return data.detach().cpu().numpy()
-        return np.asarray(data)
-
     def safe_get_batch(data, b_idx, batch_ndim=3):
-        arr = to_numpy(data)
+        arr = _to_numpy(data)
         if arr is None:
             return None
         if arr.ndim >= batch_ndim and arr.shape[0] > b_idx:
@@ -110,8 +162,8 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
         return arr
 
     def reconstruct_nbrs_from_mask(nbrs_flat, tmask, b_idx):
-        nbrs_arr = to_numpy(nbrs_flat)
-        mask_arr = to_numpy(tmask)
+        nbrs_arr = _to_numpy(nbrs_flat)
+        mask_arr = _to_numpy(tmask)
         if nbrs_arr is None or mask_arr is None:
             return None
         if nbrs_arr.ndim != 3 or mask_arr.ndim != 4:
@@ -145,7 +197,7 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
     def resolve_best_idx(best_idx_data, b_idx, num_modes):
         if best_idx_data is None or num_modes <= 0:
             return None
-        arr = to_numpy(best_idx_data)
+        arr = _to_numpy(best_idx_data)
         if arr is None:
             return None
         if np.isscalar(arr):
@@ -198,6 +250,9 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
     pred_single = normalize_traj2d(safe_get_batch(pred, idx, batch_ndim=3))
     fut_mask_arr = safe_get_batch(future_mask, idx, batch_ndim=3)
     pred_modes = safe_get_batch(pred_all, idx, batch_ndim=4)
+    pred_instant_vis = normalize_traj2d(safe_get_batch(pred_instant, idx, batch_ndim=3))
+    intent_lat = safe_get_batch(None if intent_probs is None else intent_probs.get("lat"), idx, batch_ndim=2)
+    intent_lon = safe_get_batch(None if intent_probs is None else intent_probs.get("lon"), idx, batch_ndim=2)
 
     if pred_modes is not None:
         pred_modes = np.asarray(pred_modes)
@@ -277,6 +332,32 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
             )
     elif pred_best is not None:
         ax.plot(pred_best[:, 1], pred_best[:, 0], 'r-o', label='Pred', markersize=4, linewidth=2, alpha=0.9)
+    if pred_instant_vis is not None:
+        ax.plot(
+            pred_instant_vis[:, 1], pred_instant_vis[:, 0],
+            linestyle='--',
+            marker='s',
+            markersize=4,
+            linewidth=2.0,
+            alpha=0.95,
+            color='#F39C12',
+            label='Pred Instant',
+            zorder=4,
+        )
+
+    if intent_lat is not None or intent_lon is not None:
+        ax.text(
+            0.02,
+            0.98,
+            f"lat={_format_prob_list(intent_lat)}\nlon={_format_prob_list(intent_lon)}",
+            transform=ax.transAxes,
+            ha='left',
+            va='top',
+            fontsize=10,
+            family='monospace',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='#555555'),
+            zorder=5,
+        )
 
     unit = input_unit or "ft"
     title = "Trajectory Visualization"
@@ -300,7 +381,8 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
 
 def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pred, valid_mask, stage,
                                       enable_train_vis=False, enable_eval_vis=False,
-                                      pred_all=None, pred_best_idx=None, meter_per_foot=0.3048, batch_idx=0):
+                                      pred_all=None, pred_best_idx=None, pred_instant=None, intent_probs=None,
+                                      meter_per_foot=0.3048, batch_idx=0):
     """按配置开关控制 future 预测可视化。"""
     if stage == "train":
         if not enable_train_vis:
@@ -318,6 +400,24 @@ def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pr
         "ADE(vis traj)": {"ft": vis_ade.item(), "m": vis_ade.item() * meter_per_foot},
         "FDE(vis traj)": {"ft": vis_fde.item(), "m": vis_fde.item() * meter_per_foot},
     }
+    instant_metrics = _compute_vis_metrics(
+        pred_traj=None if pred_instant is None else pred_instant[batch_idx],
+        target_traj=future[batch_idx],
+        valid_mask=valid_mask[batch_idx],
+    )
+    if instant_metrics is not None:
+        metrics["ADE(inst traj)"] = {
+            "ft": instant_metrics["ade"],
+            "m": instant_metrics["ade"] * meter_per_foot,
+        }
+        metrics["FDE(inst traj)"] = {
+            "ft": instant_metrics["fde"],
+            "m": instant_metrics["fde"] * meter_per_foot,
+        }
+        metrics["RMSE(inst traj)"] = {
+            "ft": instant_metrics["rmse"],
+            "m": instant_metrics["rmse"] * meter_per_foot,
+        }
 
     visualize_batch_trajectories(
         hist=hist,
@@ -328,6 +428,8 @@ def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pr
         pred_all=pred_all,
         pred_best_idx=pred_best_idx,
         future_mask=valid_mask,
+        pred_instant=pred_instant,
+        intent_probs=intent_probs,
         batch_idx=batch_idx,
         metrics=metrics,
         input_unit="ft",

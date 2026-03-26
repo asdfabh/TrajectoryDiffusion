@@ -72,6 +72,8 @@ def get_args_parser():
     parser.add_argument("--x0_clip", default=5.0, type=float)
     parser.add_argument("--self_condition_prob", default=0.5, type=float)
     parser.add_argument("--fut_pos_loss_weight", default=1.5, type=float)
+    parser.add_argument("--bridge_tau", default=5, type=int)
+    parser.add_argument("--intent_tail_k", default=4, type=int)
 
     # Fut visualization
     parser.add_argument("--fut_enable_train_vis", default=0, type=int)
