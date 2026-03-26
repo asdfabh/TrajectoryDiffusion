@@ -58,6 +58,16 @@ class DiffusionFut(nn.Module):
         self.intent_head = IntentHead(self.hidden_dim, self.intent_tail_k, self.context_pooler)
         self.bridge_head = BridgeHead(self.hidden_dim, self.intent_tail_k, self.bridge_tau, self.context_pooler)
         self.motion_head = MotionSummaryHead(self.hidden_dim)
+        self.intent_context_adapter = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        self.bridge_context_adapter = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
 
         # DiT 主干与扩散调度器：负责时间嵌入、去噪建模和 DDIM 调度。
         self.timestep_embedder = dit.TimestepEmbedder(self.hidden_dim, self.time_embedding_size)
@@ -119,22 +129,26 @@ class DiffusionFut(nn.Module):
     # 构造送入 future DiT cross-attn 的 planning-aware cross tokens。
     def buildCrossTokens(self, hist, hist_nbrs, mask, temporal_mask):
         context = self.encodeContext(hist, hist_nbrs, mask, temporal_mask)  # [B, T_ctx, H]
+        context_intent = self.intent_context_adapter(context)  # [B, T_ctx, H]
+        context_bridge = self.bridge_context_adapter(context)  # [B, T_ctx, H]
         hist_feat = hist[..., :4]  # [B, T_hist, 4]，future 主路径当前固定为 xyva 四维输入。
-        intent_token, intent_aux = self.intent_head(context, hist_feat)  # [B, 1, H]
+        intent_tokens, intent_aux = self.intent_head(context_intent, hist_feat)  # [B, 2, H]
         anchor_pos = hist[:, -1:, :2]  # [B, 1, 2]
         bridge_tokens, bridge_aux = self.bridge_head(
-            context=context,
+            context=context_bridge,
             hist_feat=hist_feat,
             anchor_pos=anchor_pos,
         )  # bridge_tokens: [B, tau, H]
         motion_token = self.motion_head(bridge_tokens, bridge_aux)  # [B, 1, H]
-        cross_tokens = torch.cat([context, intent_token, motion_token, bridge_tokens], dim=1)  # [B, T_ctx+tau+2, H]
+        cross_tokens = torch.cat([context, intent_tokens, motion_token, bridge_tokens], dim=1)  # [B, T_ctx+tau+3, H]
 
         planning_aux = {
             "context": context,
+            "context_intent": context_intent,
+            "context_bridge": context_bridge,
             "hist_feat": hist_feat,
             "intent_aux": intent_aux,
-            "intent_token": intent_token,
+            "intent_tokens": intent_tokens,
             "bridge_aux": bridge_aux,
             "bridge_tokens": bridge_tokens,
             "motion_token": motion_token,
@@ -197,7 +211,7 @@ class DiffusionFut(nn.Module):
             loss_intent = loss_intent_lat + loss_intent_lon
 
             # 总损失 = diffusion 主损失 + planning 辅助损失。
-            loss_total = total_mean + 0.4 * loss_bridge + 0.2 * loss_intent + 0.3 * loss_cons
+            loss_total = total_mean + 0.4 * loss_bridge + 0.3 * loss_intent + 0.3 * loss_cons
 
         if not return_parts:
             return loss_total

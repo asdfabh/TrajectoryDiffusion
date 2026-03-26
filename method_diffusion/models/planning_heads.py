@@ -5,7 +5,7 @@ planning heads 模块说明
 这部分改动的目标，是在 future diffusion 模型侧建立更强的 hist -> fut 显式连接，
 让未来预测不只依赖 HistEncoder 输出的原始 context 序列，还额外依赖：
 
-    [hist_context ; intent_token ; motion_token ; bridge_tokens]
+    [hist_context ; intent_lat_token ; intent_lon_token ; motion_token ; bridge_tokens]
 
 最终这些 token 会一起送入 future DiT 的 cross-attention，作为 planning-aware 条件。
 
@@ -28,7 +28,7 @@ planning heads 模块说明
    - 作用：
      - 预测横向意图 logits_lat
      - 预测纵向意图 logits_lon
-     - 生成一个可送入 DiT cross-attn 的 intent_token
+     - 生成两个可送入 DiT cross-attn 的 intent token（横向 / 纵向）
    - 意图获取方式：
      - 先用 ContextPooler 得到 z_lat、z_lon
      - 再从历史最后 K 帧中截取 tail state，并用 MLP 压缩成 hist_tail_embed
@@ -37,7 +37,8 @@ planning heads 模块说明
    - token 构造方式：
      - 不是直接取 argmax，而是对 logits 做 softmax 得到概率 p_lat / p_lon
      - 再与可学习的意图 embedding 表相乘，得到软意图向量 e_lat / e_lon
-     - 最后将 [z_lat, z_lon, e_lat, e_lon, hist_tail_embed] 拼接，经 MLP 生成 intent_token
+     - 横向 token: [z_lat, e_lat, hist_tail_embed] -> lat_token_mlp
+     - 纵向 token: [z_lon, e_lon, hist_tail_embed] -> lon_token_mlp
    - 原理：
      - z_lat / z_lon 提供全局历史语义
      - hist_tail_embed 提供最近运动状态
@@ -83,11 +84,11 @@ planning heads 模块说明
 ---------------
 在 fut model 中，这些模块的输出会按如下顺序拼接：
 
-    cross_tokens = [context ; intent_token ; motion_token ; bridge_tokens]
+    cross_tokens = [context ; intent_lat_token ; intent_lon_token ; motion_token ; bridge_tokens]
 
 其中：
 - context 提供完整历史上下文
-- intent_token 提供长时行为/规划语义
+- intent_lat_token / intent_lon_token 提供解耦的横纵向规划语义
 - motion_token 提供短时运动摘要
 - bridge_tokens 提供细粒度短时连接轨迹信息
 
@@ -100,10 +101,10 @@ planning heads 模块说明
 ---------------------------
 - 当前默认维度下：
       - context: [B, 16, 128]
-      - intent_token: [B, 1, 128]
+      - intent_tokens: [B, 2, 128]
       - motion_token: [B, 1, 128]
       - bridge_tokens: [B, 5, 128]
-      - cross_tokens: [B, 23, 128]
+      - cross_tokens: [B, 24, 128]
   - 这套结构已经能向 future DiT 提供：
       - 完整历史记忆
       - 高层意图
@@ -180,14 +181,21 @@ class IntentHead(nn.Module):
             nn.SiLU(),
             nn.Linear(self.hidden_dim, 3),
         )
-        self.intent_mlp = nn.Sequential(
-            nn.Linear(self.hidden_dim * 5, self.hidden_dim * 2),
+        self.lat_token_mlp = nn.Sequential(
+            nn.Linear(self.hidden_dim * 3, self.hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+        )
+        self.lon_token_mlp = nn.Sequential(
+            nn.Linear(self.hidden_dim * 3, self.hidden_dim * 2),
             nn.SiLU(),
             nn.Linear(self.hidden_dim * 2, self.hidden_dim),
         )
 
         self.lat_embedding = nn.Parameter(torch.randn(3, self.hidden_dim) * 0.02)
         self.lon_embedding = nn.Parameter(torch.randn(3, self.hidden_dim) * 0.02)
+        self.intent_type_lat = nn.Parameter(torch.randn(1, 1, self.hidden_dim) * 0.02)
+        self.intent_type_lon = nn.Parameter(torch.randn(1, 1, self.hidden_dim) * 0.02)
 
     def forward(self, context, hist_feat):
         # context: [B, T_ctx, H], hist_feat: [B, T_hist, 4]
@@ -205,9 +213,13 @@ class IntentHead(nn.Module):
         e_lat = torch.matmul(p_lat, self.lat_embedding)  # [B, H]
         e_lon = torch.matmul(p_lon, self.lon_embedding)  # [B, H]
 
-        intent_token = self.intent_mlp(
-            torch.cat([z_lat, z_lon, e_lat, e_lon, hist_tail_embed], dim=-1)
-        ).unsqueeze(1)  # [B, 1, H]
+        lat_token = self.lat_token_mlp(
+            torch.cat([z_lat, e_lat, hist_tail_embed], dim=-1)
+        ).unsqueeze(1) + self.intent_type_lat  # [B, 1, H]
+        lon_token = self.lon_token_mlp(
+            torch.cat([z_lon, e_lon, hist_tail_embed], dim=-1)
+        ).unsqueeze(1) + self.intent_type_lon  # [B, 1, H]
+        intent_tokens = torch.cat([lat_token, lon_token], dim=1)  # [B, 2, H]
 
         aux = {
             "logits_lat": logits_lat,
@@ -217,8 +229,10 @@ class IntentHead(nn.Module):
             "hist_tail_embed": hist_tail_embed,
             "z_lat": z_lat,
             "z_lon": z_lon,
+            "lat_token": lat_token,
+            "lon_token": lon_token,
         }
-        return intent_token, aux
+        return intent_tokens, aux
 
 
 class BridgeHead(nn.Module):
@@ -251,6 +265,12 @@ class BridgeHead(nn.Module):
             hidden_size=self.hidden_dim,
             batch_first=True,
         )
+        self.bridge_step_embedding = nn.Parameter(torch.randn(1, self.bridge_tau, self.hidden_dim) * 0.02)
+        self.decoder_input_mlp = nn.Sequential(
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
         self.bridge_vel_proj = nn.Linear(self.hidden_dim, 2)
         self.bridge_token_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
 
@@ -263,7 +283,9 @@ class BridgeHead(nn.Module):
         bridge_ctx_embed = self.bridge_ctx_mlp(bridge_ctx)  # [B, H]
         decoder_init = self.fuse_mlp(torch.cat([bridge_ctx_embed, hist_tail_embed], dim=-1))  # [B, H]
 
-        decoder_inputs = context.new_zeros(context.size(0), self.bridge_tau, self.hidden_dim)  # [B, tau, H]
+        step_tokens = self.bridge_step_embedding.expand(context.size(0), -1, -1)  # [B, tau, H]
+        bridge_ctx_tokens = bridge_ctx_embed.unsqueeze(1).expand(-1, self.bridge_tau, -1)  # [B, tau, H]
+        decoder_inputs = self.decoder_input_mlp(torch.cat([step_tokens, bridge_ctx_tokens], dim=-1))  # [B, tau, H]
         bridge_hidden, _ = self.decoder(decoder_inputs, decoder_init.unsqueeze(0))  # [B, tau, H]
 
         bridge_vel = self.bridge_vel_proj(bridge_hidden)  # [B, tau, 2]
