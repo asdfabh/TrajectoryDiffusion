@@ -5,7 +5,7 @@ from diffusers.schedulers import DDIMScheduler
 
 from method_diffusion.models import dit_fut as dit
 from method_diffusion.models.hist_encoder import HistEncoder
-from method_diffusion.models.planning_heads import BridgeHead, ContextPooler, IntentHead, MotionSummaryHead
+from method_diffusion.models.planning_heads import BridgeHead, ContextPooler, IntentHead
 from method_diffusion.utils.position_encoding import SequentialPositionalEncoding
 from method_diffusion.utils.visualization import maybe_visualize_future_prediction
 
@@ -53,21 +53,10 @@ class DiffusionFut(nn.Module):
         self.pos_embedding = SequentialPositionalEncoding(self.hidden_dim)
         self.hist_encoder = HistEncoder(args)
 
-        # planning 分支：从 history context 提取意图、桥接与运动摘要 token。
+        # planning 分支：从 history context 提取意图 token 与桥接 token。
         self.context_pooler = ContextPooler(self.hidden_dim)
         self.intent_head = IntentHead(self.hidden_dim, self.intent_tail_k, self.context_pooler)
         self.bridge_head = BridgeHead(self.hidden_dim, self.intent_tail_k, self.bridge_tau, self.context_pooler)
-        self.motion_head = MotionSummaryHead(self.hidden_dim)
-        self.intent_context_adapter = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-        )
-        self.bridge_context_adapter = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-        )
 
         # DiT 主干与扩散调度器：负责时间嵌入、去噪建模和 DDIM 调度。
         self.timestep_embedder = dit.TimestepEmbedder(self.hidden_dim, self.time_embedding_size)
@@ -129,29 +118,27 @@ class DiffusionFut(nn.Module):
     # 构造送入 future DiT cross-attn 的 planning-aware cross tokens。
     def buildCrossTokens(self, hist, hist_nbrs, mask, temporal_mask):
         context = self.encodeContext(hist, hist_nbrs, mask, temporal_mask)  # [B, T_ctx, H]
-        context_intent = self.intent_context_adapter(context)  # [B, T_ctx, H]
-        context_bridge = self.bridge_context_adapter(context)  # [B, T_ctx, H]
-        hist_feat = hist[..., :4]  # [B, T_hist, 4]，future 主路径当前固定为 xyva 四维输入。
-        intent_tokens, intent_aux = self.intent_head(context_intent, hist_feat)  # [B, 2, H]
-        anchor_pos = hist[:, -1:, :2]  # [B, 1, 2]
+        hist_xy = hist[..., :2]  # [B, T_hist, 2]，planning 分支仅使用 xy。
+
+        # IntentHead: 输出单一 intent_token [B, 1, H]
+        intent_token, intent_aux = self.intent_head(context, hist_xy)
+
+        # BridgeHead: 仅使用 hist + context，不需要 intent 引导
         bridge_tokens, bridge_aux = self.bridge_head(
-            context=context_bridge,
-            hist_feat=hist_feat,
-            anchor_pos=anchor_pos,
-        )  # bridge_tokens: [B, tau, H]
-        motion_token = self.motion_head(bridge_tokens, bridge_aux)  # [B, 1, H]
-        cross_tokens = torch.cat([context, intent_tokens, motion_token, bridge_tokens], dim=1)  # [B, T_ctx+tau+3, H]
+            context=context,
+            hist_xy=hist_xy,
+        )
+
+        # 拼接 cross tokens: [context ; intent_token ; bridge_tokens]
+        cross_tokens = torch.cat([context, intent_token, bridge_tokens], dim=1)  # [B, T_ctx+1+tau, H]
 
         planning_aux = {
             "context": context,
-            "context_intent": context_intent,
-            "context_bridge": context_bridge,
-            "hist_feat": hist_feat,
+            "hist_xy": hist_xy,
             "intent_aux": intent_aux,
-            "intent_tokens": intent_tokens,
+            "intent_token": intent_token,
             "bridge_aux": bridge_aux,
             "bridge_tokens": bridge_tokens,
-            "motion_token": motion_token,
             "cross_tokens": cross_tokens,
         }
         return cross_tokens, planning_aux
@@ -181,8 +168,9 @@ class DiffusionFut(nn.Module):
 
         loss_total = total_mean
         loss_intent = total_mean.new_zeros(())  # 意图分类损失
+        loss_intent_lat = total_mean.new_zeros(())
+        loss_intent_lon = total_mean.new_zeros(())
         loss_bridge = total_mean.new_zeros(())  # bridge 短时轨迹监督损失
-        loss_cons = total_mean.new_zeros(())    # diffusion 与 bridge 的一致性损失
 
         if planning_aux is not None:
             # bridge 分支：监督前 tau 帧的短时连接轨迹。
@@ -192,26 +180,35 @@ class DiffusionFut(nn.Module):
             tau = min(self.bridge_tau, future_phys.size(1), bridge_pos.size(1))
             if tau > 0:
                 gt_bridge_pos = future_phys[:, :tau, :2]
-                gt_bridge_vel = gt_bridge_pos - torch.cat([anchor_phys[..., :2], gt_bridge_pos[:, :-1, :]], dim=1)
+                prev_pos = torch.cat([gt_bridge_pos.new_zeros(gt_bridge_pos.size(0), 1, 2), gt_bridge_pos[:, :-1, :]], dim=1)
+                gt_bridge_vel = gt_bridge_pos - prev_pos
                 valid_bridge = valid_mask[:, :tau].unsqueeze(-1)
                 denom_bridge = valid_bridge.sum() * 2.0 + 1e-6
-                loss_bridge_vel = (torch.abs(bridge_vel[:, :tau, :] - gt_bridge_vel) * valid_bridge).sum() / denom_bridge
-                loss_bridge_pos = (torch.abs(bridge_pos[:, :tau, :] - gt_bridge_pos) * valid_bridge).sum() / denom_bridge
-                loss_bridge = loss_bridge_vel + 1.5 * loss_bridge_pos
-                loss_cons = (torch.abs(pred_pos_phys[:, :tau, :] - bridge_pos[:, :tau, :].detach()) * valid_bridge).sum() / denom_bridge
+                loss_bridge_vel = (F.smooth_l1_loss(bridge_vel[:, :tau, :], gt_bridge_vel, reduction="none") * valid_bridge).sum() / denom_bridge
+                loss_bridge_pos = (F.smooth_l1_loss(bridge_pos[:, :tau, :], gt_bridge_pos, reduction="none") * valid_bridge).sum() / denom_bridge
+                loss_bridge = loss_bridge_pos + 0.5 * loss_bridge_vel
 
-            # intent 分支：使用 lat/lon one-hot 标签做横向/纵向意图分类监督。
+            # intent 分支：横纵向分别监督，使用 class-weighted CE
             intent_aux = planning_aux["intent_aux"]
-            loss_intent_lat = total_mean.new_zeros(())
-            loss_intent_lon = total_mean.new_zeros(())
+
             if lat_enc is not None:
-                loss_intent_lat = F.cross_entropy(intent_aux["logits_lat"], lat_enc.argmax(dim=-1).long())
+                lat_target = lat_enc.argmax(dim=-1).long()
+                # 类别权重：变道类上采样，直行类下采样
+                # lat: 左变道=0, 直行=1, 右变道=2
+                lat_weights = torch.tensor([4.0, 0.5, 4.0], device=lat_target.device, dtype=pred_vel_norm.dtype)
+                loss_intent_lat = F.cross_entropy(intent_aux["logits_lat"], lat_target, weight=lat_weights)
+
             if lon_enc is not None:
-                loss_intent_lon = F.cross_entropy(intent_aux["logits_lon"], lon_enc.argmax(dim=-1).long())
+                lon_target = lon_enc.argmax(dim=-1).long()
+                # 类别权重：加减速类上采样，匀速类下采样
+                # lon: 减速=0, 匀速=1, 加速=2
+                lon_weights = torch.tensor([1.5, 0.7, 1.5], device=lon_target.device, dtype=pred_vel_norm.dtype)
+                loss_intent_lon = F.cross_entropy(intent_aux["logits_lon"], lon_target, weight=lon_weights)
+
             loss_intent = loss_intent_lat + loss_intent_lon
 
             # 总损失 = diffusion 主损失 + planning 辅助损失。
-            loss_total = total_mean + 0.4 * loss_bridge + 0.3 * loss_intent + 0.3 * loss_cons
+            loss_total = total_mean + 0.4 * loss_bridge + 0.3 * loss_intent
 
         if not return_parts:
             return loss_total
@@ -224,8 +221,9 @@ class DiffusionFut(nn.Module):
             "loss_vel": vel_mean.detach(),
             "loss_pos": pos_mean.detach(),
             "loss_intent": loss_intent.detach(),
+            "loss_intent_lat": loss_intent_lat.detach(),
+            "loss_intent_lon": loss_intent_lon.detach(),
             "loss_bridge": loss_bridge.detach(),
-            "loss_cons": loss_cons.detach(),
         }
         return loss_total, parts, pred_pos_phys
 
@@ -508,4 +506,5 @@ class DiffusionFut(nn.Module):
                 "lat": intent_aux.get("p_lat"),
                 "lon": intent_aux.get("p_lon"),
             },
+            "intent_token": planning_aux.get("intent_token"),
         }

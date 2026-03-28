@@ -1,117 +1,20 @@
 """
-planning heads 模块说明
-======================
+planning heads 模块
+===================
 
-这部分改动的目标，是在 future diffusion 模型侧建立更强的 hist -> fut 显式连接，
-让未来预测不只依赖 HistEncoder 输出的原始 context 序列，还额外依赖：
+本文件实现三类轻量 planning 子模块：
+1. ContextPooler：从 HistEncoder context 提取意图语义摘要。
+2. IntentHead：基于 [x,y,dx,dy] 特征 + context 预测横/纵向意图，生成单一 intent_token。
+3. BridgeHead：基于 hist + context 预测短时 bridge 轨迹并输出 bridge tokens（无需 intent 引导）。
 
-    [hist_context ; intent_lat_token ; intent_lon_token ; motion_token ; bridge_tokens]
+最终 cross 条件：
+    cross_tokens = [context ; intent_token ; bridge_tokens]
 
-最终这些 token 会一起送入 future DiT 的 cross-attention，作为 planning-aware 条件。
-
-整体结构
---------
-本文件实现了 4 个轻量 planning 子模块：
-
-1. ContextPooler
-   - 输入：HistEncoder 输出的 context，形状为 [B, T_ctx, H]
-   - 作用：从同一份 history context 中抽取三类摘要
-     - bridge_ctx：对全部 context 做全局平均池化，得到短时桥接分支的全局上下文
-     - z_lat：用一个可学习查询向量做 attention pooling，提取横向意图相关信息
-     - z_lon：用另一个可学习查询向量做 attention pooling，提取纵向意图相关信息
-   - 原理：不改 HistEncoder 主体，只在输出序列上做轻量摘要，让不同 planning 分支共享同一份历史表征。
-
-2. IntentHead
-   - 输入：
-     - context: [B, T_ctx, H]
-     - hist_feat: [B, T_hist, 4]，当前 future 主路径固定使用 xyva 四维历史特征
-   - 作用：
-     - 预测横向意图 logits_lat
-     - 预测纵向意图 logits_lon
-     - 生成两个可送入 DiT cross-attn 的 intent token（横向 / 纵向）
-   - 意图获取方式：
-     - 先用 ContextPooler 得到 z_lat、z_lon
-     - 再从历史最后 K 帧中截取 tail state，并用 MLP 压缩成 hist_tail_embed
-     - z_lat + hist_tail_embed -> 横向分类头
-     - z_lon + hist_tail_embed -> 纵向分类头
-   - token 构造方式：
-     - 不是直接取 argmax，而是对 logits 做 softmax 得到概率 p_lat / p_lon
-     - 再与可学习的意图 embedding 表相乘，得到软意图向量 e_lat / e_lon
-     - 横向 token: [z_lat, e_lat, hist_tail_embed] -> lat_token_mlp
-     - 纵向 token: [z_lon, e_lon, hist_tail_embed] -> lon_token_mlp
-   - 原理：
-     - z_lat / z_lon 提供全局历史语义
-     - hist_tail_embed 提供最近运动状态
-     - 软意图 embedding 让 token 连续可导，便于与 diffusion 主分支联合训练
-
-3. BridgeHead
-   - 输入：
-     - context: [B, T_ctx, H]
-     - hist_feat: [B, T_hist, 4]
-     - anchor_pos: [B, 1, 2]，历史最后一帧位置
-   - 作用：
-     - 预测未来前 tau 帧的短时 bridge rollout
-     - 同时输出 bridge_tokens，作为 future DiT 的额外 cross 条件
-   - 瞬时轨迹获取方式：
-     - 用 ContextPooler 得到 bridge_ctx
-     - 从历史最后 K 帧提取 hist tail，并编码为 hist_tail_embed
-     - 将 bridge_ctx 与 hist_tail_embed 融合后，作为小型 GRU decoder 的初始状态
-     - GRU 每一步输出一个 hidden state
-     - hidden state -> bridge_vel
-     - 通过 cumsum(bridge_vel) + anchor_pos 得到 bridge_pos
-   - token 获取方式：
-     - 将每个 decoder hidden state 线性投影到 hidden_dim，得到 bridge_tokens
-   - 原理：
-     - bridge 分支只负责短时连接，而不是完整 future 预测器
-     - 它为 diffusion 主分支提供“从历史尾部如何平滑过渡到未来开头”的显式几何先验
-
-4. MotionSummaryHead
-   - 输入：
-     - bridge_tokens: [B, tau, H]
-     - bridge_aux：包含 bridge_pos、bridge_vel 等信息
-   - 作用：将短时 bridge rollout 压缩成单个 motion_token
-   - 聚合方式：
-     - 取最后一个 bridge token
-     - 取最后一帧 bridge_pos
-     - 取 bridge_vel 的均值
-     - 取 bridge_vel 的最后一帧
-     - 拼接后经 MLP 映射成 motion_token
-   - 原理：
-     - bridge_tokens 保留逐步短时动态
-     - motion_token 提供一个更紧凑的“短时运动摘要”，补充给 DiT cross-attn
-
-最终 cross 条件
----------------
-在 fut model 中，这些模块的输出会按如下顺序拼接：
-
-    cross_tokens = [context ; intent_lat_token ; intent_lon_token ; motion_token ; bridge_tokens]
-
-其中：
-- context 提供完整历史上下文
-- intent_lat_token / intent_lon_token 提供解耦的横纵向规划语义
-- motion_token 提供短时运动摘要
-- bridge_tokens 提供细粒度短时连接轨迹信息
-
-这样做的核心思想是：
-- 不改 DiT 主干和 self-attention
-- 不改 HistEncoder 稀疏交互
-- 只通过额外 planning tokens 增强 cross-attention 条件
-- 用轻量模块把历史中的“意图”和“短时过渡结构”显式暴露给 future diffusion
-
----------------------------
-- 当前默认维度下：
-      - context: [B, 16, 128]
-      - intent_tokens: [B, 2, 128]
-      - motion_token: [B, 1, 128]
-      - bridge_tokens: [B, 5, 128]
-      - cross_tokens: [B, 24, 128]
-  - 这套结构已经能向 future DiT 提供：
-      - 完整历史记忆
-      - 高层意图
-      - 短时运动摘要
-      - 短时桥接细节
-  - 后续提高 cross-attn 的信息质量：
-      - 更细粒度的 token 语义拆分
+方案 A：横纵向分别监督，融合生成单一 token
+- 输入：hist_xy [B, T, 2] + context [B, T_ctx, H]
+- 特征：[x, y, dx, dy] 保留位置+运动信息
+- 输出：intent_token [B, 1, H]
+- 监督：CE_lat + CE_lon (class-weighted)
 """
 
 import math
@@ -122,7 +25,7 @@ from torch import nn
 
 
 def _build_tail_tensor(sequence, tail_k):
-    # 统一抽取最后 K 帧；当历史长度不足时在前侧补零，保证输出形状稳定为 [B, K, D]。
+    """统一抽取最后 K 帧；当历史长度不足时在前侧补零，保证输出形状稳定为 [B, K, D]。"""
     batch_size, time_steps, feat_dim = sequence.shape
     if time_steps >= tail_k:
         return sequence[:, -tail_k:, :]
@@ -132,15 +35,51 @@ def _build_tail_tensor(sequence, tail_k):
     return torch.cat([pad, sequence], dim=1)
 
 
+def _build_motion_features(hist_xy, tail_k):
+    """构造运动特征 [x, y, dx, dy]。
+
+    从历史轨迹中提取最后 K 帧的位置和一阶差分特征，用于 IntentHead 和 BridgeHead。
+
+    Args:
+        hist_xy: [B, T_hist, 2] - 历史轨迹 xy 坐标
+        tail_k: int - 提取的尾部帧数
+
+    Returns:
+        motion_feat: [B, 4*K] - 展平的运动特征
+    """
+    # 取最后 K 帧
+    hist_tail = _build_tail_tensor(hist_xy, tail_k)  # [B, K, 2]
+
+    # 原始位置
+    x = hist_tail[..., 0]  # [B, K]
+    y = hist_tail[..., 1]  # [B, K]
+
+    # 计算一阶差分
+    dx = torch.zeros_like(x)
+    dy = torch.zeros_like(y)
+    dx[:, 1:] = x[:, 1:] - x[:, :-1]  # [B, K]，首帧差分为 0
+    dy[:, 1:] = y[:, 1:] - y[:, :-1]  # [B, K]
+
+    # 组合特征 [x, y, dx, dy] 并展平
+    motion_feat = torch.stack([x, y, dx, dy], dim=-1)  # [B, K, 4]
+    motion_feat = motion_feat.reshape(motion_feat.size(0), -1)  # [B, 4*K]
+
+    return motion_feat
+
+
 class ContextPooler(nn.Module):
-    # 从 HistEncoder 的序列上下文中提取 bridge / lateral intent / longitudinal intent 摘要。
+    """从 HistEncoder 的序列上下文中提取意图相关的语义摘要。
+
+    使用可学习的 query 向量做 attention pooling，提取与意图预测相关的上下文信息。
+    """
     def __init__(self, hidden_dim):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
-        self.q_lat = nn.Parameter(torch.randn(1, 1, self.hidden_dim) * 0.02)
-        self.q_lon = nn.Parameter(torch.randn(1, 1, self.hidden_dim) * 0.02)
+        # 单一意图 query，用于提取融合的意图上下文
+        self.q_intent = nn.Parameter(torch.randn(1, 1, self.hidden_dim) * 0.02)
 
     def _attn_pool(self, context, query):
+        """Attention pooling: 使用 query 从 context 中提取相关信息。"""
         # context: [B, T_ctx, H], query: [1, 1, H]
         batch_size = context.size(0)
         query_expanded = query.expand(batch_size, -1, -1)
@@ -150,93 +89,133 @@ class ContextPooler(nn.Module):
         return pooled
 
     def forward(self, context):
-        # bridge_ctx: [B, H], intent_ctx_lat/lon: [B, H]
+        """
+        Args:
+            context: [B, T_ctx, H] - HistEncoder 输出的上下文序列
+
+        Returns:
+            intent_ctx: [B, H] - 意图相关的上下文摘要
+            bridge_ctx: [B, H] - bridge 分支使用的全局上下文（均值池化）
+        """
+        intent_ctx = self._attn_pool(context, self.q_intent)
         bridge_ctx = context.mean(dim=1)
-        intent_ctx_lat = self._attn_pool(context, self.q_lat)
-        intent_ctx_lon = self._attn_pool(context, self.q_lon)
-        return intent_ctx_lat, intent_ctx_lon, bridge_ctx
+        return intent_ctx, bridge_ctx
 
 
 class IntentHead(nn.Module):
-    # 基于 context 摘要与历史尾部状态预测横向/纵向意图，并生成 planning token。
+    """意图预测头：基于 [x,y,dx,dy] + context 预测横纵向意图，生成单一 intent_token。
+
+    架构设计（方案 A）：
+    1. 特征提取：从 hist_xy 构造 [x, y, dx, dy] 特征
+    2. Context 融合：使用 attention pooling 从 context 提取意图相关信息
+    3. 分别预测：独立的 lat_head 和 lon_head 进行 3 分类
+    4. Token 生成：融合特征 + 软意图 embedding 生成单一 intent_token
+
+    优势：
+    - 训练稳定：3 类分类比 9 类更容易收敛
+    - 数据高效：不受联合分布长尾问题影响
+    - 鲁棒性强：单维度错误不会完全误导 DiT
+    """
     def __init__(self, hidden_dim, tail_k, pooler):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.tail_k = int(tail_k)
         self.pooler = pooler
 
-        tail_input_dim = self.tail_k * 4  # 轻量实现：默认使用 hist_xy + va 共 4 维。
-        self.hist_tail_mlp = nn.Sequential(
-            nn.Linear(tail_input_dim, self.hidden_dim),
+        # 运动特征编码器：输入 [x, y, dx, dy] * tail_k
+        motion_feat_dim = 4 * self.tail_k
+        self.motion_encoder = nn.Sequential(
+            nn.Linear(motion_feat_dim, self.hidden_dim),
             nn.SiLU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
-        self.lat_head = nn.Sequential(
+
+        # 特征融合：motion + context
+        self.fuse_mlp = nn.Sequential(
             nn.Linear(self.hidden_dim * 2, self.hidden_dim),
             nn.SiLU(),
-            nn.Linear(self.hidden_dim, 3),
-        )
-        self.lon_head = nn.Sequential(
-            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim, 3),
-        )
-        self.lat_token_mlp = nn.Sequential(
-            nn.Linear(self.hidden_dim * 3, self.hidden_dim * 2),
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
-        )
-        self.lon_token_mlp = nn.Sequential(
-            nn.Linear(self.hidden_dim * 3, self.hidden_dim * 2),
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
         )
 
+        # 横向意图分类头
+        self.lat_head = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, 3),
+        )
+
+        # 纵向意图分类头
+        self.lon_head = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, 3),
+        )
+
+        # 意图 Embedding 表：用于生成软意图向量
         self.lat_embedding = nn.Parameter(torch.randn(3, self.hidden_dim) * 0.02)
         self.lon_embedding = nn.Parameter(torch.randn(3, self.hidden_dim) * 0.02)
-        self.intent_type_lat = nn.Parameter(torch.randn(1, 1, self.hidden_dim) * 0.02)
-        self.intent_type_lon = nn.Parameter(torch.randn(1, 1, self.hidden_dim) * 0.02)
 
-    def forward(self, context, hist_feat):
-        # context: [B, T_ctx, H], hist_feat: [B, T_hist, 4]
-        z_lat, z_lon, _ = self.pooler(context)
+        # Token 生成：融合 [h_fused, e_lat, e_lon] 生成单一 intent_token
+        self.token_mlp = nn.Sequential(
+            nn.Linear(self.hidden_dim * 3, self.hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+        )
 
-        hist_tail = _build_tail_tensor(hist_feat, self.tail_k)  # [B, K, 4]
-        hist_tail_flat = hist_tail.reshape(hist_tail.size(0), -1)  # [B, K * 4]
-        hist_tail_embed = self.hist_tail_mlp(hist_tail_flat)  # [B, H]
+    def forward(self, context, hist_xy):
+        """
+        Args:
+            context: [B, T_ctx, H] - HistEncoder 输出的上下文序列
+            hist_xy: [B, T_hist, 2] - 历史轨迹 xy 坐标
 
-        logits_lat = self.lat_head(torch.cat([z_lat, hist_tail_embed], dim=-1))  # [B, 3]
-        logits_lon = self.lon_head(torch.cat([z_lon, hist_tail_embed], dim=-1))  # [B, 3]
+        Returns:
+            intent_token: [B, 1, H] - 单一意图 token
+            aux: dict - 包含 logits_lat, logits_lon, p_lat, p_lon 等辅助信息
+        """
+        # 1. 特征提取（使用模块级函数）
+        motion_feat = _build_motion_features(hist_xy, self.tail_k)  # [B, 4*K]
+        h_motion = self.motion_encoder(motion_feat)  # [B, H]
 
+        # 2. Context 融合
+        h_ctx, _ = self.pooler(context)  # [B, H]
+        h_fused = self.fuse_mlp(torch.cat([h_motion, h_ctx], dim=-1))  # [B, H]
+
+        # 3. 分别预测横纵向意图
+        logits_lat = self.lat_head(h_fused)  # [B, 3]
+        logits_lon = self.lon_head(h_fused)  # [B, 3]
+
+        # 4. 计算软概率
         p_lat = F.softmax(logits_lat, dim=-1)  # [B, 3]
         p_lon = F.softmax(logits_lon, dim=-1)  # [B, 3]
+
+        # 5. 生成软意图向量
         e_lat = torch.matmul(p_lat, self.lat_embedding)  # [B, H]
         e_lon = torch.matmul(p_lon, self.lon_embedding)  # [B, H]
 
-        lat_token = self.lat_token_mlp(
-            torch.cat([z_lat, e_lat, hist_tail_embed], dim=-1)
-        ).unsqueeze(1) + self.intent_type_lat  # [B, 1, H]
-        lon_token = self.lon_token_mlp(
-            torch.cat([z_lon, e_lon, hist_tail_embed], dim=-1)
-        ).unsqueeze(1) + self.intent_type_lon  # [B, 1, H]
-        intent_tokens = torch.cat([lat_token, lon_token], dim=1)  # [B, 2, H]
+        # 6. 融合生成单一 intent_token
+        token_input = torch.cat([h_fused, e_lat, e_lon], dim=-1)  # [B, 3H]
+        intent_token = self.token_mlp(token_input).unsqueeze(1)  # [B, 1, H]
 
         aux = {
             "logits_lat": logits_lat,
             "logits_lon": logits_lon,
             "p_lat": p_lat,
             "p_lon": p_lon,
-            "hist_tail_embed": hist_tail_embed,
-            "z_lat": z_lat,
-            "z_lon": z_lon,
-            "lat_token": lat_token,
-            "lon_token": lon_token,
+            "h_motion": h_motion,
+            "h_ctx": h_ctx,
+            "h_fused": h_fused,
+            "e_lat": e_lat,
+            "e_lon": e_lon,
         }
-        return intent_tokens, aux
+        return intent_token, aux
 
 
 class BridgeHead(nn.Module):
-    # 仅预测短时 bridge rollout，并同步输出可送入 DiT cross-attn 的 bridge tokens。
+    """Bridge 预测头：基于 hist + context 预测短时轨迹并输出 bridge tokens。
+
+    使用历史运动特征和上下文信息，通过 cross-attention 预测短时 bridge 轨迹。
+    注意：不使用 intent 引导，仅依赖 hist 和 context。
+    """
     def __init__(self, hidden_dim, tail_k, bridge_tau, pooler):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -244,87 +223,76 @@ class BridgeHead(nn.Module):
         self.bridge_tau = int(bridge_tau)
         self.pooler = pooler
 
-        tail_input_dim = self.tail_k * 4  # 轻量实现：默认使用 hist_xy + va 共 4 维。
-        self.hist_tail_mlp = nn.Sequential(
-            nn.Linear(tail_input_dim, self.hidden_dim),
+        # 运动特征编码器
+        motion_feat_dim = 4 * self.tail_k
+        self.motion_encoder = nn.Sequential(
+            nn.Linear(motion_feat_dim, self.hidden_dim),
             nn.SiLU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
-        self.bridge_ctx_mlp = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-        )
-        self.fuse_mlp = nn.Sequential(
+
+        # Step query：可学习的位置 embedding
+        self.step_embedding = nn.Parameter(torch.randn(1, self.bridge_tau, self.hidden_dim) * 0.02)
+
+        # Query 生成：融合 step + motion（移除 intent）
+        self.query_mlp = nn.Sequential(
             nn.Linear(self.hidden_dim * 2, self.hidden_dim),
             nn.SiLU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
-        self.decoder = nn.GRU(
+
+        # Cross-attention：从 context 中提取信息
+        num_heads = 4 if (self.hidden_dim % 4 == 0) else 1
+        self.step_cross_attn = nn.MultiheadAttention(self.hidden_dim, num_heads, batch_first=True)
+
+        # GRU 解码器
+        self.tiny_gru = nn.GRU(
             input_size=self.hidden_dim,
             hidden_size=self.hidden_dim,
             batch_first=True,
         )
-        self.bridge_step_embedding = nn.Parameter(torch.randn(1, self.bridge_tau, self.hidden_dim) * 0.02)
-        self.decoder_input_mlp = nn.Sequential(
-            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-        )
+
+        # 输出投影
         self.bridge_vel_proj = nn.Linear(self.hidden_dim, 2)
         self.bridge_token_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
 
-    def forward(self, context, hist_feat, anchor_pos):
-        # context: [B, T_ctx, H], hist_feat: [B, T_hist, 4], anchor_pos: [B, 1, 2]
-        _, _, bridge_ctx = self.pooler(context)
-        hist_tail = _build_tail_tensor(hist_feat, self.tail_k)  # [B, K, 4]
-        hist_tail_flat = hist_tail.reshape(hist_tail.size(0), -1)  # [B, K * 4]
-        hist_tail_embed = self.hist_tail_mlp(hist_tail_flat)  # [B, H]
-        bridge_ctx_embed = self.bridge_ctx_mlp(bridge_ctx)  # [B, H]
-        decoder_init = self.fuse_mlp(torch.cat([bridge_ctx_embed, hist_tail_embed], dim=-1))  # [B, H]
+    def forward(self, context, hist_xy):
+        """
+        Args:
+            context: [B, T_ctx, H] - HistEncoder 输出的上下文序列
+            hist_xy: [B, T_hist, 2] - 历史轨迹 xy 坐标
 
-        step_tokens = self.bridge_step_embedding.expand(context.size(0), -1, -1)  # [B, tau, H]
-        bridge_ctx_tokens = bridge_ctx_embed.unsqueeze(1).expand(-1, self.bridge_tau, -1)  # [B, tau, H]
-        decoder_inputs = self.decoder_input_mlp(torch.cat([step_tokens, bridge_ctx_tokens], dim=-1))  # [B, tau, H]
-        bridge_hidden, _ = self.decoder(decoder_inputs, decoder_init.unsqueeze(0))  # [B, tau, H]
+        Returns:
+            bridge_tokens: [B, tau, H] - Bridge tokens
+            aux: dict - 包含 bridge_vel, bridge_pos 等辅助信息
+        """
+        batch_size = context.size(0)
 
+        # 1. 运动特征编码（使用模块级函数）
+        motion_feat = _build_motion_features(hist_xy, self.tail_k)  # [B, 4*K]
+        h_motion = self.motion_encoder(motion_feat)  # [B, H]
+
+        # 2. 构建 step query（仅使用 step + motion，不使用 intent）
+        step_tokens = self.step_embedding.expand(batch_size, -1, -1)  # [B, tau, H]
+        h_motion_step = h_motion.unsqueeze(1).expand(-1, self.bridge_tau, -1)  # [B, tau, H]
+        step_query = self.query_mlp(torch.cat([step_tokens, h_motion_step], dim=-1))  # [B, tau, H]
+
+        # 3. Cross-attention 从 context 提取信息
+        bridge_cond, _ = self.step_cross_attn(step_query, context, context, need_weights=False)  # [B, tau, H]
+
+        # 4. GRU 解码
+        bridge_hidden, _ = self.tiny_gru(bridge_cond)  # [B, tau, H]
+
+        # 5. 输出：速度、位置、tokens
         bridge_vel = self.bridge_vel_proj(bridge_hidden)  # [B, tau, 2]
-        bridge_pos = torch.cumsum(bridge_vel, dim=1) + anchor_pos  # [B, tau, 2]
+        bridge_pos = torch.cumsum(bridge_vel, dim=1)  # [B, tau, 2]，相对锚点坐标系
         bridge_tokens = self.bridge_token_proj(bridge_hidden)  # [B, tau, H]
 
         aux = {
             "bridge_vel": bridge_vel,
             "bridge_pos": bridge_pos,
             "bridge_hidden": bridge_hidden,
-            "anchor_pos": anchor_pos,
-            "bridge_ctx": bridge_ctx,
-            "hist_tail_embed": hist_tail_embed,
+            "h_motion": h_motion,
+            "step_query": step_query,
         }
         return bridge_tokens, aux
-
-
-class MotionSummaryHead(nn.Module):
-    # 从短时 bridge rollout 中提炼一个运动摘要 token。
-    def __init__(self, hidden_dim):
-        super().__init__()
-        self.hidden_dim = int(hidden_dim)
-        self.motion_mlp = nn.Sequential(
-            nn.Linear(self.hidden_dim + 6, self.hidden_dim * 2),
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
-        )
-
-    def forward(self, bridge_tokens, bridge_aux):
-        # bridge_tokens: [B, tau, H]
-        bridge_pos = bridge_aux["bridge_pos"]  # [B, tau, 2]
-        bridge_vel = bridge_aux["bridge_vel"]  # [B, tau, 2]
-
-        last_bridge_token = bridge_tokens[:, -1, :]  # [B, H]
-        last_bridge_pos = bridge_pos[:, -1, :]  # [B, 2]
-        mean_bridge_vel = bridge_vel.mean(dim=1)  # [B, 2]
-        last_bridge_vel = bridge_vel[:, -1, :]  # [B, 2]
-
-        motion_token = self.motion_mlp(
-            torch.cat([last_bridge_token, last_bridge_pos, mean_bridge_vel, last_bridge_vel], dim=-1)
-        ).unsqueeze(1)  # [B, 1, H]
-        return motion_token
