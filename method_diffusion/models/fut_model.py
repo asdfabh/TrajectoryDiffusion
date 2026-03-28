@@ -5,7 +5,14 @@ from diffusers.schedulers import DDIMScheduler
 
 from method_diffusion.models import dit_fut as dit
 from method_diffusion.models.hist_encoder import HistEncoder
-from method_diffusion.models.planning_heads import BridgeHead, ContextPooler, IntentHead
+from method_diffusion.models.planning_heads import (
+    AlignmentProjector,
+    BridgeHead,
+    ContextPooler,
+    FutureReconHead,
+    IntentHead,
+    compute_alignment_loss,
+)
 from method_diffusion.utils.position_encoding import SequentialPositionalEncoding
 from method_diffusion.utils.visualization import maybe_visualize_future_prediction
 
@@ -57,6 +64,16 @@ class DiffusionFut(nn.Module):
         self.context_pooler = ContextPooler(self.hidden_dim)
         self.intent_head = IntentHead(self.hidden_dim, self.intent_tail_k, self.context_pooler)
         self.bridge_head = BridgeHead(self.hidden_dim, self.intent_tail_k, self.bridge_tau, self.context_pooler)
+
+        # TimeAlign 对齐模块：Future 重建分支 + 对齐投影层（仅训练时使用）
+        self.future_recon_head = FutureReconHead(self.hidden_dim, self.bridge_tau)
+        self.align_projector = AlignmentProjector(self.hidden_dim)
+
+        # 对齐损失权重（可通过 args 配置）
+        self.lambda_recon = float(getattr(args, "lambda_recon", 0.5))
+        self.lambda_align = float(getattr(args, "lambda_align", 0.3))
+        self.align_margin_local = float(getattr(args, "align_margin_local", 0.1))
+        self.align_margin_global = float(getattr(args, "align_margin_global", 0.1))
 
         # DiT 主干与扩散调度器：负责时间嵌入、去噪建模和 DDIM 调度。
         self.timestep_embedder = dit.TimestepEmbedder(self.hidden_dim, self.time_embedding_size)
@@ -146,7 +163,8 @@ class DiffusionFut(nn.Module):
     # 统一计算 fut 分支损失。
     # - planning_aux: planning 分支的辅助输出；为 None 时只计算 diffusion 主损失
     # - lat_enc / lon_enc: [B, 3]，横向/纵向意图 one-hot 标签
-    def computeLoss(self, pred_vel_norm, target_vel_norm, future_phys, anchor_phys, valid_mask, planning_aux=None, lat_enc=None, lon_enc=None, return_parts=False):
+    # - align_aux: 对齐分支的辅助输出（包含 future_hidden, future_recon 等）
+    def computeLoss(self, pred_vel_norm, target_vel_norm, future_phys, anchor_phys, valid_mask, planning_aux=None, lat_enc=None, lon_enc=None, align_aux=None, return_parts=False):
         # diffusion 主损失第一部分：直接约束归一化速度预测。
         loss_vel = F.l1_loss(pred_vel_norm, target_vel_norm, reduction="none")
 
@@ -171,6 +189,10 @@ class DiffusionFut(nn.Module):
         loss_intent_lat = total_mean.new_zeros(())
         loss_intent_lon = total_mean.new_zeros(())
         loss_bridge = total_mean.new_zeros(())  # bridge 短时轨迹监督损失
+        loss_recon = total_mean.new_zeros(())  # future 重建损失
+        loss_align = total_mean.new_zeros(())  # 分布对齐损失
+        L_local = total_mean.new_zeros(())
+        L_global = total_mean.new_zeros(())
 
         if planning_aux is not None:
             # bridge 分支：监督前 tau 帧的短时连接轨迹。
@@ -207,8 +229,34 @@ class DiffusionFut(nn.Module):
 
             loss_intent = loss_intent_lat + loss_intent_lon
 
-            # 总损失 = diffusion 主损失 + planning 辅助损失。
-            loss_total = total_mean + 0.4 * loss_bridge + 0.3 * loss_intent
+            # TimeAlign 对齐损失：重建 + 分布对齐
+            if align_aux is not None:
+                future_hidden = align_aux["future_hidden"]  # [B, τ, H]
+                future_recon = align_aux["future_recon"]    # [B, τ, 2]
+                bridge_proj = align_aux["bridge_proj"]      # [B, τ, H]
+
+                # 重建损失：监督 FutureReconHead 的重建质量
+                tau = future_recon.size(1)
+                gt_future_tau = future_phys[:, :tau, :2]
+                # 计算 GT 位移
+                gt_vel_tau = torch.zeros_like(gt_future_tau)
+                gt_vel_tau[:, 1:, :] = gt_future_tau[:, 1:, :] - gt_future_tau[:, :-1, :]
+                valid_recon = valid_mask[:, :tau].unsqueeze(-1)
+                denom_recon = valid_recon.sum() * 2.0 + 1e-6
+                loss_recon = (F.smooth_l1_loss(future_recon, gt_vel_tau, reduction="none") * valid_recon).sum() / denom_recon
+
+                # 分布对齐损失：将 BridgeHead 的表示拉向 FutureReconHead
+                loss_align, align_loss_aux = compute_alignment_loss(
+                    bridge_proj,
+                    future_hidden,
+                    margin_local=self.align_margin_local,
+                    margin_global=self.align_margin_global,
+                )
+                L_local = align_loss_aux["L_local"]
+                L_global = align_loss_aux["L_global"]
+
+            # 总损失 = diffusion 主损失 + planning 辅助损失 + 对齐损失。
+            loss_total = total_mean + 0.4 * loss_bridge + 0.3 * loss_intent + self.lambda_recon * loss_recon + self.lambda_align * loss_align
 
         if not return_parts:
             return loss_total
@@ -224,6 +272,10 @@ class DiffusionFut(nn.Module):
             "loss_intent_lat": loss_intent_lat.detach(),
             "loss_intent_lon": loss_intent_lon.detach(),
             "loss_bridge": loss_bridge.detach(),
+            "loss_recon": loss_recon.detach(),
+            "loss_align": loss_align.detach(),
+            "L_local": L_local.detach(),
+            "L_global": L_global.detach(),
         }
         return loss_total, parts, pred_pos_phys
 
@@ -298,6 +350,22 @@ class DiffusionFut(nn.Module):
 
         cross_tokens, planning_aux = self.buildCrossTokens(hist, hist_nbrs, mask, temporal_mask)
 
+        # TimeAlign: Future 重建分支（仅训练时使用）
+        future_xy = future_phys[..., :2]  # [B, T_f, 2]
+        future_hidden, future_recon, recon_aux = self.future_recon_head(future_xy)
+
+        # 获取 BridgeHead 的隐层并投影
+        bridge_hidden = planning_aux["bridge_aux"]["bridge_hidden"]  # [B, τ, H]
+        bridge_proj = self.align_projector(bridge_hidden)  # [B, τ, H]
+
+        # 对齐辅助信息
+        align_aux = {
+            "future_hidden": future_hidden,
+            "future_recon": future_recon,
+            "bridge_proj": bridge_proj,
+            "recon_aux": recon_aux,
+        }
+
         # 自条件：以一定概率将前一步的预测结果作为下一步的输入条件，增强模型稳定性和一致性。
         pred_vel_cond = torch.zeros_like(x_t)
         if self.self_condition_prob > 0.0:
@@ -319,6 +387,7 @@ class DiffusionFut(nn.Module):
             planning_aux=planning_aux,
             lat_enc=lat_enc,
             lon_enc=lon_enc,
+            align_aux=align_aux,
             return_parts=True,
         )
 
