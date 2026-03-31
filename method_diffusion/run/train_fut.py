@@ -15,6 +15,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
+from method_diffusion.utils.visualization import maybe_visualize_future_prediction
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
@@ -23,9 +24,6 @@ BEST_MODEL_FDE_WEIGHT = 0.5
 LOSS_STAT_KEYS = [
     "loss",
     "loss_vel",
-    "loss_pos",
-    "loss_intent",
-    "loss_bridge",
 ]
 
 
@@ -79,14 +77,8 @@ def write_csv_log(csv_path, epoch, train_stats, val_stats, eval_ade, eval_fde, s
         "epoch": epoch,
         "train_loss": train_stats["loss"],
         "train_vel_loss": train_stats["loss_vel"],
-        "train_pos_loss": train_stats["loss_pos"],
-        "train_loss_intent": train_stats["loss_intent"],
-        "train_loss_bridge": train_stats["loss_bridge"],
         "val_loss": val_stats["loss"],
         "val_vel_loss": val_stats["loss_vel"],
-        "val_pos_loss": val_stats["loss_pos"],
-        "val_loss_intent": val_stats["loss_intent"],
-        "val_loss_bridge": val_stats["loss_bridge"],
         "val_ade_ft": eval_ade,
         "val_fde_ft": eval_fde,
         "val_ade_m": eval_ade * 0.3048,
@@ -104,14 +96,8 @@ def init_csv_log(csv_path):
         "epoch",
         "train_loss",
         "train_vel_loss",
-        "train_pos_loss",
-        "train_loss_intent",
-        "train_loss_bridge",
         "val_loss",
         "val_vel_loss",
-        "val_pos_loss",
-        "val_loss_intent",
-        "val_loss_bridge",
         "val_ade_ft",
         "val_fde_ft",
         "val_ade_m",
@@ -133,14 +119,8 @@ def build_zero_loss_stats():
 def write_tensorboard_log(writer, epoch, train_stats, val_stats, eval_ade, eval_fde, selection_score, lr):
     writer.add_scalar("Loss/Train", train_stats["loss"], epoch)
     writer.add_scalar("Loss/TrainVel", train_stats["loss_vel"], epoch)
-    writer.add_scalar("Loss/TrainPos", train_stats["loss_pos"], epoch)
-    writer.add_scalar("Loss/TrainIntent", train_stats["loss_intent"], epoch)
-    writer.add_scalar("Loss/TrainBridge", train_stats["loss_bridge"], epoch)
     writer.add_scalar("Loss/Val", val_stats["loss"], epoch)
     writer.add_scalar("Loss/ValVel", val_stats["loss_vel"], epoch)
-    writer.add_scalar("Loss/ValPos", val_stats["loss_pos"], epoch)
-    writer.add_scalar("Loss/ValIntent", val_stats["loss_intent"], epoch)
-    writer.add_scalar("Loss/ValBridge", val_stats["loss_bridge"], epoch)
     writer.add_scalar("Eval/ADE_ft", eval_ade, epoch)
     writer.add_scalar("Eval/FDE_ft", eval_fde, epoch)
     writer.add_scalar("Eval/SelectionScore_ft", selection_score, epoch)
@@ -153,14 +133,8 @@ def print_eval_summary(epoch, total_epochs, train_stats, val_stats, eval_ade, ev
         f"Epoch {epoch}/{total_epochs} | "
         f"train={train_stats['loss']:.6f} | "
         f"train_vel={train_stats['loss_vel']:.6f} | "
-        f"train_pos={train_stats['loss_pos']:.6f} | "
-        f"train_intent={train_stats['loss_intent']:.6f} | "
-        f"train_bridge={train_stats['loss_bridge']:.6f} | "
         f"val={val_stats['loss']:.6f} | "
         f"val_vel={val_stats['loss_vel']:.6f} | "
-        f"val_pos={val_stats['loss_pos']:.6f} | "
-        f"val_intent={val_stats['loss_intent']:.6f} | "
-        f"val_bridge={val_stats['loss_bridge']:.6f} | "
         f"ade={eval_ade:.4f}ft | "
         f"fde={eval_fde:.4f}ft | "
         f"score={selection_score:.4f}"
@@ -180,8 +154,6 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     cclass_nbrs = batch["nbrs_class"]
     mask = batch["mask"]
     temporal_mask = batch["temporal_mask"]
-    lat_enc = batch["lat_enc"]
-    lon_enc = batch["lon_enc"]
 
     if feature_dim == 6:
         hist = torch.cat((hist, va, lane, cclass), dim=-1).to(device)
@@ -200,9 +172,7 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     op_mask = op_mask.to(device)
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
-    lat_enc = lat_enc.to(device)
-    lon_enc = lon_enc.to(device)
-    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc
+    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
 
 # 执行单个训练 epoch 并汇总平均损失。
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
@@ -217,7 +187,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
     )
 
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
             batch,
             feature_dim,
             device=device,
@@ -230,8 +200,6 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
             fut,
             op_mask,
             device,
-            lat_enc=lat_enc,
-            lon_enc=lon_enc,
             return_components=True,
         )
         optimizer.zero_grad()
@@ -248,8 +216,6 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
         pbar.set_postfix({
             "loss": f"{loss.item():.6f}",
             "avg_loss": f"{(totals['loss'] / num_batches):.6f}",
-            "intent": f"{(totals['loss_intent'] / num_batches):.6f}",
-            "bridge": f"{(totals['loss_bridge'] / num_batches):.6f}",
         })
 
     denom = max(num_batches, 1)
@@ -283,7 +249,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio):
     for batch in pbar:
         if num_batches >= target_batches:
             break
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
             batch,
             feature_dim,
             device=device,
@@ -296,8 +262,6 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio):
             fut,
             op_mask,
             device,
-            lat_enc=lat_enc,
-            lon_enc=lon_enc,
             return_components=True,
         )
         _, eval_ade, eval_fde = model.forwardEval(
@@ -320,8 +284,6 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio):
         num_batches += 1
         pbar.set_postfix({
             "val_loss": f"{(totals['loss'] / num_batches):.6f}",
-            "val_intent": f"{(totals['loss_intent'] / num_batches):.6f}",
-            "val_bridge": f"{(totals['loss_bridge'] / num_batches):.6f}",
             "avg_ade_ft": f"{(total_ade / num_batches):.4f}",
             "avg_fde_ft": f"{(total_fde / num_batches):.4f}",
         })

@@ -44,7 +44,7 @@ def get_args_parser():
     parser.add_argument("--T", default=16, type=int)
 
     # Social/history encoder
-    parser.add_argument("--feature_dim", default=4, type=int)
+    parser.add_argument("--feature_dim", default=6, type=int)
     parser.add_argument("--attn_nhead", default=4, type=int)
     parser.add_argument("--attn_out", default=16, type=int)
     parser.add_argument("--encoder_input_dim", default=64, type=int)
@@ -70,10 +70,9 @@ def get_args_parser():
     parser.add_argument("--num_inference_steps", default=15, type=int)
     parser.add_argument("--ddim_eta", default=0.0, type=float)
     parser.add_argument("--x0_clip", default=5.0, type=float)
-    parser.add_argument("--self_condition_prob", default=0.5, type=float)
-    parser.add_argument("--fut_pos_loss_weight", default=1.5, type=float)
-    parser.add_argument("--bridge_tau", default=5, type=int)
-    parser.add_argument("--intent_tail_k", default=4, type=int)
+    parser.add_argument("--radius_fut", default=2, type=int, help="Conv1d radius for adjacent-frame embedding in denoiser (MMPD default=2)")
+    parser.add_argument("--n_gmm_modes", default=3, type=int, help="Number of GMM cluster modes output at inference. ")
+    parser.add_argument("--gmm_K", default=10, type=int, help="Number of independent trajectory samples drawn per scene for GMM clustering. ")
 
     # Fut visualization
     parser.add_argument("--fut_enable_train_vis", default=0, type=int)
@@ -83,6 +82,5 @@ def get_args_parser():
 
     # Eval
     parser.add_argument("--eval_ratio", default=0.5, type=float)
-    parser.add_argument("--num_samples", default=5, type=int)
 
     return parser

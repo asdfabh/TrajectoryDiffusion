@@ -138,9 +138,9 @@ def maybe_visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_t
 
 
 def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, future=None, pred=None,
-                                 pred_all=None, pred_best_idx=None,
+                                 pred_all=None, pred_best_idx=None, mode_probs=None,
                                  future_mask=None, pred_instant=None, intent_probs=None,
-                                 batch_idx=0, metrics=None, input_unit="ft"):
+                                 batch_idx=0, metrics=None, input_unit="ft", top_k_modes=3):
     """绘制 future 预测结果，支持单模态与多模态最佳轨迹高亮。"""
 
     def safe_get_batch(data, b_idx, batch_ndim=3):
@@ -254,6 +254,13 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
     intent_lat = safe_get_batch(None if intent_probs is None else intent_probs.get("lat"), idx, batch_ndim=2)
     intent_lon = safe_get_batch(None if intent_probs is None else intent_probs.get("lon"), idx, batch_ndim=2)
 
+    # Extract per-sample mode probabilities
+    probs_arr = None
+    if mode_probs is not None:
+        mp = _to_numpy(mode_probs)
+        if mp is not None and mp.ndim >= 2 and mp.shape[0] > idx:
+            probs_arr = np.asarray(mp[idx]).reshape(-1)  # [n_modes]
+
     if pred_modes is not None:
         pred_modes = np.asarray(pred_modes)
         if pred_modes.ndim == 2 and pred_modes.shape[-1] >= 2:
@@ -306,30 +313,53 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
     if gt_fut is not None:
         ax.plot(gt_fut[:, 1], gt_fut[:, 0], 'g-o', label='GT Future', markersize=4, linewidth=2, alpha=0.8)
     if pred_modes is not None:
-        non_best_labeled = False
-        for k in range(pred_modes.shape[0]):
+        # Show top top_k_modes modes; mode 0 is highest probability (GMM sorted)
+        n_display = min(top_k_modes, pred_modes.shape[0])
+        # Palette: red for best, blues for others
+        other_colors = ['#5DADE2', '#A9CCE3', '#85C1E9', '#2E86C1']
+
+        for k in range(n_display):
             traj = normalize_traj2d(pred_modes[k])
             if traj is None:
                 continue
-            is_best = (best_k is not None and k == best_k)
-            label = None
+            is_best = (k == 0)
+            color = '#FF0000' if is_best else other_colors[min(k - 1, len(other_colors) - 1)]
+            lw = 2.2 if is_best else 1.4
+            alpha = 0.95 if is_best else 0.70
+            marker = 'o' if is_best else '+'
+            ms = 4 if is_best else 5
+
+            # Build label with probability if available
+            prob_str = ""
+            if probs_arr is not None and k < len(probs_arr):
+                prob_str = f" p={probs_arr[k]:.2f}"
             if is_best:
-                label = 'Pred Best'
-            elif not non_best_labeled:
-                label = 'Pred Modes'
-                non_best_labeled = True
+                label = f"Pred Best{prob_str}"
+            elif k == 1:
+                label = f"Pred Mode 2{prob_str}"
+            else:
+                label = f"Pred Mode {k+1}{prob_str}"
+
             ax.plot(
                 traj[:, 1], traj[:, 0],
-                linestyle='-',
-                marker='o' if is_best else '+',
-                markersize=4 if is_best else 6,
-                markeredgewidth=1.2 if not is_best else 1.0,
-                linewidth=1.4 if not is_best else 2.0,
-                alpha=0.65 if not is_best else 0.95,
-                color='#FF0000' if is_best else '#5DADE2',
-                label=label,
-                zorder=3 if is_best else 2
+                linestyle='-', marker=marker, markersize=ms,
+                markeredgewidth=1.2, linewidth=lw, alpha=alpha,
+                color=color, label=label,
+                zorder=4 if is_best else 2 + k,
             )
+
+            # Annotate probability at trajectory end-point
+            if probs_arr is not None and k < len(probs_arr):
+                ax.annotate(
+                    f"p={probs_arr[k]:.2f}",
+                    xy=(traj[-1, 1], traj[-1, 0]),
+                    xytext=(4, 2),
+                    textcoords="offset points",
+                    fontsize=8,
+                    color=color,
+                    fontweight='bold' if is_best else 'normal',
+                    zorder=6,
+                )
     elif pred_best is not None:
         ax.plot(pred_best[:, 1], pred_best[:, 0], 'r-o', label='Pred', markersize=4, linewidth=2, alpha=0.9)
     if pred_instant_vis is not None:
@@ -381,7 +411,8 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
 
 def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pred, valid_mask, stage,
                                       enable_train_vis=False, enable_eval_vis=False,
-                                      pred_all=None, pred_best_idx=None, pred_instant=None, intent_probs=None,
+                                      pred_all=None, pred_best_idx=None, mode_probs=None,
+                                      pred_instant=None, intent_probs=None,
                                       meter_per_foot=0.3048, batch_idx=0):
     """按配置开关控制 future 预测可视化。"""
     if stage == "train":
@@ -427,6 +458,7 @@ def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pr
         pred=pred,
         pred_all=pred_all,
         pred_best_idx=pred_best_idx,
+        mode_probs=mode_probs,
         future_mask=valid_mask,
         pred_instant=pred_instant,
         intent_probs=intent_probs,

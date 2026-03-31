@@ -288,7 +288,7 @@ def train_epoch(
             device,
             return_components=True,
         )
-        # _, _, _ = model_fut.forwardEval_minADE(hist_for_fut, hist_nbrs, mask, temporal_mask, fut, op_mask, device, K=5)
+        # _, _, _, _, _ = model_fut.forwardEval_multimodal(hist_for_fut, hist_nbrs, mask, temporal_mask, fut, op_mask, device, K=5)
 
         loss_hist_weighted = hist_loss_weight * loss_hist
         loss = loss_fut + loss_hist_weighted

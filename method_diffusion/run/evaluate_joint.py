@@ -159,7 +159,7 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, num_samples
         hist_metrics.update(pred_hist, hist, hist_mask)
 
         if k_samples > 1:
-            pred_fut, _, _ = model_fut.forwardEval_minADE(
+            pred_fut, _, _, _, _ = model_fut.forwardEval_multimodal(
                 pred_hist,
                 hist_nbrs,
                 mask,
@@ -210,7 +210,7 @@ def main():
     print(f"[JointEval] Device: {device}")
     print(f"[JointEval] Hist checkpoint dir: {hist_checkpoint_dir}")
     print(f"[JointEval] Fut checkpoint dir: {fut_checkpoint_dir}")
-    print(f"[JointEval] num_samples={args.num_samples}, num_inference_steps={args.num_inference_steps}")
+    print(f"[JointEval] gmm_K={args.gmm_K}, n_gmm_modes={args.n_gmm_modes}, num_inference_steps={args.num_inference_steps}")
 
     dataloader = build_test_loader(args)
     model_hist = DiffusionPast(args).to(device)
@@ -223,7 +223,7 @@ def main():
         dataloader=dataloader,
         device=device,
         feature_dim=args.feature_dim,
-        num_samples=args.num_samples,
+        num_samples=args.gmm_K,
         mask_ratio=max(0.0, min(1.0, float(args.mask_prob))),
         random_mask_ratio=max(0.0, min(1.0, float(args.random_mask_ratio))),
         block_mask_start=int(args.block_mask_start) > 0,
