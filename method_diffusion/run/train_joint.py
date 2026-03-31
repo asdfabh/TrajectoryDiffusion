@@ -171,8 +171,7 @@ def init_csv_log(csv_path):
         "train_hist_loss",
         "train_hist_loss_weighted",
         "train_fut_loss",
-        "train_fut_vel_loss",
-        "train_fut_pos_loss",
+        "train_fut_noise_loss",
         "val_ade_ft",
         "val_fde_ft",
         "val_ade_m",
@@ -192,8 +191,7 @@ def write_csv_log(csv_path, epoch, train_stats, eval_ade, eval_fde, lr_fut, lr_h
         "train_hist_loss": train_stats["loss_hist"],
         "train_hist_loss_weighted": train_stats["loss_hist_weighted"],
         "train_fut_loss": train_stats["loss_fut"],
-        "train_fut_vel_loss": train_stats["loss_vel"],
-        "train_fut_pos_loss": train_stats["loss_pos"],
+        "train_fut_noise_loss": train_stats["loss_noise"],
         "val_ade_ft": eval_ade,
         "val_fde_ft": eval_fde,
         "val_ade_m": eval_ade * 0.3048,
@@ -257,8 +255,7 @@ def train_epoch(
     total_hist_loss = 0.0
     total_hist_loss_weighted = 0.0
     total_fut_loss = 0.0
-    total_vel_loss = 0.0
-    total_pos_loss = 0.0
+    total_noise_loss = 0.0
     num_batches = 0
 
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Train", ncols=140)
@@ -306,16 +303,14 @@ def train_epoch(
         total_hist_loss += float(loss_hist.item())
         total_hist_loss_weighted += float(loss_hist_weighted.item())
         total_fut_loss += float(loss_fut.item())
-        total_vel_loss += float(fut_parts["loss_vel"].item())
-        total_pos_loss += float(fut_parts["loss_pos"].item())
+        total_noise_loss += float(fut_parts["loss_noise"].item())
         num_batches += 1
         pbar.set_postfix({
             "loss": f"{loss.item():.6f}",
             "avg": f"{(total_loss / num_batches):.6f}",
             "hist": f"{(total_hist_loss / num_batches):.6f}",
             "fut": f"{(total_fut_loss / num_batches):.6f}",
-            "vel": f"{(total_vel_loss / num_batches):.6f}",
-            "pos": f"{(total_pos_loss / num_batches):.6f}",
+            "noise": f"{(total_noise_loss / num_batches):.6f}",
         })
 
     denom = max(num_batches, 1)
@@ -324,8 +319,7 @@ def train_epoch(
         "loss_hist": total_hist_loss / denom,
         "loss_hist_weighted": total_hist_loss_weighted / denom,
         "loss_fut": total_fut_loss / denom,
-        "loss_vel": total_vel_loss / denom,
-        "loss_pos": total_pos_loss / denom,
+        "loss_noise": total_noise_loss / denom,
     }
 
 
@@ -523,8 +517,7 @@ def main():
         writer.add_scalar("Loss/TrainHist", train_stats["loss_hist"], epoch + 1)
         writer.add_scalar("Loss/TrainHistWeighted", train_stats["loss_hist_weighted"], epoch + 1)
         writer.add_scalar("Loss/TrainFut", train_stats["loss_fut"], epoch + 1)
-        writer.add_scalar("Loss/TrainVel", train_stats["loss_vel"], epoch + 1)
-        writer.add_scalar("Loss/TrainPos", train_stats["loss_pos"], epoch + 1)
+        writer.add_scalar("Loss/TrainNoise", train_stats["loss_noise"], epoch + 1)
         writer.add_scalar("Eval/ADE_ft", eval_ade, epoch + 1)
         writer.add_scalar("Eval/FDE_ft", eval_fde, epoch + 1)
 

@@ -121,8 +121,7 @@ def train_epoch(
     total_hist_loss = 0.0
     total_hist_loss_weighted = 0.0
     total_fut_loss = 0.0
-    total_vel_loss = 0.0
-    total_pos_loss = 0.0
+    total_noise_loss = 0.0
     num_batches = 0
 
     pbar = tqdm(
@@ -176,8 +175,7 @@ def train_epoch(
         total_hist_loss += float(loss_hist.item())
         total_hist_loss_weighted += float(loss_hist_weighted.item())
         total_fut_loss += float(loss_fut.item())
-        total_vel_loss += float(fut_parts["loss_vel"].item())
-        total_pos_loss += float(fut_parts["loss_pos"].item())
+        total_noise_loss += float(fut_parts["loss_noise"].item())
         num_batches += 1
 
         if is_main_process(rank):
@@ -186,8 +184,7 @@ def train_epoch(
                 "avg": f"{(total_loss / num_batches):.6f}",
                 "hist": f"{(total_hist_loss / num_batches):.6f}",
                 "fut": f"{(total_fut_loss / num_batches):.6f}",
-                "vel": f"{(total_vel_loss / num_batches):.6f}",
-                "pos": f"{(total_pos_loss / num_batches):.6f}",
+                "noise": f"{(total_noise_loss / num_batches):.6f}",
             })
 
     stats = torch.tensor(
@@ -196,23 +193,21 @@ def train_epoch(
             total_hist_loss,
             total_hist_loss_weighted,
             total_fut_loss,
-            total_vel_loss,
-            total_pos_loss,
+            total_noise_loss,
             float(num_batches),
         ],
         device=device,
         dtype=torch.float64,
     )
     stats = reduce_tensor(stats)
-    denom = max(int(stats[6].item()), 1)
+    denom = max(int(stats[5].item()), 1)
 
     return {
         "loss": float(stats[0].item()) / denom,
         "loss_hist": float(stats[1].item()) / denom,
         "loss_hist_weighted": float(stats[2].item()) / denom,
         "loss_fut": float(stats[3].item()) / denom,
-        "loss_vel": float(stats[4].item()) / denom,
-        "loss_pos": float(stats[5].item()) / denom,
+        "loss_noise": float(stats[4].item()) / denom,
     }
 
 
@@ -445,8 +440,7 @@ def main():
             writer.add_scalar("Loss/TrainHist", train_stats["loss_hist"], epoch + 1)
             writer.add_scalar("Loss/TrainHistWeighted", train_stats["loss_hist_weighted"], epoch + 1)
             writer.add_scalar("Loss/TrainFut", train_stats["loss_fut"], epoch + 1)
-            writer.add_scalar("Loss/TrainVel", train_stats["loss_vel"], epoch + 1)
-            writer.add_scalar("Loss/TrainPos", train_stats["loss_pos"], epoch + 1)
+            writer.add_scalar("Loss/TrainNoise", train_stats["loss_noise"], epoch + 1)
             writer.add_scalar("Eval/ADE_ft", eval_ade, epoch + 1)
             writer.add_scalar("Eval/FDE_ft", eval_fde, epoch + 1)
             print(

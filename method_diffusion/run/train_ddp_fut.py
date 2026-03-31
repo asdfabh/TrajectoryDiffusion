@@ -102,7 +102,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
     )
 
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
             batch,
             feature_dim,
             device=device,
@@ -115,8 +115,6 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
             fut,
             op_mask,
             device,
-            lat_enc=lat_enc,
-            lon_enc=lon_enc,
             return_components=True,
         )
 
@@ -137,8 +135,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
                 {
                     "loss": f"{loss.item():.6f}",
                     "avg_loss": f"{(totals['loss'] / num_batches):.6f}",
-                    "intent": f"{(totals['loss_intent'] / num_batches):.6f}",
-                    "bridge": f"{(totals['loss_bridge'] / num_batches):.6f}",
+                    "noise": f"{(totals['loss_noise'] / num_batches):.6f}",
                 }
             )
 
@@ -192,7 +189,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
         if num_batches >= target_batches:
             break
 
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
             batch,
             feature_dim,
             device=device,
@@ -205,8 +202,6 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
             fut,
             op_mask,
             device,
-            lat_enc=lat_enc,
-            lon_enc=lon_enc,
             return_components=True,
         )
         _, eval_ade, eval_fde = fut_model.forwardEval(
@@ -232,8 +227,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
             pbar.set_postfix(
                 {
                     "val_loss": f"{(totals['loss'] / num_batches):.6f}",
-                    "val_intent": f"{(totals['loss_intent'] / num_batches):.6f}",
-                    "val_bridge": f"{(totals['loss_bridge'] / num_batches):.6f}",
+                    "val_noise": f"{(totals['loss_noise'] / num_batches):.6f}",
                     "avg_ade_ft": f"{(total_ade / num_batches):.4f}",
                     "avg_fde_ft": f"{(total_fde / num_batches):.4f}",
                 }

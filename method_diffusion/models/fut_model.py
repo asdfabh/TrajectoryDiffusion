@@ -5,7 +5,6 @@ from diffusers.schedulers import DDIMScheduler
 
 from method_diffusion.models import dit_fut as dit
 from method_diffusion.models.hist_encoder import HistEncoder
-from method_diffusion.models.planning_heads import BridgeHead, ContextPooler, IntentHead
 from method_diffusion.utils.position_encoding import SequentialPositionalEncoding
 from method_diffusion.utils.visualization import maybe_visualize_future_prediction
 
@@ -28,19 +27,11 @@ class DiffusionFut(nn.Module):
         self.time_embedding_size = int(args.time_embedding_size_fut)
         self.T = int(args.T_f)
 
-        # planning 分支参数：瞬时预测帧数、采用的hist 尾部帧数
-        self.bridge_tau = int(getattr(args, "bridge_tau", 5))
-        self.intent_tail_k = int(getattr(args, "intent_tail_k", 4))
-
         # 扩散与推理参数：控制训练时间步、推理步数和 DDIM 采样行为。
         self.num_train_timesteps = int(args.num_train_timesteps_fut)
         self.num_inference_steps = int(args.num_inference_steps)
         self.ddim_eta = float(args.ddim_eta)
         self.x0_clip = float(args.x0_clip) if float(args.x0_clip) > 0 else None
-
-        # 训练策略与损失参数：控制自条件训练和损失项权重。
-        self.self_condition_prob = min(max(float(args.self_condition_prob), 0.0), 1.0)
-        self.pos_loss_weight = max(0.0, float(args.fut_pos_loss_weight))
 
         # 可视化参数：仅决定训练和评估阶段是否绘图。
         self.fut_enable_train_vis = int(args.fut_enable_train_vis) > 0
@@ -48,22 +39,17 @@ class DiffusionFut(nn.Module):
         self.meter_per_foot = 0.3048
 
         # 输入编码模块：分别处理 future 噪声序列和 history context。
-        self.input_embedding = nn.Linear(self.input_dim * 2, self.hidden_dim)
+        self.input_embedding = nn.Linear(self.input_dim, self.hidden_dim)
         self.context_embedding = nn.Linear(self.hidden_dim, self.hidden_dim)
         self.pos_embedding = SequentialPositionalEncoding(self.hidden_dim)
         self.hist_encoder = HistEncoder(args)
-
-        # planning 分支：从 history context 提取意图 token 与桥接 token。
-        self.context_pooler = ContextPooler(self.hidden_dim)
-        self.intent_head = IntentHead(self.hidden_dim, self.intent_tail_k, self.context_pooler)
-        self.bridge_head = BridgeHead(self.hidden_dim, self.intent_tail_k, self.bridge_tau, self.context_pooler)
 
         # DiT 主干与扩散调度器：负责时间嵌入、去噪建模和 DDIM 调度。
         self.timestep_embedder = dit.TimestepEmbedder(self.hidden_dim, self.time_embedding_size)
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=self.num_train_timesteps,
             beta_schedule="squaredcos_cap_v2",
-            prediction_type="sample",
+            prediction_type="epsilon",
             clip_sample=False,
         )
 
@@ -71,20 +57,10 @@ class DiffusionFut(nn.Module):
         final_layer = dit.FinalLayer(self.hidden_dim, self.T, self.output_dim)
         self.dit = dit.DiT(dit_block=dit_block, final_layer=final_layer, depth=self.depth, model_type="x_start")
 
-        # 双空间归一化参数
-        # 物理坐标归一化参数 (给历史轨迹编码和宏观位置 Loss 使用)
         if self.dataset_name == "ngsim":
-            self.register_buffer("pos_mean", torch.tensor([0.05076411229651117, -31.318518632454474], dtype=torch.float32), persistent=False)
-            self.register_buffer("pos_std", torch.tensor([9.67614343193339, 59.53730335210165], dtype=torch.float32), persistent=False)
-            self.register_buffer("va_mean", torch.tensor([21.150308365503957, 0.006041414014469039], dtype=torch.float32), persistent=False)
-            self.register_buffer("va_std", torch.tensor([13.598306447881924, 4.505736504111998], dtype=torch.float32), persistent=False)
             self.register_buffer("vel_mean", torch.tensor([-0.004181504611623526, 5.041936610524995], dtype=torch.float32), persistent=False)
             self.register_buffer("vel_std", torch.tensor([0.1502223350250087, 2.951254134709027], dtype=torch.float32), persistent=False)
         elif self.dataset_name == "highd":
-            self.register_buffer("pos_mean", torch.tensor([-0.39106148272179536, -115.63853904936501], dtype=torch.float32), persistent=False)
-            self.register_buffer("pos_std", torch.tensor([9.266579303046143, 98.49671326349531], dtype=torch.float32), persistent=False)
-            self.register_buffer("va_mean", torch.tensor([78.09292302772707, -0.04991240184019581], dtype=torch.float32), persistent=False)
-            self.register_buffer("va_std", torch.tensor([29.215909315170098, 1.1700240860076556], dtype=torch.float32), persistent=False)
             self.register_buffer("vel_mean", torch.tensor([0.004845835373614644, 17.01558226555126], dtype=torch.float32), persistent=False)
             self.register_buffer("vel_std", torch.tensor([0.10621210903901461, 4.838376260255577], dtype=torch.float32), persistent=False)
         else:
@@ -97,12 +73,11 @@ class DiffusionFut(nn.Module):
     def toValidMask(op_mask, device):
         return (op_mask[..., 0] > 0.5).float().to(device)
 
-    # 基于当前噪声状态与 planning-aware cross 条件预测归一化速度。
-    def predictX0(self, x_t, timesteps, cross_tokens, pred_x0_cond):
+    # 基于当前噪声状态与 history context 预测 epsilon。
+    def predictNoise(self, x_t, timesteps, context_tokens):
         t_emb = self.timestep_embedder(timesteps)
-        combined_input = torch.cat([x_t, pred_x0_cond], dim=-1)
-        input_embedded = self.input_embedding(combined_input) + self.pos_embedding(x_t)
-        cross_encoded = self.context_embedding(cross_tokens)
+        input_embedded = self.input_embedding(x_t) + self.pos_embedding(x_t)
+        cross_encoded = self.context_embedding(context_tokens)
         return self.dit(
             x=input_embedded,
             t_cond=t_emb,
@@ -110,122 +85,24 @@ class DiffusionFut(nn.Module):
         )
 
     def encodeContext(self, hist, hist_nbrs, mask, temporal_mask):
-        hist_norm = self.normalize(hist)
-        hist_nbrs_norm = self.normalize(hist_nbrs)
-        context, _ = self.hist_encoder(hist_norm, hist_nbrs_norm, mask, temporal_mask)
+        context, _ = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
         return context
 
-    # 构造送入 future DiT cross-attn 的 planning-aware cross tokens。
-    def buildCrossTokens(self, hist, hist_nbrs, mask, temporal_mask):
-        context = self.encodeContext(hist, hist_nbrs, mask, temporal_mask)  # [B, T_ctx, H]
-        hist_xy = hist[..., :2]  # [B, T_hist, 2]，planning 分支仅使用 xy。
-
-        # IntentHead: 输出单一 intent_token [B, 1, H]
-        intent_token, intent_aux = self.intent_head(context, hist_xy)
-
-        # BridgeHead: 仅使用 hist + context，不需要 intent 引导
-        bridge_tokens, bridge_aux = self.bridge_head(
-            context=context,
-            hist_xy=hist_xy,
-        )
-
-        # 拼接 cross tokens: [context ; intent_token ; bridge_tokens]
-        cross_tokens = torch.cat([context, intent_token, bridge_tokens], dim=1)  # [B, T_ctx+1+tau, H]
-
-        planning_aux = {
-            "context": context,
-            "hist_xy": hist_xy,
-            "intent_aux": intent_aux,
-            "intent_token": intent_token,
-            "bridge_aux": bridge_aux,
-            "bridge_tokens": bridge_tokens,
-            "cross_tokens": cross_tokens,
-        }
-        return cross_tokens, planning_aux
-
-    # 统一计算 fut 分支损失。
-    # - planning_aux: planning 分支的辅助输出；为 None 时只计算 diffusion 主损失
-    # - lat_enc / lon_enc: [B, 3]，横向/纵向意图 one-hot 标签
-    def computeLoss(self, pred_vel_norm, target_vel_norm, future_phys, anchor_phys, valid_mask, planning_aux=None, lat_enc=None, lon_enc=None, return_parts=False):
-        # diffusion 主损失第一部分：直接约束归一化速度预测。
-        loss_vel = F.l1_loss(pred_vel_norm, target_vel_norm, reduction="none")
-
-        # 将预测速度还原到物理空间，并从历史锚点开始积分为 future 位置。
-        std_vel = self.vel_std.view(1, 1, 2).to(pred_vel_norm.device)
-        mean_vel = self.vel_mean.view(1, 1, 2).to(pred_vel_norm.device)
-        pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
-        pred_pos_phys = torch.cumsum(pred_vel_phys, dim=1) + anchor_phys[..., :2]
-
-        # diffusion 主损失第二部分：约束积分后的物理位置轨迹。
-        loss_pos = F.l1_loss(pred_pos_phys, future_phys[..., :2], reduction="none")
-        total_loss = loss_vel + self.pos_loss_weight * loss_pos
-
-        # 只在有效 future 帧上聚合 diffusion 主损失。
+    def computeLoss(self, pred_eps, noise, valid_mask, return_parts=False):
+        loss_noise = F.mse_loss(pred_eps, noise, reduction="none")
         valid = valid_mask.unsqueeze(-1)
-        numer = (total_loss * valid).sum(dim=(1, 2))
-        denom = valid.sum(dim=(1, 2)) + 1e-6
-        total_mean = (numer / denom).mean()
-
-        loss_total = total_mean
-        loss_intent = total_mean.new_zeros(())  # 意图分类损失
-        loss_intent_lat = total_mean.new_zeros(())
-        loss_intent_lon = total_mean.new_zeros(())
-        loss_bridge = total_mean.new_zeros(())  # bridge 短时轨迹监督损失
-
-        if planning_aux is not None:
-            # bridge 分支：监督前 tau 帧的短时连接轨迹。
-            bridge_aux = planning_aux["bridge_aux"]
-            bridge_pos = bridge_aux["bridge_pos"]  # [B, tau, 2]
-            bridge_vel = bridge_aux["bridge_vel"]  # [B, tau, 2]
-            tau = min(self.bridge_tau, future_phys.size(1), bridge_pos.size(1))
-            if tau > 0:
-                gt_bridge_pos = future_phys[:, :tau, :2]
-                prev_pos = torch.cat([gt_bridge_pos.new_zeros(gt_bridge_pos.size(0), 1, 2), gt_bridge_pos[:, :-1, :]], dim=1)
-                gt_bridge_vel = gt_bridge_pos - prev_pos
-                valid_bridge = valid_mask[:, :tau].unsqueeze(-1)
-                denom_bridge = valid_bridge.sum() * 2.0 + 1e-6
-                loss_bridge_vel = (F.smooth_l1_loss(bridge_vel[:, :tau, :], gt_bridge_vel, reduction="none") * valid_bridge).sum() / denom_bridge
-                loss_bridge_pos = (F.smooth_l1_loss(bridge_pos[:, :tau, :], gt_bridge_pos, reduction="none") * valid_bridge).sum() / denom_bridge
-                loss_bridge = loss_bridge_pos + 0.5 * loss_bridge_vel
-
-            # intent 分支：横纵向分别监督，使用 class-weighted CE
-            intent_aux = planning_aux["intent_aux"]
-
-            if lat_enc is not None:
-                lat_target = lat_enc.argmax(dim=-1).long()
-                # 类别权重：变道类上采样，直行类下采样
-                # lat: 左变道=0, 直行=1, 右变道=2
-                lat_weights = torch.tensor([4.0, 0.5, 4.0], device=lat_target.device, dtype=pred_vel_norm.dtype)
-                loss_intent_lat = F.cross_entropy(intent_aux["logits_lat"], lat_target, weight=lat_weights)
-
-            if lon_enc is not None:
-                lon_target = lon_enc.argmax(dim=-1).long()
-                # 类别权重：加减速类上采样，匀速类下采样
-                # lon: 减速=0, 匀速=1, 加速=2
-                lon_weights = torch.tensor([1.5, 0.7, 1.5], device=lon_target.device, dtype=pred_vel_norm.dtype)
-                loss_intent_lon = F.cross_entropy(intent_aux["logits_lon"], lon_target, weight=lon_weights)
-
-            loss_intent = loss_intent_lat + loss_intent_lon
-
-            # 总损失 = diffusion 主损失 + planning 辅助损失。
-            loss_total = total_mean + 0.4 * loss_bridge + 0.3 * loss_intent
+        denom = valid.sum() * noise.size(-1) + 1e-6
+        loss_total = (loss_noise * valid).sum() / denom
 
         if not return_parts:
             return loss_total
 
-        vel_mean = ((loss_vel * valid).sum(dim=(1, 2)) / denom).mean()
-        pos_mean = ((loss_pos * valid).sum(dim=(1, 2)) / denom).mean()
         parts = {
             "loss_total": loss_total.detach(),
-            "loss_diffusion": total_mean.detach(),
-            "loss_vel": vel_mean.detach(),
-            "loss_pos": pos_mean.detach(),
-            "loss_intent": loss_intent.detach(),
-            "loss_intent_lat": loss_intent_lat.detach(),
-            "loss_intent_lon": loss_intent_lon.detach(),
-            "loss_bridge": loss_bridge.detach(),
+            "loss_diffusion": loss_total.detach(),
+            "loss_noise": loss_total.detach(),
         }
-        return loss_total, parts, pred_pos_phys
+        return loss_total, parts
 
     # 计算 batch 级别的 ADE 与 FDE 指标。
     @staticmethod
@@ -240,24 +117,28 @@ class DiffusionFut(nn.Module):
         fde = (final_dist * has_valid.float()).sum() / (has_valid.float().sum() + 1e-6)
         return ade, fde
 
-    # 执行推理阶段的 DDIM 采样并输出最终预测结果（相对坐标系）。
-    def sampleFromXt(self, x_t, cross_tokens, infer_scheduler):
-        bsz, t_len, _ = x_t.shape
-        pred_vel_cond = torch.zeros((bsz, t_len, self.output_dim), device=x_t.device, dtype=x_t.dtype)
+    def decodeVelocityToTrajectory(self, pred_vel_norm, anchor_phys):
+        std_vel = self.vel_std.view(1, 1, 2).to(pred_vel_norm.device)
+        mean_vel = self.vel_mean.view(1, 1, 2).to(pred_vel_norm.device)
+        pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
+        pred_pos_phys = torch.cumsum(pred_vel_phys, dim=1) + anchor_phys[..., :2]
+        return pred_vel_phys, pred_pos_phys
+
+    # 执行推理阶段的 DDIM 采样并输出最终预测结果（归一化速度）。
+    def sampleFromXt(self, x_t, context_tokens, infer_scheduler):
         for t in infer_scheduler.timesteps:
             t_scalar = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
-            timesteps = torch.full((bsz,), t_scalar, device=x_t.device, dtype=torch.long)
+            timesteps = torch.full((x_t.size(0),), t_scalar, device=x_t.device, dtype=torch.long)
+            pred_eps = self.predictNoise(x_t, timesteps, context_tokens)
 
-            pred_vel_norm = self.predictX0(x_t, timesteps, cross_tokens, pred_vel_cond)
-            if self.x0_clip is not None:
-                pred_vel_norm = torch.clamp(pred_vel_norm, -self.x0_clip, self.x0_clip)
-
-            pred_vel_cond = pred_vel_norm.detach()
             try:
-                x_t = infer_scheduler.step(pred_vel_norm, t, x_t, eta=self.ddim_eta).prev_sample
+                x_t = infer_scheduler.step(pred_eps, t, x_t, eta=self.ddim_eta).prev_sample
             except TypeError:
-                x_t = infer_scheduler.step(pred_vel_norm, t, x_t).prev_sample
-        return pred_vel_cond
+                x_t = infer_scheduler.step(pred_eps, t, x_t).prev_sample
+
+        if self.x0_clip is not None:
+            x_t = torch.clamp(x_t, -self.x0_clip, self.x0_clip)
+        return x_t
 
     # 统一准备评估阶段所需的条件编码、掩码和调度器参数。
     def prepareEvalInputs(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
@@ -265,15 +146,13 @@ class DiffusionFut(nn.Module):
         valid_mask = self.toValidMask(op_mask, device)
         anchor_phys = hist[:, -1:, :self.output_dim]
         future_phys = future[..., :self.output_dim]
-        cross_tokens, planning_aux = self.buildCrossTokens(hist, hist_nbrs, mask, temporal_mask)
+        context_tokens = self.encodeContext(hist, hist_nbrs, mask, temporal_mask)
         infer_scheduler = DDIMScheduler.from_config(self.diffusion_scheduler.config)
         infer_scheduler.set_timesteps(self.num_inference_steps)
-        std_vel = self.vel_std.view(1, 1, 2).to(device)
-        mean_vel = self.vel_mean.view(1, 1, 2).to(device)
-        return bsz, t_len, valid_mask, anchor_phys, future_phys, cross_tokens, planning_aux, infer_scheduler, std_vel, mean_vel
+        return bsz, t_len, valid_mask, anchor_phys, future_phys, context_tokens, infer_scheduler
 
     # 执行单个 batch 的 fut 训练前向与损失计算。
-    def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, lat_enc=None, lon_enc=None, return_components=False):
+    def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, return_components=False):
         bsz, t_len, _ = future.shape  # [B, T_f, D]
         valid_mask = self.toValidMask(op_mask, device)  # [B, T_f]
 
@@ -296,36 +175,26 @@ class DiffusionFut(nn.Module):
         timesteps = torch.randint(0, self.num_train_timesteps, (bsz,), device=device).long()
         x_t = self.diffusion_scheduler.add_noise(target_vel_norm, noise, timesteps)
 
-        cross_tokens, planning_aux = self.buildCrossTokens(hist, hist_nbrs, mask, temporal_mask)
+        context_tokens = self.encodeContext(hist, hist_nbrs, mask, temporal_mask)
 
-        # 自条件：以一定概率将前一步的预测结果作为下一步的输入条件，增强模型稳定性和一致性。
-        pred_vel_cond = torch.zeros_like(x_t)
-        if self.self_condition_prob > 0.0:
-            use_sc = (torch.rand(bsz, 1, 1, device=device) < self.self_condition_prob).float()
-            if use_sc.any():
-                with torch.no_grad():
-                    prev_pred_vel = self.predictX0(x_t, timesteps, cross_tokens, pred_vel_cond)
-                pred_vel_cond = prev_pred_vel.detach() * use_sc
+        # 网络输出：预测的噪声 epsilon。
+        pred_eps = self.predictNoise(x_t, timesteps, context_tokens)
 
-        # 网络输出：预测的归一化速度。
-        pred_vel_norm_t = self.predictX0(x_t, timesteps, cross_tokens, pred_vel_cond)
-
-        loss, loss_parts, pred_pos_phys = self.computeLoss(
-            pred_vel_norm_t,
-            target_vel_norm,
-            future_phys,
-            anchor_phys,
+        loss, loss_parts = self.computeLoss(
+            pred_eps,
+            noise,
             valid_mask,
-            planning_aux=planning_aux,
-            lat_enc=lat_enc,
-            lon_enc=lon_enc,
             return_parts=True,
         )
 
         if self.fut_enable_train_vis:
+            infer_scheduler = DDIMScheduler.from_config(self.diffusion_scheduler.config)
+            infer_scheduler.set_timesteps(self.num_inference_steps)
+            x_t_vis = torch.randn((bsz, t_len, self.input_dim), device=device)
+            pred_vel_norm = self.sampleFromXt(x_t_vis, context_tokens, infer_scheduler)
+            _, pred_pos_phys = self.decodeVelocityToTrajectory(pred_vel_norm, anchor_phys)
             pred_phys_abs = future_phys.clone()
             pred_phys_abs[..., :2] = pred_pos_phys
-            vis_payload = self.buildVisualizationPayload(planning_aux)
             maybe_visualize_future_prediction(
                 hist=hist,
                 hist_nbrs=hist_nbrs,
@@ -336,8 +205,6 @@ class DiffusionFut(nn.Module):
                 stage="train",
                 enable_train_vis=self.fut_enable_train_vis,
                 enable_eval_vis=self.fut_enable_eval_vis,
-                pred_instant=None if vis_payload is None else vis_payload["pred_instant"],
-                intent_probs=None if vis_payload is None else vis_payload["intent_probs"],
                 meter_per_foot=self.meter_per_foot,
             )
 
@@ -354,24 +221,19 @@ class DiffusionFut(nn.Module):
             valid_mask,
             anchor_phys,
             future_phys,
-            cross_tokens,
-            planning_aux,
             infer_scheduler,
-            std_vel,
-            mean_vel,
+            context_tokens,
         ) = self.prepareEvalInputs(hist, hist_nbrs, mask, temporal_mask, future, op_mask, device)
 
         x_t = torch.randn((bsz, t_len, self.input_dim), device=device)
-        pred_vel_norm = self.sampleFromXt(x_t, cross_tokens, infer_scheduler)
+        pred_vel_norm = self.sampleFromXt(x_t, context_tokens, infer_scheduler)
 
         # 积分还原：解归一化 -> 累加 -> 拼接绝对锚点。
-        pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
-        pred_pos_phys = torch.cumsum(pred_vel_phys, dim=1) + anchor_phys[..., :2]
+        _, pred_pos_phys = self.decodeVelocityToTrajectory(pred_vel_norm, anchor_phys)
         pred_phys_abs = future_phys.clone()
         pred_phys_abs[..., :2] = pred_pos_phys
 
         ade, fde = self.computeAdeFde(pred_phys_abs, future, valid_mask)
-        vis_payload = self.buildVisualizationPayload(planning_aux)
         maybe_visualize_future_prediction(
             hist=hist,
             hist_nbrs=hist_nbrs,
@@ -382,12 +244,10 @@ class DiffusionFut(nn.Module):
             stage="eval",
             enable_train_vis=self.fut_enable_train_vis,
             enable_eval_vis=self.fut_enable_eval_vis,
-            pred_instant=None if vis_payload is None else vis_payload["pred_instant"],
-            intent_probs=None if vis_payload is None else vis_payload["intent_probs"],
             meter_per_foot=self.meter_per_foot,
         )
         if return_aux:
-            return pred_phys_abs, ade, fde, vis_payload
+            return pred_phys_abs, ade, fde, None
         return pred_phys_abs, ade, fde
 
     @torch.no_grad()
@@ -399,28 +259,24 @@ class DiffusionFut(nn.Module):
             valid_mask,
             anchor_phys,
             future_phys,
-            cross_tokens,
-            planning_aux,
             infer_scheduler,
-            std_vel,
-            mean_vel,
+            context_tokens,
         ) = self.prepareEvalInputs(hist, hist_nbrs, mask, temporal_mask, future, op_mask, device)
 
         # 核心提速优化：在 Batch 维度上并行展开 K 倍。
-        cross_tokens_k = cross_tokens.repeat_interleave(K, dim=0)
+        context_tokens_k = context_tokens.repeat_interleave(K, dim=0)
 
         # 一次性生成 bsz * K 份随机噪声，并行执行完整的去噪过程。
         x_t_k = torch.randn((bsz * K, t_len, self.input_dim), device=device)
-        pred_vel_norm_k = self.sampleFromXt(x_t_k, cross_tokens_k, infer_scheduler)
+        pred_vel_norm_k = self.sampleFromXt(x_t_k, context_tokens_k, infer_scheduler)
 
         # 把并发结果 Reshape 回 [bsz, K, t_len, dim]。
         pred_vel_norm = pred_vel_norm_k.view(bsz, K, t_len, self.output_dim)
 
         # 积分还原物理坐标 (张量广播)。
-        std_vel_k = std_vel.unsqueeze(1)
-        mean_vel_k = mean_vel.unsqueeze(1)
-        pred_vel_phys = pred_vel_norm * std_vel_k + mean_vel_k
-
+        std_vel = self.vel_std.view(1, 1, 1, 2).to(device)
+        mean_vel = self.vel_mean.view(1, 1, 1, 2).to(device)
+        pred_vel_phys = pred_vel_norm * std_vel + mean_vel
         anchor_phys_k = anchor_phys[..., :2].unsqueeze(1)
         pred_pos_phys = torch.cumsum(pred_vel_phys, dim=2) + anchor_phys_k
 
@@ -445,7 +301,6 @@ class DiffusionFut(nn.Module):
         self.last_minade_best_idx = best_k_idx.detach()
 
         ade_batch, fde_batch = self.computeAdeFde(best_pred_phys, future, valid_mask)
-        vis_payload = self.buildVisualizationPayload(planning_aux)
         maybe_visualize_future_prediction(
             hist=hist,
             hist_nbrs=hist_nbrs,
@@ -458,17 +313,15 @@ class DiffusionFut(nn.Module):
             enable_eval_vis=self.fut_enable_eval_vis,
             pred_all=all_preds,
             pred_best_idx=best_k_idx,
-            pred_instant=None if vis_payload is None else vis_payload["pred_instant"],
-            intent_probs=None if vis_payload is None else vis_payload["intent_probs"],
             meter_per_foot=self.meter_per_foot,
         )
 
         if return_aux:
-            return best_pred_phys, ade_batch, fde_batch, vis_payload
+            return best_pred_phys, ade_batch, fde_batch, None
         return best_pred_phys, ade_batch, fde_batch
 
     # 统一前向入口，默认复用训练路径。
-    def forward(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, lat_enc=None, lon_enc=None, return_components=False):
+    def forward(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, return_components=False):
         return self.forwardTrain(
             hist,
             hist_nbrs,
@@ -477,34 +330,5 @@ class DiffusionFut(nn.Module):
             future,
             op_mask,
             device,
-            lat_enc=lat_enc,
-            lon_enc=lon_enc,
             return_components=return_components,
         )
-
-    # 对历史输入的坐标与运动学特征做归一化。
-    def normalize(self, x):
-        x_norm = x.clone()
-        x_norm[..., 0:2] = (x[..., 0:2] - self.pos_mean) / self.pos_std
-        x_norm[..., 0:2] = torch.clamp(x_norm[..., 0:2], -10.0, 10.0)
-        channels = x_norm.shape[-1]
-        if channels >= 4:
-            x_norm[..., 2:4] = (x[..., 2:4] - self.va_mean) / self.va_std
-            x_norm[..., 2:4] = torch.clamp(x_norm[..., 2:4], -10.0, 10.0)
-        return x_norm
-
-    @staticmethod
-    def buildVisualizationPayload(planning_aux):
-        if planning_aux is None:
-            return None
-
-        intent_aux = planning_aux.get("intent_aux", {})
-        bridge_aux = planning_aux.get("bridge_aux", {})
-        return {
-            "pred_instant": bridge_aux.get("bridge_pos"),
-            "intent_probs": {
-                "lat": intent_aux.get("p_lat"),
-                "lon": intent_aux.get("p_lon"),
-            },
-            "intent_token": planning_aux.get("intent_token"),
-        }
