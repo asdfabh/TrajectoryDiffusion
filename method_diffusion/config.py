@@ -65,6 +65,22 @@ def get_args_parser():
     parser.add_argument("--num_train_timesteps_fut", default=200, type=int)
     parser.add_argument("--time_embedding_size_fut", default=256, type=int)
     parser.add_argument("--T_f", default=25, type=int)
+    parser.add_argument("--num_modes", default=18, type=int)
+    parser.add_argument("--num_lat_classes", default=3, type=int)
+    parser.add_argument("--num_lon_classes", default=3, type=int)
+    parser.add_argument("--num_submodes", default=2, type=int)
+    parser.add_argument("--mode_dim", default=128, type=int)
+    parser.add_argument("--lambda_intent", default=1.0, type=float)
+    parser.add_argument("--lambda_mode", default=0.5, type=float)
+    parser.add_argument("--lambda_anchor", default=1.0, type=float)
+    parser.add_argument("--lambda_div", default=0.05, type=float)
+    parser.add_argument("--lambda_x0", default=0.1, type=float)
+    parser.add_argument("--lambda_end", default=0.1, type=float)
+    parser.add_argument("--save_best_metric", default="multi", type=str, choices=["multi", "exec", "joint"])
+    parser.add_argument("--use_hard_assignment", default=1, type=int)
+    parser.add_argument("--intent_label_smoothing", default=0.05, type=float)
+    parser.add_argument("--submode_temperature", default=1.0, type=float)
+    parser.add_argument("--anchor_div_margin", default=2.0, type=float)
 
     # Fut train/inference
     parser.add_argument("--num_inference_steps", default=15, type=int)
@@ -73,12 +89,11 @@ def get_args_parser():
 
     # Fut visualization
     parser.add_argument("--fut_enable_train_vis", default=0, type=int)
-    parser.add_argument("--fut_enable_eval_vis", default=0, type=int)
+    parser.add_argument("--fut_enable_eval_vis", default=1, type=int)
     parser.add_argument("--hist_enable_train_vis", default=0, type=int)
     parser.add_argument("--hist_enable_eval_vis", default=0, type=int)
 
     # Eval
     parser.add_argument("--eval_ratio", default=0.5, type=float)
-    parser.add_argument("--num_samples", default=5, type=int)
 
     return parser

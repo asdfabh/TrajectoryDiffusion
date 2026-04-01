@@ -139,6 +139,7 @@ def maybe_visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_t
 
 def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, future=None, pred=None,
                                  pred_all=None, pred_best_idx=None,
+                                 anchor_all=None,
                                  future_mask=None, pred_instant=None, intent_probs=None,
                                  batch_idx=0, metrics=None, input_unit="ft"):
     """绘制 future 预测结果，支持单模态与多模态最佳轨迹高亮。"""
@@ -250,6 +251,7 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
     pred_single = normalize_traj2d(safe_get_batch(pred, idx, batch_ndim=3))
     fut_mask_arr = safe_get_batch(future_mask, idx, batch_ndim=3)
     pred_modes = safe_get_batch(pred_all, idx, batch_ndim=4)
+    anchor_modes = safe_get_batch(anchor_all, idx, batch_ndim=4)
     pred_instant_vis = normalize_traj2d(safe_get_batch(pred_instant, idx, batch_ndim=3))
     intent_lat = safe_get_batch(None if intent_probs is None else intent_probs.get("lat"), idx, batch_ndim=2)
     intent_lon = safe_get_batch(None if intent_probs is None else intent_probs.get("lon"), idx, batch_ndim=2)
@@ -260,6 +262,13 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
             pred_modes = pred_modes[None, ...]
         if pred_modes.ndim != 3 or pred_modes.shape[-1] < 2:
             pred_modes = None
+
+    if anchor_modes is not None:
+        anchor_modes = np.asarray(anchor_modes)
+        if anchor_modes.ndim == 2 and anchor_modes.shape[-1] >= 2:
+            anchor_modes = anchor_modes[None, ...]
+        if anchor_modes.ndim != 3 or anchor_modes.shape[-1] < 2:
+            anchor_modes = None
 
     best_k = resolve_best_idx(pred_best_idx, idx, 0 if pred_modes is None else pred_modes.shape[0])
     if best_k is None and pred_modes is not None:
@@ -332,6 +341,24 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
             )
     elif pred_best is not None:
         ax.plot(pred_best[:, 1], pred_best[:, 0], 'r-o', label='Pred', markersize=4, linewidth=2, alpha=0.9)
+
+    # Draw best anchor trajectory (粗预测锚点，仅显示 best 模态对应的 anchor)
+    if anchor_modes is not None and best_k is not None and anchor_modes.shape[0] > best_k:
+        anc = normalize_traj2d(anchor_modes[best_k])
+        if anc is not None:
+            ax.plot(
+                anc[:, 1], anc[:, 0],
+                linestyle='--',
+                marker='x',
+                markersize=5,
+                markeredgewidth=1.5,
+                linewidth=1.5,
+                alpha=0.80,
+                color='#9B59B6',
+                label='Best Anchor',
+                zorder=4,
+            )
+
     if pred_instant_vis is not None:
         ax.plot(
             pred_instant_vis[:, 1], pred_instant_vis[:, 0],
@@ -381,7 +408,8 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
 
 def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pred, valid_mask, stage,
                                       enable_train_vis=False, enable_eval_vis=False,
-                                      pred_all=None, pred_best_idx=None, pred_instant=None, intent_probs=None,
+                                      pred_all=None, pred_best_idx=None, anchor_all=None,
+                                      pred_instant=None, intent_probs=None,
                                       meter_per_foot=0.3048, batch_idx=0):
     """按配置开关控制 future 预测可视化。"""
     if stage == "train":
@@ -427,6 +455,7 @@ def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pr
         pred=pred,
         pred_all=pred_all,
         pred_best_idx=pred_best_idx,
+        anchor_all=anchor_all,
         future_mask=valid_mask,
         pred_instant=pred_instant,
         intent_probs=intent_probs,

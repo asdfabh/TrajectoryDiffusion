@@ -32,6 +32,8 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     cclass = batch["cclass"]
     fut = batch["fut"]
     op_mask = batch["op_mask"]
+    lat_enc = batch["lat_enc"]
+    lon_enc = batch["lon_enc"]
     hist_nbrs = batch["nbrs"]
     va_nbrs = batch["nbrs_va"]
     lane_nbrs = batch["nbrs_lane"]
@@ -54,9 +56,11 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
 
     fut = fut.to(device)
     op_mask = op_mask.to(device)
+    lat_enc = lat_enc.to(device)
+    lon_enc = lon_enc.to(device)
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
-    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
+    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc
 
 
 def build_hist_masked(hist, mask_ratio, random_mask_ratio, block_mask_start):
@@ -260,7 +264,7 @@ def train_epoch(
 
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Train", ncols=140)
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc = prepare_input_data(
             batch,
             feature_dim,
             device=device,
@@ -284,6 +288,8 @@ def train_epoch(
             op_mask,
             device,
             return_components=True,
+            lat_targets=lat_enc,
+            lon_targets=lon_enc,
         )
         # _, _, _ = model_fut.forwardEval_minADE(hist_for_fut, hist_nbrs, mask, temporal_mask, fut, op_mask, device, K=5)
 
@@ -352,7 +358,7 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval
         if num_batches >= target_batches:
             break
 
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, _, _ = prepare_input_data(
             batch,
             feature_dim,
             device=device,

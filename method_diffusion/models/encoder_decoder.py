@@ -34,6 +34,7 @@ class HistEncoder(nn.Module):
     def __init__(self, args):
         super(HistEncoder, self).__init__()
         self.args = args
+        self.context_dim = int(args.hidden_dim_fut)
 
         # Initalize embeddings and input projection.
         self.input_embedding = nn.Linear(args.feature_dim, args.encoder_input_dim)
@@ -58,6 +59,13 @@ class HistEncoder(nn.Module):
 
         # Initialize activation and regularization functions.
         self.leaky_relu = nn.LeakyReLU(0.1)
+        # global_mlp 将 [ego_64d | social_64d] 平均池化后压缩为全局摘要
+        self.global_mlp = nn.Sequential(
+            nn.LayerNorm(self.context_dim),
+            nn.Linear(self.context_dim, self.context_dim),
+            nn.GELU(),
+            nn.Linear(self.context_dim, self.context_dim),
+        )
 
     def forward(self, src, nbrs, mask, temporal_mask):
 
@@ -70,7 +78,7 @@ class HistEncoder(nn.Module):
         nbrs_t = nbrs.permute(1, 0, 2).contiguous()
 
         # Temporal attention mechanism for temporal dependency.
-        temporal_mask = temporal_mask.view(temporal_mask.size(0), temporal_mask.size(1) * temporal_mask.size(2), temporal_mask.size(3))
+        temporal_mask = temporal_mask.view(temporal_mask.size(0), temporal_mask.size(1) * temporal_mask.size(2), temporal_mask.size(3)).bool()
         temporal_occ = temporal_mask.any(dim=-1)  # [B, N_grid]
         temporal_mask = repeat(temporal_mask, 'b c n -> t b c n', t=T) # [T, B, N, D]
         temporal_grid = torch.zeros_like(temporal_mask, dtype=nbrs_t.dtype, device=nbrs_t.device)
@@ -99,7 +107,7 @@ class HistEncoder(nn.Module):
 
         # Social attention mechanism for interaction capture.
         nbrs_enc = self.encoder(self.leaky_relu(self.input_embedding(nbrs_t)), pos=self.position_encoding(nbrs_t)) # [T, N_total, D_enc]
-        mask = mask.view(mask.size(0), mask.size(1) * mask.size(2), mask.size(3))
+        mask = mask.view(mask.size(0), mask.size(1) * mask.size(2), mask.size(3)).bool()
         social_occ = mask.any(dim=-1)  # [B, N_grid]
         mask = repeat(mask, 'b c n -> t b c n', t=T) # [T, B, N_grid, N]
 
@@ -122,10 +130,15 @@ class HistEncoder(nn.Module):
         value = torch.matmul(attn_weights, value) # [B, T*H, 1, D_attn]
         value = torch.cat(torch.split(value, int(T), dim=1), dim=-1).squeeze(2) # [B, T, H * D_attn]
 
-        temporal_spatial_agg = self.leaky_relu(temporal_value + value) # [B, T, D_enc]
-        enc = torch.cat((temporal_spatial_agg, hist_enc), dim=-1) # [B, T, D_enc]
+        temporal_spatial_agg = self.leaky_relu(temporal_value + value) # [B, T, 64]
+        # D-cat：ego时序[64d] | 交互上下文[64d] → 每帧完整场景token，由encoder负责组装
+        cross_tokens = torch.cat((hist_enc, temporal_spatial_agg), dim=-1)  # [B, T, 128]
+        global_token = self.global_mlp(cross_tokens.mean(dim=1))            # [B, 128]
 
-        return enc, hist_enc # [B, T, D_enc]
+        return {
+            "cross_tokens": cross_tokens,  # [B, T, 128]  DiT cross-attn KV
+            "global_token": global_token,  # [B, 128]     mode prior / adaLN 条件
+        }
 
 
 class HistEncoderDecoder(nn.Module):
@@ -134,9 +147,5 @@ class HistEncoderDecoder(nn.Module):
         self.hist_encoder = HistEncoder(args)
 
     def forward(self, src, nbrs, mask, temporal_mask):
-        hist_context, hist_enc = self.hist_encoder(src, nbrs, mask, temporal_mask)
-        aux = {
-            "hist_context": hist_context,
-            "hist_enc": hist_enc,
-        }
-        return hist_context, aux
+        hist_context = self.hist_encoder(src, nbrs, mask, temporal_mask)
+        return hist_context, hist_context

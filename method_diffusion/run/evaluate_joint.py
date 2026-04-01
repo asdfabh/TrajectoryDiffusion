@@ -134,7 +134,7 @@ def build_test_loader(args):
 
 
 @torch.no_grad()
-def evaluate(model_hist, model_fut, dataloader, device, feature_dim, num_samples, mask_ratio, random_mask_ratio, block_mask_start):
+def evaluate(model_hist, model_fut, dataloader, device, feature_dim, num_modes, mask_ratio, random_mask_ratio, block_mask_start):
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
@@ -143,7 +143,7 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, num_samples
     model_fut.eval()
     hist_metrics = HistReconstructionMetrics()
     fut_metrics = TrajectoryMetrics(model_fut.T)
-    k_samples = max(1, int(num_samples))
+    k_samples = max(1, int(num_modes))
 
     pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc="Eval Joint", ncols=140)
     for batch_idx, batch in pbar:
@@ -210,7 +210,7 @@ def main():
     print(f"[JointEval] Device: {device}")
     print(f"[JointEval] Hist checkpoint dir: {hist_checkpoint_dir}")
     print(f"[JointEval] Fut checkpoint dir: {fut_checkpoint_dir}")
-    print(f"[JointEval] num_samples={args.num_samples}, num_inference_steps={args.num_inference_steps}")
+    print(f"[JointEval] num_modes={args.num_modes}, num_inference_steps={args.num_inference_steps}")
 
     dataloader = build_test_loader(args)
     model_hist = DiffusionPast(args).to(device)
@@ -223,7 +223,7 @@ def main():
         dataloader=dataloader,
         device=device,
         feature_dim=args.feature_dim,
-        num_samples=args.num_samples,
+        num_modes=args.num_modes,
         mask_ratio=max(0.0, min(1.0, float(args.mask_prob))),
         random_mask_ratio=max(0.0, min(1.0, float(args.random_mask_ratio))),
         block_mask_start=int(args.block_mask_start) > 0,

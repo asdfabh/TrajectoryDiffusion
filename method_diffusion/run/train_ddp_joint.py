@@ -133,7 +133,7 @@ def train_epoch(
     )
 
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc = prepare_input_data(
             batch,
             feature_dim,
             device=device,
@@ -157,6 +157,8 @@ def train_epoch(
             op_mask,
             device,
             return_components=True,
+            lat_targets=lat_enc,
+            lon_targets=lon_enc,
         )
 
         loss_hist_weighted = hist_loss_weight * loss_hist
@@ -252,7 +254,7 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval
         if num_batches >= target_batches:
             break
 
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, _, _ = prepare_input_data(
             batch,
             feature_dim,
             device=device,
