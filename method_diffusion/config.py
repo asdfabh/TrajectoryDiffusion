@@ -59,7 +59,7 @@ def get_args_parser():
     parser.add_argument("--input_dim_fut", default=2, type=int)
     parser.add_argument("--output_dim_fut", default=2, type=int)
     parser.add_argument("--heads_fut", default=4, type=int)
-    parser.add_argument("--depth_fut", default=3, type=int)
+    parser.add_argument("--depth_fut", default=2, type=int)
     parser.add_argument("--dropout_fut", default=0.1, type=float)
     parser.add_argument("--mlp_ratio_fut", default=4, type=int)
     parser.add_argument("--num_train_timesteps_fut", default=200, type=int)

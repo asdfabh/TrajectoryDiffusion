@@ -29,6 +29,85 @@ def build_position_encoding(args):
     position_embedding = PositionalEncodingSine(args.encoder_input_dim // 2, temperature=10000)
     return position_embedding
 
+
+class FutureDecoderBlock(nn.Module):
+    def __init__(self, hidden_dim, heads, dropout=0.1, mlp_ratio=2.0):
+        super().__init__()
+        self.norm_q_cross = nn.LayerNorm(hidden_dim)
+        self.norm_mem = nn.LayerNorm(hidden_dim)
+        self.cross_attn = nn.MultiheadAttention(hidden_dim, heads, dropout=dropout, batch_first=True)
+
+        self.norm_q_self = nn.LayerNorm(hidden_dim)
+        self.self_attn = nn.MultiheadAttention(hidden_dim, heads, dropout=dropout, batch_first=True)
+
+        self.norm_local = nn.LayerNorm(hidden_dim)
+        self.local_mixer = nn.Sequential(
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim),
+            nn.GELU(),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1),
+        )
+
+        mlp_hidden = int(hidden_dim * mlp_ratio)
+        self.norm_ffn = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, mlp_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden, hidden_dim),
+        )
+
+    def forward(self, query, memory):
+        memory_norm = self.norm_mem(memory)
+        query = query + self.cross_attn(
+            self.norm_q_cross(query),
+            memory_norm,
+            memory_norm,
+            need_weights=False,
+        )[0]
+
+        query_norm = self.norm_q_self(query)
+        query = query + self.self_attn(query_norm, query_norm, query_norm, need_weights=False)[0]
+
+        local_input = self.norm_local(query).transpose(1, 2)
+        query = query + self.local_mixer(local_input).transpose(1, 2)
+        query = query + self.ffn(self.norm_ffn(query))
+        return query
+
+
+class FutureContextDecoder(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.future_steps = int(args.T_f)
+        self.hidden_dim = int(args.hidden_dim_fut)
+        self.memory_dim = int(args.encoder_input_dim) * 2
+        self.num_layers = 2
+        self.num_heads = int(getattr(args, "heads_fut", 4))
+        self.dropout = float(getattr(args, "dropout_fut", 0.1))
+
+        self.memory_proj = nn.Sequential(
+            nn.LayerNorm(self.memory_dim),
+            nn.Linear(self.memory_dim, self.hidden_dim),
+        )
+        self.summary_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.future_queries = nn.Parameter(torch.randn(1, self.future_steps, self.hidden_dim) * 0.02)
+        self.future_pos = nn.Parameter(torch.randn(1, self.future_steps, self.hidden_dim) * 0.02)
+        self.blocks = nn.ModuleList(
+            [FutureDecoderBlock(self.hidden_dim, self.num_heads, dropout=self.dropout, mlp_ratio=2.0) for _ in range(self.num_layers)]
+        )
+        self.output_norm = nn.LayerNorm(self.hidden_dim)
+
+    def forward(self, memory):
+        batch_size = memory.size(0)
+        memory = self.memory_proj(memory)
+        summary = self.summary_proj(memory.mean(dim=1, keepdim=True))
+        future_queries = self.future_queries + self.future_pos
+        future_queries = future_queries.expand(batch_size, -1, -1) + summary
+
+        for block in self.blocks:
+            future_queries = block(future_queries, memory)
+
+        return self.output_norm(future_queries)
+
 class HistEncoder(nn.Module):
     def __init__(self, args):
         super(HistEncoder, self).__init__()
@@ -126,3 +205,18 @@ class HistEncoder(nn.Module):
 
         return enc, hist_enc # [B, T, D_enc]
 
+
+class HistEncoderDecoder(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.hist_encoder = HistEncoder(args)
+        self.future_decoder = FutureContextDecoder(args)
+
+    def forward(self, src, nbrs, mask, temporal_mask):
+        hist_context, hist_enc = self.hist_encoder(src, nbrs, mask, temporal_mask)
+        aux = {
+            "hist_context": hist_context,
+            "hist_enc": hist_enc,
+        }
+        # 未来分支当前直接消费 hist encoder 输出，decoder 保留但暂不接入主路径。
+        return hist_context, aux

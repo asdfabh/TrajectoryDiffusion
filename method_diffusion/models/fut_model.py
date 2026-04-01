@@ -4,7 +4,7 @@ from torch import nn
 from diffusers.schedulers import DDIMScheduler
 
 from method_diffusion.models import dit_fut as dit
-from method_diffusion.models.hist_encoder import HistEncoder
+from method_diffusion.models.encoder_decoder import HistEncoderDecoder
 from method_diffusion.utils.position_encoding import SequentialPositionalEncoding
 from method_diffusion.utils.visualization import maybe_visualize_future_prediction
 
@@ -42,7 +42,7 @@ class DiffusionFut(nn.Module):
         self.input_embedding = nn.Linear(self.input_dim, self.hidden_dim)
         self.context_embedding = nn.Linear(self.hidden_dim, self.hidden_dim)
         self.pos_embedding = SequentialPositionalEncoding(self.hidden_dim)
-        self.hist_encoder = HistEncoder(args)
+        self.hist_encoder = HistEncoderDecoder(args)
 
         # DiT 主干与扩散调度器：负责时间嵌入、去噪建模和 DDIM 调度。
         self.timestep_embedder = dit.TimestepEmbedder(self.hidden_dim, self.time_embedding_size)
@@ -55,7 +55,7 @@ class DiffusionFut(nn.Module):
 
         dit_block = dit.DiTBlock(self.hidden_dim, self.heads, self.dropout, self.mlp_ratio)
         final_layer = dit.FinalLayer(self.hidden_dim, self.T, self.output_dim)
-        self.dit = dit.DiT(dit_block=dit_block, final_layer=final_layer, depth=self.depth, model_type="x_start")
+        self.dit = dit.DiT(dit_block=dit_block, final_layer=final_layer, depth=self.depth, model_type="score")
 
         if self.dataset_name == "ngsim":
             self.register_buffer("vel_mean", torch.tensor([-0.004181504611623526, 5.041936610524995], dtype=torch.float32), persistent=False)
@@ -85,8 +85,8 @@ class DiffusionFut(nn.Module):
         )
 
     def encodeContext(self, hist, hist_nbrs, mask, temporal_mask):
-        context, _ = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
-        return context
+        context_tokens, _ = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
+        return context_tokens
 
     def computeLoss(self, pred_eps, noise, valid_mask, return_parts=False):
         loss_noise = F.mse_loss(pred_eps, noise, reduction="none")
@@ -221,8 +221,8 @@ class DiffusionFut(nn.Module):
             valid_mask,
             anchor_phys,
             future_phys,
-            infer_scheduler,
             context_tokens,
+            infer_scheduler,
         ) = self.prepareEvalInputs(hist, hist_nbrs, mask, temporal_mask, future, op_mask, device)
 
         x_t = torch.randn((bsz, t_len, self.input_dim), device=device)
@@ -259,8 +259,8 @@ class DiffusionFut(nn.Module):
             valid_mask,
             anchor_phys,
             future_phys,
-            infer_scheduler,
             context_tokens,
+            infer_scheduler,
         ) = self.prepareEvalInputs(hist, hist_nbrs, mask, temporal_mask, future, op_mask, device)
 
         # 核心提速优化：在 Batch 维度上并行展开 K 倍。
