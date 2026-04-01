@@ -4,7 +4,7 @@ from torch import nn
 from diffusers.schedulers import DDIMScheduler
 
 from method_diffusion.models import dit_fut as dit
-from method_diffusion.models.encoder_decoder import HistEncoderDecoder
+from method_diffusion.models.encoder_decoder import HistEncoder
 from method_diffusion.utils.position_encoding import SequentialPositionalEncoding
 from method_diffusion.utils.visualization import maybe_visualize_future_prediction
 
@@ -42,7 +42,7 @@ class DiffusionFut(nn.Module):
         self.input_embedding = nn.Linear(self.input_dim, self.hidden_dim)
         self.context_embedding = nn.Linear(self.hidden_dim, self.hidden_dim)
         self.pos_embedding = SequentialPositionalEncoding(self.hidden_dim)
-        self.hist_encoder = HistEncoderDecoder(args)
+        self.hist_encoder = HistEncoder(args)
 
         # DiT 主干与扩散调度器：负责时间嵌入、去噪建模和 DDIM 调度。
         self.timestep_embedder = dit.TimestepEmbedder(self.hidden_dim, self.time_embedding_size)
@@ -85,8 +85,8 @@ class DiffusionFut(nn.Module):
         )
 
     def encodeContext(self, hist, hist_nbrs, mask, temporal_mask):
-        context_tokens, _ = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
-        return context_tokens
+        hist_context, _ = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
+        return hist_context
 
     def computeLoss(self, pred_eps, noise, valid_mask, return_parts=False):
         loss_noise = F.mse_loss(pred_eps, noise, reduction="none")
