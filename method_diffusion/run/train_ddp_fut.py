@@ -19,14 +19,17 @@ from method_diffusion.run.train_fut import (
     FUT_CHECKPOINT_DIR,
     LOSS_STAT_KEYS,
     VAL_METRIC_KEYS,
-    build_selection_scores,
+    compute_exec_selection_score,
     build_zero_eval_metrics,
     build_zero_loss_stats,
+    flatten_eval_aux,
+    flatten_train_parts,
     init_csv_log,
     load_checkpoint,
     prepare_input_data,
     print_eval_summary,
-    save_checkpoint_aliases,
+    save_best_checkpoint,
+    save_latest_checkpoint,
     write_csv_log,
     write_tensorboard_log,
 )
@@ -127,11 +130,12 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
+        flat_loss_parts = flatten_train_parts(loss_parts)
         totals["loss"] += float(loss.item())
         for key in LOSS_STAT_KEYS:
             if key == "loss":
                 continue
-            totals[key] += float(loss_parts[key].item())
+            totals[key] += flat_loss_parts[key]
         num_batches += 1
 
         if is_main_process(rank):
@@ -140,10 +144,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
                     "loss": f"{loss.item():.6f}",
                     "avg_loss": f"{(totals['loss'] / num_batches):.6f}",
                     "eps": f"{(totals['loss_eps'] / num_batches):.6f}",
-                    "lat": f"{(totals['loss_intent_lat'] / num_batches):.6f}",
-                    "lon": f"{(totals['loss_intent_lon'] / num_batches):.6f}",
                     "joint": f"{(totals['loss_intent_joint'] / num_batches):.6f}",
-                    "mode": f"{(totals['loss_mode'] / num_batches):.6f}",
+                    "anchor": f"{(totals['loss_anchor'] / num_batches):.6f}",
                 }
             )
 
@@ -196,7 +198,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
             lat_targets=lat_enc,
             lon_targets=lon_enc,
         )
-        _, _, eval_aux = fut_model.forwardEvalMulti(
+        _, eval_aux = fut_model.forwardEval(
             hist,
             hist_nbrs,
             mask,
@@ -207,22 +209,17 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
             return_aux=True,
             lat_targets=lat_enc,
             lon_targets=lon_enc,
-            compute_oracle_all=False,
         )
 
+        flat_val_parts = flatten_train_parts(val_parts)
+        flat_eval_metrics = flatten_eval_aux(eval_aux)
         totals["loss"] += float(val_loss.item())
         for key in LOSS_STAT_KEYS:
             if key == "loss":
                 continue
-            totals[key] += float(val_parts[key].item())
-        metric_totals["top1_ade"] += float(eval_aux["top1_ade"].item())
-        metric_totals["top1_fde"] += float(eval_aux["top1_fde"].item())
-        metric_totals["best_pred_ade"] += float(eval_aux["best_pred_ade"].item())
-        metric_totals["best_pred_fde"] += float(eval_aux["best_pred_fde"].item())
-        metric_totals["rank_nll"] += float(eval_aux["rank_nll"].item())
-        metric_totals["lat_acc"] += float(eval_aux["lat_acc"].item())
-        metric_totals["lon_acc"] += float(eval_aux["lon_acc"].item())
-        metric_totals["joint_acc"] += float(eval_aux["joint_acc"].item())
+            totals[key] += flat_val_parts[key]
+        for key in VAL_METRIC_KEYS:
+            metric_totals[key] += flat_eval_metrics[key]
         num_batches += 1
 
         if is_main_process(rank):
@@ -230,7 +227,6 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
                 {
                     "val_loss": f"{(totals['loss'] / num_batches):.6f}",
                     "top1_ade": f"{(metric_totals['top1_ade'] / num_batches):.4f}",
-                    "best@pred": f"{(metric_totals['best_pred_ade'] / num_batches):.4f}",
                     "joint_acc": f"{(metric_totals['joint_acc'] / num_batches):.4f}",
                 }
             )
@@ -326,8 +322,7 @@ def main():
     model = DiffusionFut(args).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
-    start_epoch, best_scores = load_checkpoint_for_rank(args, model, optimizer, scheduler, device, rank)
-    selected_metric = str(getattr(args, "save_best_metric", "multi")).strip().lower()
+    start_epoch, best_score = load_checkpoint_for_rank(args, model, optimizer, scheduler, device, rank)
 
     if dist.is_initialized():
         if device.type == "cuda":
@@ -340,21 +335,18 @@ def main():
 
         train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim, rank)
         val_stats, eval_metrics = evaluate(model, val_loader, device, epoch + 1, args.feature_dim, rank)
-        selection_scores = build_selection_scores(eval_metrics)
+        score_exec = compute_exec_selection_score(eval_metrics["top1_ade"], eval_metrics["top1_fde"])
         current_lr = optimizer.param_groups[0]["lr"]
 
         if is_main_process(rank):
-            write_csv_log(log_csv_path, epoch + 1, train_stats, val_stats, eval_metrics, selection_scores, current_lr)
-            write_tensorboard_log(writer, epoch + 1, train_stats, val_stats, eval_metrics, selection_scores, current_lr)
-            print_eval_summary(epoch + 1, args.num_epochs, train_stats, val_stats, eval_metrics, selection_scores)
+            write_csv_log(log_csv_path, epoch + 1, train_stats, val_stats, eval_metrics, score_exec, current_lr)
+            write_tensorboard_log(writer, epoch + 1, train_stats, val_stats, eval_metrics, score_exec, current_lr)
+            print_eval_summary(epoch + 1, args.num_epochs, train_stats, val_stats, eval_metrics, score_exec)
 
         scheduler.step()
-        best_flags = {}
-        for key, score in selection_scores.items():
-            is_best = score < best_scores[key]
-            best_flags[key] = is_best
-            if is_best:
-                best_scores[key] = score
+        is_best = score_exec < best_score
+        if is_best:
+            best_score = score_exec
 
         if is_main_process(rank):
             model_state = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
@@ -365,16 +357,18 @@ def main():
                 "scheduler_state_dict": scheduler.state_dict(),
                 "loss": train_stats["loss"],
                 "eval_metrics": eval_metrics,
-                "selection_scores": selection_scores,
-                "best_scores": best_scores,
-                "best_score": best_scores[selected_metric],
+                "score_exec": score_exec,
+                "best_score": best_score,
                 "eval_ade": eval_metrics["top1_ade"],
                 "eval_fde": eval_metrics["top1_fde"],
             }
 
-            if (epoch + 1) % args.save_interval == 0:
-                torch.save(state, Path(args.checkpoint_dir) / f"epoch_{epoch + 1}.pth")
-            save_checkpoint_aliases(state, Path(args.checkpoint_dir), best_flags, selected_metric)
+            checkpoint_dir = Path(args.checkpoint_dir)
+            save_latest_checkpoint(state, checkpoint_dir)
+            if (epoch + 1) % 5 == 0:
+                torch.save(state, checkpoint_dir / f"epoch_{epoch + 1}.pth")
+            if is_best:
+                save_best_checkpoint(state, checkpoint_dir)
 
         if dist.is_initialized():
             dist.barrier()

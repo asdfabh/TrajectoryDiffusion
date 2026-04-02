@@ -83,6 +83,21 @@ def _format_optional_index(name, value, one_based=False):
     return f"{name}={idx_val}"
 
 
+def _scalar_from_batch(data, b_idx=0):
+    arr = _to_numpy(data)
+    if arr is None:
+        return None
+    arr = np.asarray(arr)
+    if arr.ndim == 0:
+        return int(arr.item())
+    if arr.shape[0] > b_idx:
+        arr = np.asarray(arr[b_idx]).reshape(-1)
+        if arr.size > 0:
+            return int(arr[0])
+    flat = arr.reshape(-1)
+    return int(flat[0]) if flat.size > 0 else None
+
+
 def plot_traj_with_mask(hist_original, hist_masked, hist_pred, fig_num1=3, fig_num2=3, input_unit="ft"):
     """绘制 hist 重建结果：原始轨迹、掩码位置、预测轨迹。"""
     num_samples = len(hist_original)
@@ -231,7 +246,9 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
             idx_val = int(np.asarray(arr[b_idx]).reshape(-1)[0])
         else:
             return None
-        return max(0, min(num_modes - 1, idx_val))
+        if idx_val < 0 or idx_val >= num_modes:
+            return None
+        return idx_val
 
     def select_best_by_ade(pred_modes, gt_traj, fut_mask_arr):
         if pred_modes is None or pred_modes.ndim != 3 or pred_modes.shape[0] == 0:
@@ -283,6 +300,8 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
     oracle_joint_idx = safe_get_batch(None if intent_meta is None else intent_meta.get("oracle_joint_idx"), idx, batch_ndim=1)
     routed_sub_idx = safe_get_batch(None if intent_meta is None else intent_meta.get("routed_sub_idx"), idx, batch_ndim=1)
     best_sub_idx = safe_get_batch(None if intent_meta is None else intent_meta.get("best_sub_idx"), idx, batch_ndim=1)
+    best_sub_label = None if intent_meta is None else intent_meta.get("best_sub_label")
+    num_submodes = _scalar_from_batch(None if intent_meta is None else intent_meta.get("num_submodes"), idx)
 
     if pred_modes is not None:
         pred_modes = np.asarray(pred_modes)
@@ -302,6 +321,7 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
     best_k = resolve_best_idx(pred_best_idx, idx, 0 if pred_modes is None else pred_modes.shape[0])
     if best_k is None and pred_modes is not None:
         best_k = select_best_by_ade(pred_modes, gt_fut, fut_mask_arr)
+    selected_equals_global = selected_k is not None and best_k is not None and selected_k == best_k
 
     pred_best = pred_single
     if pred_best is None and pred_modes is not None and pred_modes.shape[0] > 0:
@@ -343,83 +363,90 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
         ax.plot(gt_hist[:, 1], gt_hist[:, 0], 'b-o', label='Hist', markersize=4, linewidth=2, alpha=0.8)
     if gt_fut is not None:
         ax.plot(gt_fut[:, 1], gt_fut[:, 0], 'g-o', label='GT Future', markersize=4, linewidth=2, alpha=0.8)
-    if pred_modes is not None:
-        non_best_labeled = False
-        for k in range(pred_modes.shape[0]):
-            traj = normalize_traj2d(pred_modes[k])
-            if traj is None:
+
+    if anchor_modes is not None:
+        all_anchor_labeled = False
+        base_anchor_color = '#66ccff'
+        highlight_anchor_color = '#8fd9ff'
+        for k in range(anchor_modes.shape[0]):
+            anc = normalize_traj2d(anchor_modes[k])
+            if anc is None:
                 continue
-            is_selected = (selected_k is not None and k == selected_k)
-            is_global_best = (best_k is not None and k == best_k)
+            is_selected_anchor = (selected_k is not None and k == selected_k)
+            is_global_anchor = (best_k is not None and k == best_k)
+            color = base_anchor_color
+            linewidth = 1.1
+            alpha = 0.70
             label = None
-            color = '#5DADE2'
-            alpha = 0.65
-            linewidth = 1.4
-            marker = '+'
-            markersize = 6
-            markeredgewidth = 1.2
             zorder = 2
-            if is_selected and is_global_best:
-                label = 'Selected = Global Best'
-                color = '#D4AF37'
-                alpha = 0.98
-                linewidth = 2.2
-                marker = 'o'
-                markersize = 4
-                markeredgewidth = 1.0
-                zorder = 4
-            elif is_selected:
-                label = 'Selected'
-                color = '#FF0000'
+            if is_selected_anchor and is_global_anchor:
+                color = highlight_anchor_color
+                linewidth = 1.8
                 alpha = 0.95
-                linewidth = 2.0
-                marker = 'o'
-                markersize = 4
-                markeredgewidth = 1.0
+                label = 'Best = Global Best Anchor'
                 zorder = 4
-            elif is_global_best:
-                label = 'Global Best'
-                color = '#F39C12'
+            elif is_selected_anchor:
+                color = highlight_anchor_color
+                linewidth = 1.8
                 alpha = 0.95
-                linewidth = 2.0
-                marker = 'o'
-                markersize = 4
-                markeredgewidth = 1.0
+                label = 'Best Anchor'
                 zorder = 4
-            elif not non_best_labeled:
-                label = 'Pred Modes'
-                non_best_labeled = True
+            elif is_global_anchor:
+                color = highlight_anchor_color
+                linewidth = 1.8
+                alpha = 0.95
+                label = 'Global Best Anchor'
+                zorder = 4
+            elif not all_anchor_labeled:
+                label = 'Anchors'
+                all_anchor_labeled = True
             ax.plot(
-                traj[:, 1], traj[:, 0],
-                linestyle='-',
-                marker=marker,
-                markersize=markersize,
-                markeredgewidth=markeredgewidth,
+                anc[:, 1], anc[:, 0],
+                linestyle='--',
+                marker='+',
+                markersize=7,
+                markeredgewidth=1.2,
                 linewidth=linewidth,
                 alpha=alpha,
                 color=color,
                 label=label,
                 zorder=zorder,
             )
-    elif pred_best is not None:
-        ax.plot(pred_best[:, 1], pred_best[:, 0], 'r-o', label='Pred', markersize=4, linewidth=2, alpha=0.9)
 
-    # Draw best anchor trajectory (粗预测锚点，仅显示 best 模态对应的 anchor)
-    if anchor_modes is not None and best_k is not None and anchor_modes.shape[0] > best_k:
-        anc = normalize_traj2d(anchor_modes[best_k])
-        if anc is not None:
-            ax.plot(
-                anc[:, 1], anc[:, 0],
-                linestyle='--',
-                marker='x',
-                markersize=5,
-                markeredgewidth=1.5,
-                linewidth=1.5,
-                alpha=0.80,
-                color='#9B59B6',
-                label='Best Anchor',
-                zorder=4,
-            )
+    if pred_modes is not None:
+        if selected_k is not None and selected_k < pred_modes.shape[0]:
+            selected_traj = normalize_traj2d(pred_modes[selected_k])
+            if selected_traj is not None:
+                ax.plot(
+                    selected_traj[:, 1], selected_traj[:, 0],
+                    linestyle='-',
+                    marker='o',
+                    markersize=4,
+                    markeredgewidth=1.0,
+                    linewidth=2.0,
+                    alpha=0.95,
+                    color='#FF0000',
+                    label='Best' if not selected_equals_global else 'Best = Global Best',
+                    zorder=5,
+                )
+
+        if (not selected_equals_global) and best_k is not None and best_k < pred_modes.shape[0]:
+            global_traj = normalize_traj2d(pred_modes[best_k])
+            if global_traj is not None:
+                ax.plot(
+                    global_traj[:, 1], global_traj[:, 0],
+                    linestyle='-',
+                    marker='o',
+                    markersize=4,
+                    markeredgewidth=1.0,
+                    linewidth=2.0,
+                    alpha=0.95,
+                    color='#F1C40F',
+                    label='Global Best',
+                    zorder=5,
+                )
+    elif pred_best is not None:
+        ax.plot(pred_best[:, 1], pred_best[:, 0], 'r-o', label='Best', markersize=4, linewidth=2, alpha=0.9)
 
     if pred_instant_vis is not None:
         ax.plot(
@@ -449,7 +476,8 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
         if gt_joint_idx is not None:
             text_lines.append(f"gt_joint={_format_joint_label(gt_joint_idx)}")
         routed_sub_text = _format_optional_index("pred_sub", routed_sub_idx, one_based=True)
-        best_sub_text = _format_optional_index("best_sub", best_sub_idx, one_based=True)
+        best_sub_name = best_sub_label if isinstance(best_sub_label, str) and best_sub_label else "best_sub"
+        best_sub_text = _format_optional_index(best_sub_name, best_sub_idx, one_based=True)
         if routed_sub_text is not None:
             text_lines.append(routed_sub_text)
         if best_sub_text is not None:

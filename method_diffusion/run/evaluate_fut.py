@@ -1,6 +1,7 @@
-import sys
+import argparse
 import os
 import re
+import sys
 from pathlib import Path
 
 import torch
@@ -12,48 +13,19 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
-from method_diffusion.utils.fut_utils import TrajectoryMetrics
+from method_diffusion.run.train_fut import prepare_input_data
+from method_diffusion.utils.fut_utils import TrajectoryMetrics, gather_by_index
+from method_diffusion.utils.visualization import maybe_visualize_future_prediction
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
 
 
-def prepare_input_data(batch, feature_dim, device="cuda"):
-    hist = batch["hist"]
-    va = batch["va"]
-    lane = batch["lane"]
-    cclass = batch["cclass"]
-    fut = batch["fut"]
-    op_mask = batch["op_mask"]
-    lat_enc = batch["lat_enc"]
-    lon_enc = batch["lon_enc"]
-    hist_nbrs = batch["nbrs"]
-    va_nbrs = batch["nbrs_va"]
-    lane_nbrs = batch["nbrs_lane"]
-    cclass_nbrs = batch["nbrs_class"]
-    mask = batch["mask"]
-    temporal_mask = batch["temporal_mask"]
-
-    if feature_dim == 6:
-        hist = torch.cat((hist, va, lane, cclass), dim=-1).to(device)
-        hist_nbrs = torch.cat((hist_nbrs, va_nbrs, lane_nbrs, cclass_nbrs), dim=-1).to(device)
-    elif feature_dim == 5:
-        hist = torch.cat((hist, va, lane), dim=-1).to(device)
-        hist_nbrs = torch.cat((hist_nbrs, va_nbrs, lane_nbrs), dim=-1).to(device)
-    elif feature_dim == 4:
-        hist = torch.cat((hist, va), dim=-1).to(device)
-        hist_nbrs = torch.cat((hist_nbrs, va_nbrs), dim=-1).to(device)
-    else:
-        hist = hist.to(device)
-        hist_nbrs = hist_nbrs.to(device)
-
-    fut = fut.to(device)
-    op_mask = op_mask.to(device)
-    lat_enc = lat_enc.to(device)
-    lon_enc = lon_enc.to(device)
-    mask = mask.to(device)
-    temporal_mask = temporal_mask.to(device)
-    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc
+def get_eval_args():
+    parser = argparse.ArgumentParser("Evaluate future diffusion model", parents=[get_args_parser()])
+    parser.add_argument("--enable_vis", default=0, type=int)
+    parser.add_argument("--oracle_topk", default=0, type=int)
+    return parser.parse_args()
 
 
 def resolve_checkpoint_path(resume_arg, checkpoint_dir):
@@ -64,6 +36,8 @@ def resolve_checkpoint_path(resume_arg, checkpoint_dir):
         return Path(str(resume_arg))
     if resume_arg == "best":
         return checkpoint_dir / "best.pth"
+    if resume_arg == "latest":
+        return checkpoint_dir / "latest.pth"
     if re.fullmatch(r"epoch_\d+", str(resume_arg)):
         return checkpoint_dir / f"{resume_arg}.pth"
     return None
@@ -81,10 +55,13 @@ def load_checkpoint(model, resume_arg, checkpoint_dir, device):
     return model
 
 
-def print_metric_block(title, top1_metrics, multi_metrics, mode_nll, lat_acc=0.0, lon_acc=0.0, joint_acc=0.0):
+def print_metric_block(title, top1_metrics, multi_metrics, mode_nll, lat_acc=0.0, lon_acc=0.0, joint_acc=0.0, hit_global=0.0, hit_joint_global=0.0):
     line_width = 140
     print("\n" + "=" * 30 + f" {title} " + "=" * 30)
-    print(f"modeNLL: {mode_nll:.6f} | latAcc: {lat_acc:.4f} | lonAcc: {lon_acc:.4f} | jointAcc: {joint_acc:.4f}")
+    print(
+        f"modeNLL: {mode_nll:.6f} | latAcc: {lat_acc:.4f} | lonAcc: {lon_acc:.4f} | "
+        f"jointAcc: {joint_acc:.4f} | hitGlobal: {hit_global:.4f} | hitJointGlobal: {hit_joint_global:.4f}"
+    )
     print("-" * line_width)
     time_pairs = [("1s", 4), ("2s", 9), ("3s", 14), ("4s", 19), ("5s", 24)]
     print(
@@ -108,17 +85,18 @@ def print_metric_block(title, top1_metrics, multi_metrics, mode_nll, lat_acc=0.0
 
 
 def print_metrics(metrics, title, metric_name="Future"):
-    mode_nll = float(metrics.get("mode_nll", 0.0)) if isinstance(metrics, dict) else 0.0
     top1_metrics = metrics.get("top1", metrics) if isinstance(metrics, dict) else metrics
     multi_metrics = metrics.get("multi", metrics) if isinstance(metrics, dict) else metrics
     print_metric_block(
         title,
         top1_metrics,
         multi_metrics,
-        mode_nll,
+        float(metrics.get("mode_nll", 0.0)),
         float(metrics.get("lat_acc", 0.0)),
         float(metrics.get("lon_acc", 0.0)),
         float(metrics.get("joint_acc", 0.0)),
+        float(metrics.get("hit_global", 0.0)),
+        float(metrics.get("hit_joint_global", 0.0)),
     )
 
 
@@ -150,8 +128,58 @@ def build_test_loader(args):
     )
 
 
+def maybe_run_visualization(args, model, hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc, top1_pred, eval_aux, all_outputs):
+    if int(args.enable_vis) <= 0:
+        return
+
+    joint_idx = (torch.argmax(lat_enc, dim=1) * lon_enc.size(1) + torch.argmax(lon_enc, dim=1)).long()
+    routing = eval_aux["routing"]
+    selected_mode_idx = routing["selected_mode_idx"]
+    best_mode_idx = all_outputs["best_mode_idx"]
+    selected_matches = all_outputs["mode_indices"] == selected_mode_idx.unsqueeze(1)
+    selected_mode_pos = torch.argmax(selected_matches.long(), dim=1)
+    selected_mode_pos = torch.where(
+        selected_matches.any(dim=1),
+        selected_mode_pos,
+        torch.full_like(selected_mode_pos, -1),
+    )
+    oracle_joint_idx = torch.div(best_mode_idx, model.num_submodes, rounding_mode="floor")
+    oracle_sub_idx = torch.remainder(best_mode_idx, model.num_submodes)
+    selected_hit_global = (selected_mode_idx == best_mode_idx).long()
+
+    maybe_visualize_future_prediction(
+        hist=hist,
+        hist_nbrs=hist_nbrs,
+        temporal_mask=temporal_mask,
+        future=fut,
+        pred=top1_pred,
+        valid_mask=(op_mask[:, :, 0] > 0),
+        stage="eval",
+        enable_eval_vis=True,
+        pred_all=all_outputs["all_pred_phys"],
+        pred_best_idx=all_outputs["best_mode_pos"],
+        pred_selected_idx=selected_mode_pos,
+        anchor_all=all_outputs["anchor_pos_phys"],
+        intent_probs={
+            "lat": routing["lat_probs"],
+            "lon": routing["lon_probs"],
+            "joint": routing["joint_probs"],
+        },
+        intent_meta={
+            "pred_joint_idx": routing["pred_joint_idx"],
+            "gt_joint_idx": joint_idx,
+            "oracle_joint_idx": oracle_joint_idx,
+            "routed_sub_idx": routing["routed_sub_idx"],
+            "best_sub_idx": oracle_sub_idx,
+            "best_sub_label": "best_sub(global)",
+            "num_submodes": torch.full_like(joint_idx, model.num_submodes),
+            "selected_hit_global": selected_hit_global,
+        },
+    )
+
+
 @torch.no_grad()
-def evaluate(model, dataloader, device, feature_dim):
+def evaluate(model, dataloader, device, feature_dim, args):
     model.eval()
     top1_metrics = TrajectoryMetrics(model.T)
     multi_metrics = TrajectoryMetrics(model.T)
@@ -159,10 +187,13 @@ def evaluate(model, dataloader, device, feature_dim):
     total_lat_correct = 0.0
     total_lon_correct = 0.0
     total_joint_correct = 0.0
+    total_hit_global = 0.0
+    total_hit_joint_global = 0.0
     total_samples = 0.0
     num_batches = 0
 
-    pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc="Fut explicit modes", ncols=140)
+    select_topk = None if int(args.oracle_topk) <= 0 else min(int(args.oracle_topk), model.num_modes)
+    pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc="Fut evaluate", ncols=140)
     for batch_idx, batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc = prepare_input_data(
             batch,
@@ -171,7 +202,7 @@ def evaluate(model, dataloader, device, feature_dim):
         )
         joint_idx = (torch.argmax(lat_enc, dim=1) * lon_enc.size(1) + torch.argmax(lon_enc, dim=1)).long()
 
-        _, _, aux = model.forwardEvalMulti(
+        top1_pred, eval_aux = model.forwardEval(
             hist,
             hist_nbrs,
             mask,
@@ -182,23 +213,61 @@ def evaluate(model, dataloader, device, feature_dim):
             return_aux=True,
             lat_targets=lat_enc,
             lon_targets=lon_enc,
-            compute_oracle_all=True,
         )
 
-        top1_metrics.update(aux["top1_pred"], fut, op_mask)
-        multi_metrics.update(aux["best_pred"], fut, op_mask)
-        total_mode_nll += float(aux["mode_nll"].item())
-        total_lat_correct += float((torch.argmax(aux["lat_probs"], dim=1) == torch.argmax(lat_enc, dim=1)).sum().item())
-        total_lon_correct += float((torch.argmax(aux["lon_probs"], dim=1) == torch.argmax(lon_enc, dim=1)).sum().item())
-        total_joint_correct += float((torch.argmax(aux["joint_probs"], dim=1) == joint_idx).sum().item())
+        all_outputs = model.getAllModePredictions(
+            hist=hist,
+            hist_nbrs=hist_nbrs,
+            mask=mask,
+            temporal_mask=temporal_mask,
+            future=fut,
+            op_mask=op_mask,
+            device=device,
+            select_topk=select_topk,
+        )
+
+        oracle_global = gather_by_index(all_outputs["all_pred_phys"], all_outputs["best_mode_pos"])
+        routing = eval_aux["routing"]
+        selected_mode_idx = routing["selected_mode_idx"]
+        pred_joint_idx = routing["pred_joint_idx"]
+        oracle_joint_idx = torch.div(all_outputs["best_mode_idx"], model.num_submodes, rounding_mode="floor")
+        hit_global = (selected_mode_idx == all_outputs["best_mode_idx"]).float()
+        hit_joint_global = (pred_joint_idx == oracle_joint_idx).float()
+
+        top1_metrics.update(top1_pred, fut, op_mask)
+        multi_metrics.update(oracle_global, fut, op_mask)
+        total_mode_nll += float(all_outputs["mode_nll"].item())
+        total_lat_correct += float((torch.argmax(routing["lat_probs"], dim=1) == torch.argmax(lat_enc, dim=1)).sum().item())
+        total_lon_correct += float((torch.argmax(routing["lon_probs"], dim=1) == torch.argmax(lon_enc, dim=1)).sum().item())
+        total_joint_correct += float((torch.argmax(routing["joint_probs"], dim=1) == joint_idx).sum().item())
+        total_hit_global += float(hit_global.sum().item())
+        total_hit_joint_global += float(hit_joint_global.sum().item())
         total_samples += float(lat_enc.size(0))
         num_batches += 1
+
+        maybe_run_visualization(
+            args=args,
+            model=model,
+            hist=hist,
+            hist_nbrs=hist_nbrs,
+            mask=mask,
+            temporal_mask=temporal_mask,
+            fut=fut,
+            op_mask=op_mask,
+            lat_enc=lat_enc,
+            lon_enc=lon_enc,
+            top1_pred=top1_pred,
+            eval_aux=eval_aux,
+            all_outputs=all_outputs,
+        )
 
         top1_summary = top1_metrics.summary()
         multi_summary = multi_metrics.summary()
         avg_lat_acc = total_lat_correct / max(total_samples, 1.0)
         avg_lon_acc = total_lon_correct / max(total_samples, 1.0)
         avg_joint_acc = total_joint_correct / max(total_samples, 1.0)
+        avg_hit_global = total_hit_global / max(total_samples, 1.0)
+        avg_hit_joint_global = total_hit_joint_global / max(total_samples, 1.0)
         pbar.set_postfix(
             {
                 "top1_ade_m": f"{top1_summary['overall_ade_m']:.4f}",
@@ -210,6 +279,8 @@ def evaluate(model, dataloader, device, feature_dim):
                 "lat_acc": f"{avg_lat_acc:.4f}",
                 "lon_acc": f"{avg_lon_acc:.4f}",
                 "joint_acc": f"{avg_joint_acc:.4f}",
+                "hit_global": f"{avg_hit_global:.4f}",
+                "hit_joint_global": f"{avg_hit_joint_global:.4f}",
                 "mode_nll": f"{(total_mode_nll / num_batches):.4f}",
             }
         )
@@ -223,6 +294,8 @@ def evaluate(model, dataloader, device, feature_dim):
                 avg_lat_acc,
                 avg_lon_acc,
                 avg_joint_acc,
+                avg_hit_global,
+                avg_hit_joint_global,
             )
 
     top1_summary = top1_metrics.summary()
@@ -231,7 +304,9 @@ def evaluate(model, dataloader, device, feature_dim):
     avg_lat_acc = total_lat_correct / max(total_samples, 1.0)
     avg_lon_acc = total_lon_correct / max(total_samples, 1.0)
     avg_joint_acc = total_joint_correct / max(total_samples, 1.0)
-    print_metric_block("Final Test Result - Future", top1_summary, multi_summary, avg_mode_nll, avg_lat_acc, avg_lon_acc, avg_joint_acc)
+    avg_hit_global = total_hit_global / max(total_samples, 1.0)
+    avg_hit_joint_global = total_hit_joint_global / max(total_samples, 1.0)
+    print_metric_block("Final Test Result - Future", top1_summary, multi_summary, avg_mode_nll, avg_lat_acc, avg_lon_acc, avg_joint_acc, avg_hit_global, avg_hit_joint_global)
     return {
         "top1": top1_summary,
         "multi": multi_summary,
@@ -239,22 +314,24 @@ def evaluate(model, dataloader, device, feature_dim):
         "lat_acc": avg_lat_acc,
         "lon_acc": avg_lon_acc,
         "joint_acc": avg_joint_acc,
+        "hit_global": avg_hit_global,
+        "hit_joint_global": avg_hit_joint_global,
     }
 
 
 def main():
-    args = get_args_parser().parse_args()
+    args = get_eval_args()
     args.checkpoint_dir = str(FUT_CHECKPOINT_DIR)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = DiffusionFut(args).to(device)
 
     print(f"[FutEval] Device: {device}")
     print(f"[FutEval] Checkpoint dir: {args.checkpoint_dir}")
-    print(f"[FutEval] num_modes={args.num_modes}, num_inference_steps={args.num_inference_steps}")
+    print(f"[FutEval] num_modes={model.num_modes}, num_inference_steps={args.num_inference_steps}")
 
     test_loader = build_test_loader(args)
-    model = DiffusionFut(args).to(device)
     load_checkpoint(model, args.resume_fut, args.checkpoint_dir, device)
-    evaluate(model, test_loader, device, args.feature_dim)
+    evaluate(model, test_loader, device, args.feature_dim, args)
 
 
 if __name__ == "__main__":
