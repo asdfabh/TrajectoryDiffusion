@@ -1,7 +1,7 @@
-import sys
+import csv
 import os
 import re
-import csv
+import sys
 from pathlib import Path
 
 import torch
@@ -17,55 +17,48 @@ from method_diffusion.models.fut_model import DiffusionFut
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
+
 LOSS_STAT_KEYS = [
     "loss",
-    "loss_intent_lat",
-    "loss_intent_lon",
     "loss_intent_joint",
-    "loss_mode",
     "loss_anchor",
-    "loss_div",
     "loss_eps",
     "loss_rank",
-    "loss_x0",
-    "loss_end",
 ]
+
 VAL_METRIC_KEYS = [
     "top1_ade",
     "top1_fde",
-    "best_pred_ade",
-    "best_pred_fde",
-    "rank_nll",
     "lat_acc",
     "lon_acc",
     "joint_acc",
 ]
 
 
-def compute_selection_score(best_pred_ade, best_pred_fde, rank_nll=0.0):
-    return float(best_pred_ade) + 0.5 * float(best_pred_fde) + 0.1 * float(rank_nll)
+def flatten_train_parts(parts):
+    losses = parts["losses"]
+    return {
+        "loss": float(parts["loss_total"].item()),
+        "loss_intent_joint": float(losses["intent_joint"].item()),
+        "loss_anchor": float(losses["anchor"].item()),
+        "loss_eps": float(losses["eps"].item()),
+        "loss_rank": float(losses["rank"].item()),
+    }
+
+
+def flatten_eval_aux(aux):
+    metrics = aux["metrics"]
+    return {
+        "top1_ade": float(metrics["top1_ade"].item()),
+        "top1_fde": float(metrics["top1_fde"].item()),
+        "lat_acc": float(metrics["lat_acc"].item()),
+        "lon_acc": float(metrics["lon_acc"].item()),
+        "joint_acc": float(metrics["joint_acc"].item()),
+    }
 
 
 def compute_exec_selection_score(top1_ade, top1_fde):
     return float(top1_ade) + 0.5 * float(top1_fde)
-
-
-def compute_joint_selection_score(top1_ade, top1_fde, best_pred_ade, best_pred_fde, rank_nll=0.0):
-    return 0.5 * compute_exec_selection_score(top1_ade, top1_fde) + 0.5 * compute_selection_score(best_pred_ade, best_pred_fde, rank_nll)
-
-
-def build_selection_scores(eval_metrics):
-    return {
-        "multi": compute_selection_score(eval_metrics["best_pred_ade"], eval_metrics["best_pred_fde"], eval_metrics["rank_nll"]),
-        "exec": compute_exec_selection_score(eval_metrics["top1_ade"], eval_metrics["top1_fde"]),
-        "joint": compute_joint_selection_score(
-            eval_metrics["top1_ade"],
-            eval_metrics["top1_fde"],
-            eval_metrics["best_pred_ade"],
-            eval_metrics["best_pred_fde"],
-            eval_metrics["rank_nll"],
-        ),
-    }
 
 
 def resolve_resume_checkpoint(resume_arg, checkpoint_dir):
@@ -73,21 +66,23 @@ def resolve_resume_checkpoint(resume_arg, checkpoint_dir):
         return None
     if resume_arg == "best":
         return checkpoint_dir / "best.pth"
+    if resume_arg == "latest":
+        return checkpoint_dir / "latest.pth"
     if re.fullmatch(r"epoch_\d+", str(resume_arg)):
         return checkpoint_dir / f"{resume_arg}.pth"
-    print(f"[FutModel] Unsupported resume_fut='{resume_arg}', expected 'best' or 'epoch_i'.")
+    print(f"[FutModel] Unsupported resume_fut='{resume_arg}', expected 'best', 'latest' or 'epoch_i'.")
     return None
 
 
 def load_checkpoint(args, model, optimizer, scheduler, device):
     start_epoch = 0
-    best_scores = {"multi": float("inf"), "exec": float("inf"), "joint": float("inf")}
+    best_score = float("inf")
     ckpt_path = resolve_resume_checkpoint(args.resume_fut, Path(args.checkpoint_dir))
 
     if ckpt_path is not None:
         if not ckpt_path.exists():
             print(f"[FutModel] Checkpoint not found: {ckpt_path}")
-            return start_epoch, best_scores
+            return start_epoch, best_score
 
         state = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(state["model_state_dict"], strict=False)
@@ -97,57 +92,36 @@ def load_checkpoint(args, model, optimizer, scheduler, device):
             scheduler.load_state_dict(state["scheduler_state_dict"])
         except Exception:
             pass
+
         start_epoch = int(state.get("epoch", 0))
-        stored_best_scores = state.get("best_scores", None)
-        if isinstance(stored_best_scores, dict):
-            for key in best_scores:
-                if key in stored_best_scores:
-                    best_scores[key] = float(stored_best_scores[key])
-        elif "best_score" in state:
-            best_scores[str(getattr(args, "save_best_metric", "multi")).strip().lower()] = float(state["best_score"])
+        if "best_score" in state:
+            best_score = float(state["best_score"])
         elif "eval_ade" in state and "eval_fde" in state:
-            best_scores["exec"] = compute_exec_selection_score(state["eval_ade"], state["eval_fde"])
+            best_score = compute_exec_selection_score(state["eval_ade"], state["eval_fde"])
         print(f"Resumed from {ckpt_path} @ epoch {start_epoch}")
 
-    return start_epoch, best_scores
+    return start_epoch, best_score
 
 
-def write_csv_log(csv_path, epoch, train_stats, val_stats, eval_metrics, selection_scores, lr):
+def write_csv_log(csv_path, epoch, train_stats, val_stats, eval_metrics, score_exec, lr):
     row = {
         "epoch": epoch,
         "train_loss": train_stats["loss"],
-        "train_loss_intent_lat": train_stats["loss_intent_lat"],
-        "train_loss_intent_lon": train_stats["loss_intent_lon"],
         "train_loss_intent_joint": train_stats["loss_intent_joint"],
-        "train_loss_mode": train_stats["loss_mode"],
         "train_loss_anchor": train_stats["loss_anchor"],
-        "train_loss_div": train_stats["loss_div"],
         "train_loss_eps": train_stats["loss_eps"],
         "train_loss_rank": train_stats["loss_rank"],
-        "train_loss_x0": train_stats["loss_x0"],
-        "train_loss_end": train_stats["loss_end"],
         "val_loss": val_stats["loss"],
-        "val_loss_intent_lat": val_stats["loss_intent_lat"],
-        "val_loss_intent_lon": val_stats["loss_intent_lon"],
         "val_loss_intent_joint": val_stats["loss_intent_joint"],
-        "val_loss_mode": val_stats["loss_mode"],
         "val_loss_anchor": val_stats["loss_anchor"],
-        "val_loss_div": val_stats["loss_div"],
         "val_loss_eps": val_stats["loss_eps"],
         "val_loss_rank": val_stats["loss_rank"],
-        "val_loss_x0": val_stats["loss_x0"],
-        "val_loss_end": val_stats["loss_end"],
         "val_top1_ade_ft": eval_metrics["top1_ade"],
         "val_top1_fde_ft": eval_metrics["top1_fde"],
-        "val_best_pred_ade_ft": eval_metrics["best_pred_ade"],
-        "val_best_pred_fde_ft": eval_metrics["best_pred_fde"],
-        "val_rank_nll": eval_metrics["rank_nll"],
         "val_lat_acc": eval_metrics["lat_acc"],
         "val_lon_acc": eval_metrics["lon_acc"],
         "val_joint_acc": eval_metrics["joint_acc"],
-        "score_multi": selection_scores["multi"],
-        "score_exec": selection_scores["exec"],
-        "score_joint": selection_scores["joint"],
+        "score_exec": score_exec,
         "lr": lr,
     }
     with csv_path.open("a", newline="", encoding="utf-8") as f:
@@ -159,38 +133,21 @@ def init_csv_log(csv_path):
     fieldnames = [
         "epoch",
         "train_loss",
-        "train_loss_intent_lat",
-        "train_loss_intent_lon",
         "train_loss_intent_joint",
-        "train_loss_mode",
         "train_loss_anchor",
-        "train_loss_div",
         "train_loss_eps",
         "train_loss_rank",
-        "train_loss_x0",
-        "train_loss_end",
         "val_loss",
-        "val_loss_intent_lat",
-        "val_loss_intent_lon",
         "val_loss_intent_joint",
-        "val_loss_mode",
         "val_loss_anchor",
-        "val_loss_div",
         "val_loss_eps",
         "val_loss_rank",
-        "val_loss_x0",
-        "val_loss_end",
         "val_top1_ade_ft",
         "val_top1_fde_ft",
-        "val_best_pred_ade_ft",
-        "val_best_pred_fde_ft",
-        "val_rank_nll",
         "val_lat_acc",
         "val_lon_acc",
         "val_joint_acc",
-        "score_multi",
         "score_exec",
-        "score_joint",
         "lr",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
@@ -206,37 +163,30 @@ def build_zero_eval_metrics():
     return {key: 0.0 for key in VAL_METRIC_KEYS}
 
 
-def write_tensorboard_log(writer, epoch, train_stats, val_stats, eval_metrics, selection_scores, lr):
+def write_tensorboard_log(writer, epoch, train_stats, val_stats, eval_metrics, score_exec, lr):
     for key in LOSS_STAT_KEYS:
         writer.add_scalar(f"LossTrain/{key}", train_stats[key], epoch)
         writer.add_scalar(f"LossVal/{key}", val_stats[key], epoch)
     writer.add_scalar("Eval/top1_ADE_ft", eval_metrics["top1_ade"], epoch)
     writer.add_scalar("Eval/top1_FDE_ft", eval_metrics["top1_fde"], epoch)
-    writer.add_scalar("Eval/bestPredIntent_ADE_ft", eval_metrics["best_pred_ade"], epoch)
-    writer.add_scalar("Eval/bestPredIntent_FDE_ft", eval_metrics["best_pred_fde"], epoch)
-    writer.add_scalar("Eval/rank_nll", eval_metrics["rank_nll"], epoch)
     writer.add_scalar("Eval/lat_acc", eval_metrics["lat_acc"], epoch)
     writer.add_scalar("Eval/lon_acc", eval_metrics["lon_acc"], epoch)
     writer.add_scalar("Eval/joint_acc", eval_metrics["joint_acc"], epoch)
-    writer.add_scalar("Eval/score_multi", selection_scores["multi"], epoch)
-    writer.add_scalar("Eval/score_exec", selection_scores["exec"], epoch)
-    writer.add_scalar("Eval/score_joint", selection_scores["joint"], epoch)
+    writer.add_scalar("Eval/score_exec", score_exec, epoch)
     writer.add_scalar("LR", lr, epoch)
 
 
-def print_eval_summary(epoch, total_epochs, train_stats, val_stats, eval_metrics, selection_scores):
+def print_eval_summary(epoch, total_epochs, train_stats, val_stats, eval_metrics, score_exec):
     print(
         f"Epoch {epoch}/{total_epochs} | "
         f"train={train_stats['loss']:.6f} | "
-        f"train_eps={train_stats['loss_eps']:.6f} | "
+        f"intent={train_stats['loss_intent_joint']:.6f} | "
+        f"eps={train_stats['loss_eps']:.6f} | "
         f"val={val_stats['loss']:.6f} | "
-        f"val_eps={val_stats['loss_eps']:.6f} | "
         f"top1_ade={eval_metrics['top1_ade']:.4f}ft | "
         f"top1_fde={eval_metrics['top1_fde']:.4f}ft | "
-        f"best_pred_ade={eval_metrics['best_pred_ade']:.4f}ft | "
-        f"best_pred_fde={eval_metrics['best_pred_fde']:.4f}ft | "
         f"joint_acc={eval_metrics['joint_acc']:.4f} | "
-        f"score={selection_scores['multi']:.4f}"
+        f"score={score_exec:.4f}"
     )
 
 
@@ -307,21 +257,17 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        totals["loss"] += float(loss.item())
+        flat_loss_parts = flatten_train_parts(loss_parts)
         for key in LOSS_STAT_KEYS:
-            if key == "loss":
-                continue
-            totals[key] += float(loss_parts[key].item())
+            totals[key] += flat_loss_parts[key]
         num_batches += 1
         pbar.set_postfix(
             {
-                "loss": f"{loss.item():.6f}",
-                "avg_loss": f"{(totals['loss'] / num_batches):.6f}",
+                "loss": f"{flat_loss_parts['loss']:.6f}",
+                "avg": f"{(totals['loss'] / num_batches):.6f}",
+                "intent": f"{(totals['loss_intent_joint'] / num_batches):.6f}",
                 "eps": f"{(totals['loss_eps'] / num_batches):.6f}",
-                "lat": f"{(totals['loss_intent_lat'] / num_batches):.6f}",
-                "lon": f"{(totals['loss_intent_lon'] / num_batches):.6f}",
-                "joint": f"{(totals['loss_intent_joint'] / num_batches):.6f}",
-                "mode": f"{(totals['loss_mode'] / num_batches):.6f}",
+                "anchor": f"{(totals['loss_anchor'] / num_batches):.6f}",
             }
         )
 
@@ -359,7 +305,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim):
             lat_targets=lat_enc,
             lon_targets=lon_enc,
         )
-        _, _, eval_aux = model.forwardEvalMulti(
+        _, eval_aux = model.forwardEval(
             hist,
             hist_nbrs,
             mask,
@@ -370,29 +316,20 @@ def evaluate(model, dataloader, device, epoch, feature_dim):
             return_aux=True,
             lat_targets=lat_enc,
             lon_targets=lon_enc,
-            compute_oracle_all=False,
         )
 
-        totals["loss"] += float(val_loss.item())
+        flat_val_parts = flatten_train_parts(val_parts)
+        flat_eval_metrics = flatten_eval_aux(eval_aux)
         for key in LOSS_STAT_KEYS:
-            if key == "loss":
-                continue
-            totals[key] += float(val_parts[key].item())
-        metric_totals["top1_ade"] += float(eval_aux["top1_ade"].item())
-        metric_totals["top1_fde"] += float(eval_aux["top1_fde"].item())
-        metric_totals["best_pred_ade"] += float(eval_aux["best_pred_ade"].item())
-        metric_totals["best_pred_fde"] += float(eval_aux["best_pred_fde"].item())
-        metric_totals["rank_nll"] += float(eval_aux["rank_nll"].item())
-        metric_totals["lat_acc"] += float(eval_aux["lat_acc"].item())
-        metric_totals["lon_acc"] += float(eval_aux["lon_acc"].item())
-        metric_totals["joint_acc"] += float(eval_aux["joint_acc"].item())
+            totals[key] += flat_val_parts[key]
+        for key in VAL_METRIC_KEYS:
+            metric_totals[key] += flat_eval_metrics[key]
         num_batches += 1
 
         pbar.set_postfix(
             {
-                "val_loss": f"{(totals['loss'] / num_batches):.6f}",
+                "val": f"{(totals['loss'] / num_batches):.6f}",
                 "top1_ade": f"{(metric_totals['top1_ade'] / num_batches):.4f}",
-                "best@pred": f"{(metric_totals['best_pred_ade'] / num_batches):.4f}",
                 "joint_acc": f"{(metric_totals['joint_acc'] / num_batches):.4f}",
             }
         )
@@ -404,22 +341,12 @@ def evaluate(model, dataloader, device, epoch, feature_dim):
     return val_stats, eval_metrics
 
 
-def save_checkpoint_aliases(state, checkpoint_dir, best_flags, selected_metric):
-    if best_flags["multi"]:
-        torch.save(state, checkpoint_dir / "best_multi.pth")
-    if best_flags["exec"]:
-        torch.save(state, checkpoint_dir / "best_exec.pth")
-    if best_flags["joint"]:
-        torch.save(state, checkpoint_dir / "best_joint.pth")
+def save_best_checkpoint(state, checkpoint_dir):
+    torch.save(state, checkpoint_dir / "best.pth")
 
-    selected_name = {
-        "multi": "best_multi.pth",
-        "exec": "best_exec.pth",
-        "joint": "best_joint.pth",
-    }[selected_metric]
-    selected_path = checkpoint_dir / selected_name
-    if selected_path.exists():
-        torch.save(torch.load(selected_path, map_location="cpu"), checkpoint_dir / "best.pth")
+
+def save_latest_checkpoint(state, checkpoint_dir):
+    torch.save(state, checkpoint_dir / "latest.pth")
 
 
 def main():
@@ -469,26 +396,22 @@ def main():
     model = DiffusionFut(args).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
-    start_epoch, best_scores = load_checkpoint(args, model, optimizer, scheduler, device)
-    selected_metric = str(getattr(args, "save_best_metric", "multi")).strip().lower()
+    start_epoch, best_score = load_checkpoint(args, model, optimizer, scheduler, device)
 
     for epoch in range(start_epoch, args.num_epochs):
         train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim)
         val_stats, eval_metrics = evaluate(model, val_loader, device, epoch + 1, args.feature_dim)
-        selection_scores = build_selection_scores(eval_metrics)
+        score_exec = compute_exec_selection_score(eval_metrics["top1_ade"], eval_metrics["top1_fde"])
         current_lr = optimizer.param_groups[0]["lr"]
 
-        write_csv_log(log_csv_path, epoch + 1, train_stats, val_stats, eval_metrics, selection_scores, current_lr)
-        write_tensorboard_log(writer, epoch + 1, train_stats, val_stats, eval_metrics, selection_scores, current_lr)
-        print_eval_summary(epoch + 1, args.num_epochs, train_stats, val_stats, eval_metrics, selection_scores)
+        write_csv_log(log_csv_path, epoch + 1, train_stats, val_stats, eval_metrics, score_exec, current_lr)
+        write_tensorboard_log(writer, epoch + 1, train_stats, val_stats, eval_metrics, score_exec, current_lr)
+        print_eval_summary(epoch + 1, args.num_epochs, train_stats, val_stats, eval_metrics, score_exec)
 
         scheduler.step()
-        best_flags = {}
-        for key, score in selection_scores.items():
-            is_best = score < best_scores[key]
-            best_flags[key] = is_best
-            if is_best:
-                best_scores[key] = score
+        is_best = score_exec < best_score
+        if is_best:
+            best_score = score_exec
 
         state = {
             "epoch": epoch + 1,
@@ -497,17 +420,18 @@ def main():
             "scheduler_state_dict": scheduler.state_dict(),
             "loss": train_stats["loss"],
             "eval_metrics": eval_metrics,
-            "selection_scores": selection_scores,
-            "best_scores": best_scores,
-            "best_score": best_scores[selected_metric],
+            "score_exec": score_exec,
+            "best_score": best_score,
             "eval_ade": eval_metrics["top1_ade"],
             "eval_fde": eval_metrics["top1_fde"],
         }
 
         checkpoint_dir = Path(args.checkpoint_dir)
-        if (epoch + 1) % args.save_interval == 0:
+        save_latest_checkpoint(state, checkpoint_dir)
+        if (epoch + 1) % 5 == 0:
             torch.save(state, checkpoint_dir / f"epoch_{epoch + 1}.pth")
-        save_checkpoint_aliases(state, checkpoint_dir, best_flags, selected_metric)
+        if is_best:
+            save_best_checkpoint(state, checkpoint_dir)
 
     writer.close()
 

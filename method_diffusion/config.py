@@ -16,9 +16,9 @@ def get_args_parser():
     parser.add_argument("--save_interval", default=5, type=int)
     parser.add_argument("--mask_prob", default=0.5, type=float)
     parser.add_argument("--random_mask_ratio", default=0.5, type=float)
-    parser.add_argument("--block_mask_start", default=1, type=int)
+    parser.add_argument("--block_mask_start", default=0, type=int)
     parser.add_argument("--checkpoint_dir", default="./checkpoints", type=str)
-    parser.add_argument("--resume_fut", default="best", type=str)
+    parser.add_argument("--resume_fut", default="none", type=str)
     parser.add_argument("--resume_hist", default="best", type=str)
 
     # Joint train strategy
@@ -39,7 +39,7 @@ def get_args_parser():
     parser.add_argument("--pre_norm", default=1, type=int)
     parser.add_argument("--dropout", default=0.1, type=float)
     parser.add_argument("--mlp_ratio", default=4, type=int)
-    parser.add_argument("--num_train_timesteps", default=500, type=int)
+    parser.add_argument("--num_train_timesteps", default=200, type=int)
     parser.add_argument("--time_embedding_size", default=256, type=int)
     parser.add_argument("--T", default=16, type=int)
 
@@ -52,7 +52,6 @@ def get_args_parser():
     parser.add_argument("--dim_feedforward", default=2048, type=int)
     parser.add_argument("--nheads", default=8, type=int)
     parser.add_argument("--activation", default="relu", type=str)
-    parser.add_argument("--network", default="highwaynet", type=str)
 
     # Fut diffusion model
     parser.add_argument("--hidden_dim_fut", default=128, type=int)
@@ -65,26 +64,10 @@ def get_args_parser():
     parser.add_argument("--num_train_timesteps_fut", default=200, type=int)
     parser.add_argument("--time_embedding_size_fut", default=256, type=int)
     parser.add_argument("--T_f", default=25, type=int)
-    parser.add_argument("--num_modes", default=18, type=int)
     parser.add_argument("--num_lat_classes", default=3, type=int)
     parser.add_argument("--num_lon_classes", default=3, type=int)
     parser.add_argument("--num_submodes", default=2, type=int)
     parser.add_argument("--mode_dim", default=128, type=int)
-    parser.add_argument("--lambda_intent", default=1.0, type=float)
-    parser.add_argument("--lambda_joint", default=1.0, type=float)
-    parser.add_argument("--lambda_mode", default=0.5, type=float)
-    parser.add_argument("--lambda_anchor", default=1.0, type=float)
-    parser.add_argument("--lambda_div", default=0.05, type=float)
-    parser.add_argument("--lambda_rank", default=0.5, type=float)
-    parser.add_argument("--lambda_x0", default=0.1, type=float)
-    parser.add_argument("--lambda_end", default=0.1, type=float)
-    parser.add_argument("--save_best_metric", default="multi", type=str, choices=["multi", "exec", "joint"])
-    parser.add_argument("--use_hard_assignment", default=1, type=int)
-    parser.add_argument("--intent_label_smoothing", default=0.05, type=float)
-    parser.add_argument("--submode_temperature", default=1.0, type=float)
-    parser.add_argument("--anchor_div_margin", default=2.0, type=float)
-    parser.add_argument("--rank_temperature", default=1.0, type=float)
-    parser.add_argument("--submode_floor_weight", default=0.2, type=float)
 
     # Fut train/inference
     parser.add_argument("--num_inference_steps", default=5, type=int)
@@ -92,8 +75,6 @@ def get_args_parser():
     parser.add_argument("--x0_clip", default=5.0, type=float)
 
     # Fut visualization
-    parser.add_argument("--fut_enable_train_vis", default=0, type=int)
-    parser.add_argument("--fut_enable_eval_vis", default=1, type=int)
     parser.add_argument("--hist_enable_train_vis", default=0, type=int)
     parser.add_argument("--hist_enable_eval_vis", default=0, type=int)
 

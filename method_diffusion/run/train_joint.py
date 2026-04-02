@@ -175,7 +175,7 @@ def init_csv_log(csv_path):
         "train_hist_loss",
         "train_hist_loss_weighted",
         "train_fut_loss",
-        "train_fut_noise_loss",
+        "train_fut_eps_loss",
         "val_ade_ft",
         "val_fde_ft",
         "val_ade_m",
@@ -195,7 +195,7 @@ def write_csv_log(csv_path, epoch, train_stats, eval_ade, eval_fde, lr_fut, lr_h
         "train_hist_loss": train_stats["loss_hist"],
         "train_hist_loss_weighted": train_stats["loss_hist_weighted"],
         "train_fut_loss": train_stats["loss_fut"],
-        "train_fut_noise_loss": train_stats["loss_noise"],
+        "train_fut_eps_loss": train_stats["loss_eps"],
         "val_ade_ft": eval_ade,
         "val_fde_ft": eval_fde,
         "val_ade_m": eval_ade * 0.3048,
@@ -259,7 +259,7 @@ def train_epoch(
     total_hist_loss = 0.0
     total_hist_loss_weighted = 0.0
     total_fut_loss = 0.0
-    total_noise_loss = 0.0
+    total_eps_loss = 0.0
     num_batches = 0
 
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Train", ncols=140)
@@ -291,7 +291,7 @@ def train_epoch(
             lat_targets=lat_enc,
             lon_targets=lon_enc,
         )
-        # _, _, _ = model_fut.forwardEval_minADE(hist_for_fut, hist_nbrs, mask, temporal_mask, fut, op_mask, device, K=5)
+        # 多模态评估统一使用 forwardEval(..., return_aux=True)
 
         loss_hist_weighted = hist_loss_weight * loss_hist
         loss = loss_fut + loss_hist_weighted
@@ -309,14 +309,14 @@ def train_epoch(
         total_hist_loss += float(loss_hist.item())
         total_hist_loss_weighted += float(loss_hist_weighted.item())
         total_fut_loss += float(loss_fut.item())
-        total_noise_loss += float(fut_parts["loss_noise"].item())
+        total_eps_loss += float(fut_parts["losses"]["eps"].item())
         num_batches += 1
         pbar.set_postfix({
             "loss": f"{loss.item():.6f}",
             "avg": f"{(total_loss / num_batches):.6f}",
             "hist": f"{(total_hist_loss / num_batches):.6f}",
             "fut": f"{(total_fut_loss / num_batches):.6f}",
-            "noise": f"{(total_noise_loss / num_batches):.6f}",
+            "eps": f"{(total_eps_loss / num_batches):.6f}",
         })
 
     denom = max(num_batches, 1)
@@ -325,7 +325,7 @@ def train_epoch(
         "loss_hist": total_hist_loss / denom,
         "loss_hist_weighted": total_hist_loss_weighted / denom,
         "loss_fut": total_fut_loss / denom,
-        "loss_noise": total_noise_loss / denom,
+        "loss_eps": total_eps_loss / denom,
     }
 
 
@@ -373,7 +373,7 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval
             freeze_hist=True,
             detach_hist_for_fut=True,
         )
-        _, eval_ade, eval_fde = model_fut.forwardEval(
+        _, eval_aux = model_fut.forwardEval(
             hist_for_fut,
             hist_nbrs,
             mask,
@@ -381,7 +381,10 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval
             fut,
             op_mask,
             device,
+            return_aux=True,
         )
+        eval_ade = eval_aux["metrics"]["top1_ade"]
+        eval_fde = eval_aux["metrics"]["top1_fde"]
 
         total_ade += float(eval_ade.item())
         total_fde += float(eval_fde.item())
@@ -523,7 +526,7 @@ def main():
         writer.add_scalar("Loss/TrainHist", train_stats["loss_hist"], epoch + 1)
         writer.add_scalar("Loss/TrainHistWeighted", train_stats["loss_hist_weighted"], epoch + 1)
         writer.add_scalar("Loss/TrainFut", train_stats["loss_fut"], epoch + 1)
-        writer.add_scalar("Loss/TrainNoise", train_stats["loss_noise"], epoch + 1)
+        writer.add_scalar("Loss/TrainEps", train_stats["loss_eps"], epoch + 1)
         writer.add_scalar("Eval/ADE_ft", eval_ade, epoch + 1)
         writer.add_scalar("Eval/FDE_ft", eval_fde, epoch + 1)
 
