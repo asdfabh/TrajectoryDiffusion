@@ -55,13 +55,28 @@ def load_checkpoint(model, resume_arg, checkpoint_dir, device):
     return model
 
 
-def print_metric_block(title, top1_metrics, multi_metrics, mode_nll, lat_acc=0.0, lon_acc=0.0, joint_acc=0.0, hit_global=0.0, hit_joint_global=0.0):
+def print_metric_block(
+    title,
+    top1_metrics,
+    multi_metrics,
+    mode_nll,
+    lat_acc=0.0,
+    lon_acc=0.0,
+    joint_acc=0.0,
+    hit_global=0.0,
+    intent_topk_hit=0.0,
+    best_intent_acc=0.0,
+    route_hit=0.0,
+    route_gap=0.0,
+):
     line_width = 140
     print("\n" + "=" * 30 + f" {title} " + "=" * 30)
     print(
         f"modeNLL: {mode_nll:.6f} | latAcc: {lat_acc:.4f} | lonAcc: {lon_acc:.4f} | "
-        f"jointAcc: {joint_acc:.4f} | hitGlobal: {hit_global:.4f} | hitJointGlobal: {hit_joint_global:.4f}"
+        f"jointAcc: {joint_acc:.4f} | hitGlobal: {hit_global:.4f} | "
+        f"intentTopK: {intent_topk_hit:.4f} | bestIntent: {best_intent_acc:.4f}"
     )
+    print(f"routeHit: {route_hit:.4f} | routeGap(ft): {route_gap:.4f}")
     print("-" * line_width)
     time_pairs = [("1s", 4), ("2s", 9), ("3s", 14), ("4s", 19), ("5s", 24)]
     print(
@@ -96,7 +111,10 @@ def print_metrics(metrics, title, metric_name="Future"):
         float(metrics.get("lon_acc", 0.0)),
         float(metrics.get("joint_acc", 0.0)),
         float(metrics.get("hit_global", 0.0)),
-        float(metrics.get("hit_joint_global", 0.0)),
+        float(metrics.get("intent_topk_hit", 0.0)),
+        float(metrics.get("best_intent_acc", 0.0)),
+        float(metrics.get("route_hit", 0.0)),
+        float(metrics.get("route_gap", 0.0)),
     )
 
 
@@ -128,7 +146,21 @@ def build_test_loader(args):
     )
 
 
-def maybe_run_visualization(args, model, hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc, top1_pred, eval_aux, all_outputs):
+def maybe_run_visualization(
+    args,
+    model,
+    hist,
+    hist_nbrs,
+    mask,
+    temporal_mask,
+    fut,
+    op_mask,
+    lat_enc,
+    lon_enc,
+    top1_pred,
+    eval_aux,
+    all_outputs,
+):
     if int(args.enable_vis) <= 0:
         return
 
@@ -143,8 +175,11 @@ def maybe_run_visualization(args, model, hist, hist_nbrs, mask, temporal_mask, f
         selected_mode_pos,
         torch.full_like(selected_mode_pos, -1),
     )
-    oracle_joint_idx = torch.div(best_mode_idx, model.num_submodes, rounding_mode="floor")
-    oracle_sub_idx = torch.remainder(best_mode_idx, model.num_submodes)
+
+    pred_intent_idx = torch.argmax(routing["intent_scores"], dim=1)
+    oracle_joint_idx = torch.div(best_mode_idx, model.num_anchor_per_joint, rounding_mode="floor")
+    oracle_anchor_idx = torch.remainder(best_mode_idx, model.num_anchor_per_joint)
+    routed_anchor_idx = torch.remainder(selected_mode_idx, model.num_anchor_per_joint)
     selected_hit_global = (selected_mode_idx == best_mode_idx).long()
 
     maybe_visualize_future_prediction(
@@ -166,13 +201,13 @@ def maybe_run_visualization(args, model, hist, hist_nbrs, mask, temporal_mask, f
             "joint": routing["joint_probs"],
         },
         intent_meta={
-            "pred_joint_idx": routing["pred_joint_idx"],
+            "pred_joint_idx": pred_intent_idx,
             "gt_joint_idx": joint_idx,
             "oracle_joint_idx": oracle_joint_idx,
-            "routed_sub_idx": routing["routed_sub_idx"],
-            "best_sub_idx": oracle_sub_idx,
-            "best_sub_label": "best_sub(global)",
-            "num_submodes": torch.full_like(joint_idx, model.num_submodes),
+            "routed_sub_idx": routed_anchor_idx,
+            "best_sub_idx": oracle_anchor_idx,
+            "best_sub_label": "best_anchor(global)",
+            "num_submodes": torch.full_like(joint_idx, model.num_anchor_per_joint),
             "selected_hit_global": selected_hit_global,
         },
     )
@@ -188,7 +223,10 @@ def evaluate(model, dataloader, device, feature_dim, args):
     total_lon_correct = 0.0
     total_joint_correct = 0.0
     total_hit_global = 0.0
-    total_hit_joint_global = 0.0
+    total_intent_topk_hit = 0.0
+    total_best_intent_acc = 0.0
+    total_route_hit = 0.0
+    total_route_gap = 0.0
     total_samples = 0.0
     num_batches = 0
 
@@ -229,10 +267,20 @@ def evaluate(model, dataloader, device, feature_dim, args):
         oracle_global = gather_by_index(all_outputs["all_pred_phys"], all_outputs["best_mode_pos"])
         routing = eval_aux["routing"]
         selected_mode_idx = routing["selected_mode_idx"]
-        pred_joint_idx = routing["pred_joint_idx"]
-        oracle_joint_idx = torch.div(all_outputs["best_mode_idx"], model.num_submodes, rounding_mode="floor")
-        hit_global = (selected_mode_idx == all_outputs["best_mode_idx"]).float()
-        hit_joint_global = (pred_joint_idx == oracle_joint_idx).float()
+        oracle_best_mode_idx = all_outputs["best_mode_idx"]
+        oracle_best_intent_idx = torch.div(
+            oracle_best_mode_idx,
+            model.num_anchor_per_joint,
+            rounding_mode="floor",
+        )
+        hit_global = (selected_mode_idx == oracle_best_mode_idx).float()
+        intent_topk_hit = (routing["top_intent_idx"] == oracle_best_intent_idx.unsqueeze(1)).any(dim=1).float()
+        best_intent_acc = (torch.argmax(routing["intent_scores"], dim=1) == oracle_best_intent_idx).float()
+        route_hit = (routing["routed_idx"] == routing["best_pred_idx"]).float()
+        route_gap = (
+            routing["candidate_dist"].gather(1, routing["routed_idx"].unsqueeze(1)).squeeze(1)
+            - routing["candidate_dist"].min(dim=1).values
+        )
 
         top1_metrics.update(top1_pred, fut, op_mask)
         multi_metrics.update(oracle_global, fut, op_mask)
@@ -241,7 +289,10 @@ def evaluate(model, dataloader, device, feature_dim, args):
         total_lon_correct += float((torch.argmax(routing["lon_probs"], dim=1) == torch.argmax(lon_enc, dim=1)).sum().item())
         total_joint_correct += float((torch.argmax(routing["joint_probs"], dim=1) == joint_idx).sum().item())
         total_hit_global += float(hit_global.sum().item())
-        total_hit_joint_global += float(hit_joint_global.sum().item())
+        total_intent_topk_hit += float(intent_topk_hit.sum().item())
+        total_best_intent_acc += float(best_intent_acc.sum().item())
+        total_route_hit += float(route_hit.sum().item())
+        total_route_gap += float(route_gap.sum().item())
         total_samples += float(lat_enc.size(0))
         num_batches += 1
 
@@ -267,21 +318,22 @@ def evaluate(model, dataloader, device, feature_dim, args):
         avg_lon_acc = total_lon_correct / max(total_samples, 1.0)
         avg_joint_acc = total_joint_correct / max(total_samples, 1.0)
         avg_hit_global = total_hit_global / max(total_samples, 1.0)
-        avg_hit_joint_global = total_hit_joint_global / max(total_samples, 1.0)
+        avg_intent_topk = total_intent_topk_hit / max(total_samples, 1.0)
+        avg_best_intent = total_best_intent_acc / max(total_samples, 1.0)
+        avg_route_hit = total_route_hit / max(total_samples, 1.0)
+        avg_route_gap = total_route_gap / max(total_samples, 1.0)
         pbar.set_postfix(
             {
                 "top1_ade_m": f"{top1_summary['overall_ade_m']:.4f}",
                 "top1_fde_m": f"{top1_summary['overall_fde_m']:.4f}",
-                "top1_rmse_m": f"{top1_summary['overall_rmse_m']:.4f}",
                 "minade_m": f"{multi_summary['overall_ade_m']:.4f}",
-                "minfde_m": f"{multi_summary['overall_fde_m']:.4f}",
                 "gap_m": f"{(top1_summary['overall_ade_m'] - multi_summary['overall_ade_m']):.4f}",
                 "lat_acc": f"{avg_lat_acc:.4f}",
-                "lon_acc": f"{avg_lon_acc:.4f}",
-                "joint_acc": f"{avg_joint_acc:.4f}",
+                "intent_topk": f"{avg_intent_topk:.4f}",
+                "route_hit": f"{avg_route_hit:.4f}",
+                "route_gap": f"{avg_route_gap:.4f}",
                 "hit_global": f"{avg_hit_global:.4f}",
-                "hit_joint_global": f"{avg_hit_joint_global:.4f}",
-                "mode_nll": f"{(total_mode_nll / num_batches):.4f}",
+                "mode_nll": f"{(total_mode_nll / max(num_batches, 1)):.4f}",
             }
         )
 
@@ -295,7 +347,10 @@ def evaluate(model, dataloader, device, feature_dim, args):
                 avg_lon_acc,
                 avg_joint_acc,
                 avg_hit_global,
-                avg_hit_joint_global,
+                avg_intent_topk,
+                avg_best_intent,
+                avg_route_hit,
+                avg_route_gap,
             )
 
     top1_summary = top1_metrics.summary()
@@ -305,8 +360,24 @@ def evaluate(model, dataloader, device, feature_dim, args):
     avg_lon_acc = total_lon_correct / max(total_samples, 1.0)
     avg_joint_acc = total_joint_correct / max(total_samples, 1.0)
     avg_hit_global = total_hit_global / max(total_samples, 1.0)
-    avg_hit_joint_global = total_hit_joint_global / max(total_samples, 1.0)
-    print_metric_block("Final Test Result - Future", top1_summary, multi_summary, avg_mode_nll, avg_lat_acc, avg_lon_acc, avg_joint_acc, avg_hit_global, avg_hit_joint_global)
+    avg_intent_topk = total_intent_topk_hit / max(total_samples, 1.0)
+    avg_best_intent = total_best_intent_acc / max(total_samples, 1.0)
+    avg_route_hit = total_route_hit / max(total_samples, 1.0)
+    avg_route_gap = total_route_gap / max(total_samples, 1.0)
+    print_metric_block(
+        "Final Test Result - Future",
+        top1_summary,
+        multi_summary,
+        avg_mode_nll,
+        avg_lat_acc,
+        avg_lon_acc,
+        avg_joint_acc,
+        avg_hit_global,
+        avg_intent_topk,
+        avg_best_intent,
+        avg_route_hit,
+        avg_route_gap,
+    )
     return {
         "top1": top1_summary,
         "multi": multi_summary,
@@ -315,7 +386,10 @@ def evaluate(model, dataloader, device, feature_dim, args):
         "lon_acc": avg_lon_acc,
         "joint_acc": avg_joint_acc,
         "hit_global": avg_hit_global,
-        "hit_joint_global": avg_hit_joint_global,
+        "intent_topk_hit": avg_intent_topk,
+        "best_intent_acc": avg_best_intent,
+        "route_hit": avg_route_hit,
+        "route_gap": avg_route_gap,
     }
 
 

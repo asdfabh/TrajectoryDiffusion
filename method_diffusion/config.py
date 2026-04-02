@@ -67,7 +67,14 @@ def get_args_parser():
     parser.add_argument("--num_lat_classes", default=3, type=int)
     parser.add_argument("--num_lon_classes", default=3, type=int)
     parser.add_argument("--num_submodes", default=2, type=int)
+    parser.add_argument("--num_anchor_per_joint", default=2, type=int)
     parser.add_argument("--mode_dim", default=128, type=int)
+    parser.add_argument("--topk_intents", default=3, type=int)
+    parser.add_argument("--lambda_fde_route", default=0.5, type=float)
+    parser.add_argument("--tau_anchor_teacher", default=1.0, type=float)
+    parser.add_argument("--tau_score_teacher", default=1.0, type=float)
+    parser.add_argument("--route_beta", default=1.0, type=float)
+    parser.add_argument("--use_joint_semantic_head", default=0, type=int)
 
     # Fut train/inference
     parser.add_argument("--num_inference_steps", default=5, type=int)

@@ -7,18 +7,17 @@ from method_diffusion.models.Intent_anchor import (
     FutureMotionCodec,
     FutureDiffusionRefiner,
 )
-from method_diffusion.models.hist_encoder import HistEncoder
 from method_diffusion.models.fut_loss import FutureLossComputer
+from method_diffusion.models.hist_encoder import HistEncoder
 from method_diffusion.utils.fut_utils import (
-    to_valid_mask,
-    gather_by_index,
     compute_ade_fde,
     compute_per_mode_distance,
+    gather_by_index,
+    to_valid_mask,
 )
 
 
 class DiffusionFut(nn.Module):
-
     def __init__(self, args):
         super().__init__()
         self.dataset_name = str(getattr(args, "dataset", "ngsim")).strip().lower()
@@ -31,8 +30,13 @@ class DiffusionFut(nn.Module):
         self.num_lat_classes = int(getattr(args, "num_lat_classes", 3))
         self.num_lon_classes = int(getattr(args, "num_lon_classes", 3))
         self.num_joint_classes = self.num_lat_classes * self.num_lon_classes
-        self.num_submodes = int(getattr(args, "num_submodes", 2))
-        self.num_modes = self.num_joint_classes * self.num_submodes
+        self.num_anchor_per_joint = int(getattr(args, "num_anchor_per_joint", getattr(args, "num_submodes", 2)))
+        self.num_submodes = self.num_anchor_per_joint
+        self.num_modes = self.num_joint_classes * self.num_anchor_per_joint
+        self.topk_intents = max(1, min(int(getattr(args, "topk_intents", 3)), self.num_joint_classes))
+        self.topk_refine = self.topk_intents * self.num_anchor_per_joint
+        self.lambda_fde_route = max(0.0, float(getattr(args, "lambda_fde_route", 0.5)))
+        self.route_beta = float(getattr(args, "route_beta", 1.0))
 
         self.hist_encoder = HistEncoder(args)
         self.mode_prior = IntentConditionedModePrior(
@@ -40,7 +44,7 @@ class DiffusionFut(nn.Module):
             mode_dim=self.mode_dim,
             num_lat_classes=self.num_lat_classes,
             num_lon_classes=self.num_lon_classes,
-            num_submodes=self.num_submodes,
+            num_anchor_per_joint=self.num_anchor_per_joint,
             future_steps=self.T,
             output_dim=self.output_dim,
         )
@@ -56,10 +60,13 @@ class DiffusionFut(nn.Module):
         self.loss_helper = FutureLossComputer(
             dataset_name=self.dataset_name,
             num_joint_classes=self.num_joint_classes,
-            num_submodes=self.num_submodes,
+            num_anchor_per_joint=self.num_anchor_per_joint,
             future_steps=self.T,
             output_dim=self.output_dim,
             num_train_timesteps=args.num_train_timesteps_fut,
+            lambda_fde_route=self.lambda_fde_route,
+            tau_anchor_teacher=float(getattr(args, "tau_anchor_teacher", 1.0)),
+            tau_score_teacher=float(getattr(args, "tau_score_teacher", 1.0)),
         )
 
         # 兼容旧代码的只读别名。
@@ -85,6 +92,58 @@ class DiffusionFut(nn.Module):
     def runDiffusionForModes(self, ctx, mode_tokens, anchor_vel_norm, anchor_phys, device):
         return self.refiner.runDiffusionForModes(ctx, mode_tokens, anchor_vel_norm, anchor_phys, device, self.motion_codec)
 
+    def gatherTopIntents(self, tensor, top_intent_idx):
+        if tensor is None:
+            return None
+        expand_shape = [top_intent_idx.size(0), top_intent_idx.size(1)] + [1] * (tensor.dim() - 2)
+        gather_idx = top_intent_idx.view(*expand_shape).expand(
+            top_intent_idx.size(0),
+            top_intent_idx.size(1),
+            *tensor.shape[2:],
+        )
+        return tensor.gather(1, gather_idx)
+
+    @staticmethod
+    def flattenIntentAnchors(tensor):
+        if tensor is None:
+            return None
+        return tensor.reshape(tensor.size(0), -1, *tensor.shape[3:])
+
+    def buildTopIntentCandidates(
+        self,
+        top_intent_idx,
+        joint_mode_tokens,
+        joint_anchor_vel_norm,
+        joint_anchor_prior_logits,
+        joint_q_anchor=None,
+    ):
+        selected_mode_tokens = self.gatherTopIntents(joint_mode_tokens, top_intent_idx)
+        selected_anchor_vel_norm = self.gatherTopIntents(joint_anchor_vel_norm, top_intent_idx)
+        selected_anchor_prior_logits = self.gatherTopIntents(joint_anchor_prior_logits, top_intent_idx)
+        selected_q_anchor = self.gatherTopIntents(joint_q_anchor, top_intent_idx) if joint_q_anchor is not None else None
+
+        local_anchor_idx = torch.arange(
+            self.num_anchor_per_joint,
+            device=top_intent_idx.device,
+        ).view(1, 1, self.num_anchor_per_joint)
+        global_mode_idx = top_intent_idx.unsqueeze(-1) * self.num_anchor_per_joint + local_anchor_idx
+
+        return {
+            "top_intent_idx": top_intent_idx,
+            "selected_mode_tokens": selected_mode_tokens,
+            "selected_anchor_vel_norm": selected_anchor_vel_norm,
+            "selected_anchor_prior_logits": selected_anchor_prior_logits,
+            "selected_q_anchor": selected_q_anchor,
+            "selected_mode_idx": global_mode_idx,
+            "flat_mode_tokens": self.flattenIntentAnchors(selected_mode_tokens),
+            "flat_anchor_vel_norm": self.flattenIntentAnchors(selected_anchor_vel_norm),
+            "flat_anchor_prior_logits": self.flattenIntentAnchors(selected_anchor_prior_logits),
+            "flat_q_anchor": self.flattenIntentAnchors(selected_q_anchor),
+            "flat_mode_idx": self.flattenIntentAnchors(global_mode_idx),
+        }
+
+    def getIntentScores(self, prior):
+        return torch.logsumexp(prior["joint_anchor_prior_logits"], dim=-1)
 
     def getAllModePredictions(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, select_topk=None):
         bsz = future.size(0)
@@ -116,7 +175,8 @@ class DiffusionFut(nn.Module):
         all_preds = future.clone().unsqueeze(1).repeat(1, mode_logits.size(1), 1, 1)
         all_preds[..., :2] = denoise_outputs["pred_pos_phys"]
         ade_per_mode, fde_per_mode = compute_per_mode_distance(denoise_outputs["pred_pos_phys"], future_phys, valid_mask)
-        best_mode_pos = torch.argmin(ade_per_mode, dim=1)
+        dist_per_mode = ade_per_mode + self.lambda_fde_route * fde_per_mode
+        best_mode_pos = torch.argmin(dist_per_mode, dim=1)
         best_mode_idx = mode_indices.gather(1, best_mode_pos.unsqueeze(1)).squeeze(1)
 
         return {
@@ -125,57 +185,87 @@ class DiffusionFut(nn.Module):
             "all_pred_phys": all_preds,
             "ade_per_mode": ade_per_mode,
             "fde_per_mode": fde_per_mode,
+            "dist_per_mode": dist_per_mode,
             "mode_indices": mode_indices,
             "best_mode_pos": best_mode_pos,
             "best_mode_idx": best_mode_idx,
             "mode_nll": F.cross_entropy(mode_logits, best_mode_pos).detach(),
         }
 
-    # ── 训练 / 评估 主流程 ───────────────────────────────────────────────────
-
-    def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device,
-                     return_components=False, lat_targets=None, lon_targets=None, joint_targets=None):
+    def forwardTrain(
+        self,
+        hist,
+        hist_nbrs,
+        mask,
+        temporal_mask,
+        future,
+        op_mask,
+        device,
+        return_components=False,
+        lat_targets=None,
+        lon_targets=None,
+        joint_targets=None,
+    ):
+        bsz = hist.size(0)
         valid_mask = to_valid_mask(op_mask, device)
         anchor_phys, future_phys, target_vel_norm = self.motion_codec.buildTargetVelNorm(hist, future, device)
         ctx = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
         prior = self.mode_prior(ctx["global_token"])
-        intent_parts = self.loss_helper.buildIntentLosses(prior, lat_targets, lon_targets, joint_targets)
+        intent_parts = self.loss_helper.buildSemanticLosses(prior, lat_targets, lon_targets, joint_targets)
 
         all_anchor_vel_norm = self.motion_codec.flattenStructuredModes(prior["anchor_vel_norm"])
         _, all_anchor_pos_phys = self.motion_codec.decodeAnchorToPosition(all_anchor_vel_norm, anchor_phys)
         global_metrics = self.loss_helper.computeGlobalMetrics(
-            prior["mode_log_probs"].view(hist.size(0), self.num_modes),
+            prior["mode_log_probs"].view(bsz, self.num_modes),
             all_anchor_pos_phys,
             future_phys,
             valid_mask,
         )
 
-        group_anchor_vel_norm = self.motion_codec.selectJointGroup(prior["joint_anchor_vel_norm"], intent_parts["joint_idx"])
-        group_mode_tokens = self.motion_codec.selectJointGroup(prior["joint_mode_tokens"], intent_parts["joint_idx"])
-        group_submode_logits = self.motion_codec.selectJointGroup(prior["joint_submode_logits"], intent_parts["joint_idx"])
-        _, group_anchor_pos_phys = self.motion_codec.decodeAnchorToPosition(group_anchor_vel_norm, anchor_phys)
+        joint_mode_tokens = prior["joint_mode_tokens"]
+        joint_anchor_vel_norm = prior["joint_anchor_vel_norm"]
+        joint_anchor_prior_logits = prior["joint_anchor_prior_logits"]
+        _, joint_anchor_pos_phys = self.motion_codec.decodeAnchorToPosition(joint_anchor_vel_norm, anchor_phys)
 
-        anchor_parts = self.loss_helper.computeAnchorGroupLosses(
-            group_submode_logits,
-            group_anchor_pos_phys,
+        anchor_parts = self.loss_helper.computeGlobalAnchorLosses(
+            joint_anchor_prior_logits,
+            joint_anchor_pos_phys,
             future_phys,
             valid_mask,
         )
-        ref_parts = self.loss_helper.computeGroupRefinementLosses(
+        q_anchor_joint = anchor_parts["q_anchor"].view(bsz, self.num_joint_classes, self.num_anchor_per_joint)
+        top_intent_idx = torch.topk(anchor_parts["q_intent"], k=self.topk_intents, dim=1).indices
+        selected = self.buildTopIntentCandidates(
+            top_intent_idx=top_intent_idx,
+            joint_mode_tokens=joint_mode_tokens,
+            joint_anchor_vel_norm=joint_anchor_vel_norm,
+            joint_anchor_prior_logits=joint_anchor_prior_logits,
+            joint_q_anchor=q_anchor_joint,
+        )
+
+        ref_parts = self.loss_helper.computeTopKRefinementLosses(
             ctx=ctx,
-            group_mode_tokens=group_mode_tokens,
-            group_anchor_vel_norm=group_anchor_vel_norm,
+            selected_mode_tokens=selected["flat_mode_tokens"],
+            selected_anchor_vel_norm=selected["flat_anchor_vel_norm"],
+            selected_anchor_prior_logits=selected["flat_anchor_prior_logits"],
+            selected_q_anchor=selected["flat_q_anchor"],
             anchor_phys=anchor_phys,
             future_phys=future_phys,
             target_vel_norm=target_vel_norm,
             valid_mask=valid_mask,
-            assign_probs=anchor_parts["assign_probs"],
             device=device,
             refiner=self.refiner,
             motion_codec=self.motion_codec,
+            route_beta=self.route_beta,
         )
 
         loss = self.loss_helper.combineTrainingLosses(intent_parts, anchor_parts, ref_parts)
+        best_intent_acc = (
+            torch.argmax(self.getIntentScores(prior), dim=1) == anchor_parts["best_intent_idx"]
+        ).float().mean().detach()
+        intent_topk_hit = (
+            top_intent_idx == anchor_parts["best_intent_idx"].unsqueeze(1)
+        ).any(dim=1).float().mean().detach()
 
         if return_components:
             return loss, {
@@ -183,11 +273,11 @@ class DiffusionFut(nn.Module):
                 "losses": {
                     "intent_lat": intent_parts["loss_intent_lat"].detach(),
                     "intent_lon": intent_parts["loss_intent_lon"].detach(),
-                    "intent_joint": intent_parts["loss_intent_joint"].detach(),
                     "mode": anchor_parts["loss_mode"].detach(),
                     "anchor": anchor_parts["loss_anchor"].detach(),
                     "div": anchor_parts["loss_div"].detach(),
                     "eps": ref_parts["loss_eps"].detach(),
+                    "score": ref_parts["loss_score"].detach(),
                     "rank": ref_parts["loss_rank"].detach(),
                     "x0": ref_parts["loss_x0"].detach(),
                     "end": ref_parts["loss_end"].detach(),
@@ -198,9 +288,10 @@ class DiffusionFut(nn.Module):
                     "coarse_minade": global_metrics["minade_m"],
                     "coarse_minfde": global_metrics["minfde_m"],
                     "coarse_mode_nll": global_metrics["mode_nll"],
-                    "submode_hit": ref_parts["submode_hit"],
-                    "submode_gap": ref_parts["submode_gap"],
-                    "final_pair_dist": ref_parts["final_pair_dist"],
+                    "intent_topk_hit": intent_topk_hit,
+                    "best_intent_acc": best_intent_acc,
+                    "route_hit": ref_parts["route_hit"],
+                    "route_gap": ref_parts["route_gap"],
                     "lat_acc": (torch.argmax(intent_parts["lat_probs"], dim=1) == intent_parts["lat_idx"]).float().mean().detach(),
                     "lon_acc": (torch.argmax(intent_parts["lon_probs"], dim=1) == intent_parts["lon_idx"]).float().mean().detach(),
                     "joint_acc": (torch.argmax(intent_parts["joint_probs"], dim=1) == intent_parts["joint_idx"]).float().mean().detach(),
@@ -209,56 +300,87 @@ class DiffusionFut(nn.Module):
         return loss
 
     @torch.no_grad()
-    def forwardEval(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device,
-                    return_aux=False, lat_targets=None, lon_targets=None, joint_targets=None):
+    def forwardEval(
+        self,
+        hist,
+        hist_nbrs,
+        mask,
+        temporal_mask,
+        future,
+        op_mask,
+        device,
+        return_aux=False,
+        lat_targets=None,
+        lon_targets=None,
+        joint_targets=None,
+    ):
+        bsz = hist.size(0)
         valid_mask = to_valid_mask(op_mask, device)
         anchor_phys, future_phys, _ = self.motion_codec.buildTargetVelNorm(hist, future, device)
         ctx = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
         prior = self.mode_prior(ctx["global_token"])
-        intent_parts = self.loss_helper.buildIntentLosses(prior, lat_targets, lon_targets, joint_targets)
+        intent_parts = self.loss_helper.buildSemanticLosses(prior, lat_targets, lon_targets, joint_targets)
 
-        pred_joint_idx = torch.argmax(prior["joint_probs"], dim=1)
-        all_anchor_vel_norm = self.motion_codec.flattenStructuredModes(prior["anchor_vel_norm"])
-        _, all_anchor_pos_phys = self.motion_codec.decodeAnchorToPosition(all_anchor_vel_norm, anchor_phys)
-        pred_group_tokens = self.motion_codec.selectJointGroup(prior["joint_mode_tokens"], pred_joint_idx)
-        pred_group_anchors = self.motion_codec.selectJointGroup(prior["joint_anchor_vel_norm"], pred_joint_idx)
-        pred_group_out = self.runDiffusionForModes(ctx, pred_group_tokens, pred_group_anchors, anchor_phys, device)
-        pred_group_preds = future.clone().unsqueeze(1).repeat(1, self.num_submodes, 1, 1)
+        joint_mode_tokens = prior["joint_mode_tokens"]
+        joint_anchor_vel_norm = prior["joint_anchor_vel_norm"]
+        joint_anchor_prior_logits = prior["joint_anchor_prior_logits"]
+        intent_scores = self.getIntentScores(prior)
+        top_intent_idx = torch.topk(intent_scores, k=self.topk_intents, dim=1).indices
+        selected = self.buildTopIntentCandidates(
+            top_intent_idx=top_intent_idx,
+            joint_mode_tokens=joint_mode_tokens,
+            joint_anchor_vel_norm=joint_anchor_vel_norm,
+            joint_anchor_prior_logits=joint_anchor_prior_logits,
+        )
+
+        pred_group_out = self.runDiffusionForModes(
+            ctx,
+            selected["flat_mode_tokens"],
+            selected["flat_anchor_vel_norm"],
+            anchor_phys,
+            device,
+        )
+        pred_group_preds = future.clone().unsqueeze(1).repeat(1, self.topk_refine, 1, 1)
         pred_group_preds[..., :2] = pred_group_out["pred_pos_phys"]
         pred_group_ade, pred_group_fde = compute_per_mode_distance(pred_group_out["pred_pos_phys"], future_phys, valid_mask)
-        routed_sub_idx = torch.argmax(pred_group_out["score_logits"], dim=1)
-        best_pred_sub_idx = torch.argmin(pred_group_ade + 0.5 * pred_group_fde, dim=1)
-        selected_mode_idx = pred_joint_idx * self.num_submodes + routed_sub_idx
-        top1_pred = gather_by_index(pred_group_preds, routed_sub_idx)
+        final_dist = pred_group_ade + self.lambda_fde_route * pred_group_fde
+        route_logits = selected["flat_anchor_prior_logits"] + self.route_beta * pred_group_out["score_logits"]
+        routed_idx = torch.argmax(route_logits, dim=1)
+        best_pred_idx = torch.argmin(final_dist, dim=1)
+        selected_mode_idx = selected["flat_mode_idx"].gather(1, routed_idx.unsqueeze(1)).squeeze(1)
+        top1_pred = gather_by_index(pred_group_preds, routed_idx)
         top1_ade, top1_fde = compute_ade_fde(top1_pred, future, valid_mask)
-        submode_hit = (routed_sub_idx == best_pred_sub_idx).float().mean().detach()
-        if self.num_submodes > 1:
-            submode_gap = torch.abs(
-                (pred_group_ade + 0.5 * pred_group_fde)[:, 0] - (pred_group_ade + 0.5 * pred_group_fde)[:, 1]
-            ).mean().detach()
-            final_pair_dist = torch.norm(
-                pred_group_out["pred_pos_phys"][:, 0, :, :self.output_dim]
-                - pred_group_out["pred_pos_phys"][:, 1, :, :self.output_dim],
-                dim=-1,
-            )
-            final_pair_dist = (
-                (final_pair_dist * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1e-6)
-            ).mean().detach()
-        else:
-            submode_gap = top1_ade.new_tensor(0.0)
-            final_pair_dist = top1_ade.new_tensor(0.0)
+
+        _, joint_anchor_pos_phys = self.motion_codec.decodeAnchorToPosition(joint_anchor_vel_norm, anchor_phys)
+        anchor_parts = self.loss_helper.computeGlobalAnchorLosses(
+            joint_anchor_prior_logits,
+            joint_anchor_pos_phys,
+            future_phys,
+            valid_mask,
+        )
+        best_intent_acc = (
+            torch.argmax(intent_scores, dim=1) == anchor_parts["best_intent_idx"]
+        ).float().mean().detach()
+        intent_topk_hit = (
+            top_intent_idx == anchor_parts["best_intent_idx"].unsqueeze(1)
+        ).any(dim=1).float().mean().detach()
+        route_hit = (routed_idx == best_pred_idx).float().mean().detach()
+        route_gap = (
+            final_dist.gather(1, routed_idx.unsqueeze(1)).squeeze(1) - final_dist.min(dim=1).values
+        ).mean().detach()
 
         aux = {
             "predictions": {
-                "group": pred_group_preds,
+                "candidates": pred_group_preds,
                 "top1": top1_pred,
             },
             "metrics": {
                 "top1_ade": top1_ade.detach(),
                 "top1_fde": top1_fde.detach(),
-                "submode_hit": submode_hit,
-                "submode_gap": submode_gap,
-                "final_pair_dist": final_pair_dist,
+                "intent_topk_hit": intent_topk_hit,
+                "best_intent_acc": best_intent_acc,
+                "route_hit": route_hit,
+                "route_gap": route_gap,
                 "lat_acc": (torch.argmax(prior["lat_probs"], dim=1) == intent_parts["lat_idx"]).float().mean().detach(),
                 "lon_acc": (torch.argmax(prior["lon_probs"], dim=1) == intent_parts["lon_idx"]).float().mean().detach(),
                 "joint_acc": (torch.argmax(prior["joint_probs"], dim=1) == intent_parts["joint_idx"]).float().mean().detach(),
@@ -268,22 +390,38 @@ class DiffusionFut(nn.Module):
                 "lat_probs": prior["lat_probs"],
                 "lon_probs": prior["lon_probs"],
                 "joint_probs": prior["joint_probs"],
+                "intent_scores": intent_scores,
+                "top_intent_idx": top_intent_idx,
                 "selected_mode_idx": selected_mode_idx,
-                "pred_joint_idx": pred_joint_idx,
-                "gt_joint_idx": intent_parts["joint_idx"],
-                "routed_sub_idx": routed_sub_idx,
-                "best_pred_joint_sub_idx": best_pred_sub_idx,
+                "selected_global_mode_idx": selected["flat_mode_idx"],
+                "best_intent_idx": anchor_parts["best_intent_idx"],
+                "routed_idx": routed_idx,
+                "best_pred_idx": best_pred_idx,
                 "score_logits": pred_group_out["score_logits"],
-                "group_ade": pred_group_ade,
-                "group_fde": pred_group_fde,
+                "route_logits": route_logits,
+                "candidate_ade": pred_group_ade,
+                "candidate_fde": pred_group_fde,
+                "candidate_dist": final_dist,
             },
         }
         if return_aux:
             return top1_pred, aux
         return top1_pred
 
-    def forward(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device,
-                return_components=False, lat_targets=None, lon_targets=None, joint_targets=None):
+    def forward(
+        self,
+        hist,
+        hist_nbrs,
+        mask,
+        temporal_mask,
+        future,
+        op_mask,
+        device,
+        return_components=False,
+        lat_targets=None,
+        lon_targets=None,
+        joint_targets=None,
+    ):
         return self.forwardTrain(
             hist,
             hist_nbrs,

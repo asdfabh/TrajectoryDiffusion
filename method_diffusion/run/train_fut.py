@@ -20,9 +20,12 @@ FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
 
 LOSS_STAT_KEYS = [
     "loss",
-    "loss_intent_joint",
+    "loss_intent_lat",
+    "loss_intent_lon",
+    "loss_mode",
     "loss_anchor",
     "loss_eps",
+    "loss_score",
     "loss_rank",
 ]
 
@@ -32,6 +35,10 @@ VAL_METRIC_KEYS = [
     "lat_acc",
     "lon_acc",
     "joint_acc",
+    "intent_topk_hit",
+    "best_intent_acc",
+    "route_hit",
+    "route_gap",
 ]
 
 
@@ -39,9 +46,12 @@ def flatten_train_parts(parts):
     losses = parts["losses"]
     return {
         "loss": float(parts["loss_total"].item()),
-        "loss_intent_joint": float(losses["intent_joint"].item()),
+        "loss_intent_lat": float(losses["intent_lat"].item()),
+        "loss_intent_lon": float(losses["intent_lon"].item()),
+        "loss_mode": float(losses["mode"].item()),
         "loss_anchor": float(losses["anchor"].item()),
         "loss_eps": float(losses["eps"].item()),
+        "loss_score": float(losses["score"].item()),
         "loss_rank": float(losses["rank"].item()),
     }
 
@@ -54,6 +64,10 @@ def flatten_eval_aux(aux):
         "lat_acc": float(metrics["lat_acc"].item()),
         "lon_acc": float(metrics["lon_acc"].item()),
         "joint_acc": float(metrics["joint_acc"].item()),
+        "intent_topk_hit": float(metrics["intent_topk_hit"].item()),
+        "best_intent_acc": float(metrics["best_intent_acc"].item()),
+        "route_hit": float(metrics["route_hit"].item()),
+        "route_gap": float(metrics["route_gap"].item()),
     }
 
 
@@ -107,20 +121,30 @@ def write_csv_log(csv_path, epoch, train_stats, val_stats, eval_metrics, score_e
     row = {
         "epoch": epoch,
         "train_loss": train_stats["loss"],
-        "train_loss_intent_joint": train_stats["loss_intent_joint"],
+        "train_loss_intent_lat": train_stats["loss_intent_lat"],
+        "train_loss_intent_lon": train_stats["loss_intent_lon"],
+        "train_loss_mode": train_stats["loss_mode"],
         "train_loss_anchor": train_stats["loss_anchor"],
         "train_loss_eps": train_stats["loss_eps"],
+        "train_loss_score": train_stats["loss_score"],
         "train_loss_rank": train_stats["loss_rank"],
         "val_loss": val_stats["loss"],
-        "val_loss_intent_joint": val_stats["loss_intent_joint"],
+        "val_loss_intent_lat": val_stats["loss_intent_lat"],
+        "val_loss_intent_lon": val_stats["loss_intent_lon"],
+        "val_loss_mode": val_stats["loss_mode"],
         "val_loss_anchor": val_stats["loss_anchor"],
         "val_loss_eps": val_stats["loss_eps"],
+        "val_loss_score": val_stats["loss_score"],
         "val_loss_rank": val_stats["loss_rank"],
         "val_top1_ade_ft": eval_metrics["top1_ade"],
         "val_top1_fde_ft": eval_metrics["top1_fde"],
         "val_lat_acc": eval_metrics["lat_acc"],
         "val_lon_acc": eval_metrics["lon_acc"],
         "val_joint_acc": eval_metrics["joint_acc"],
+        "val_intent_topk_hit": eval_metrics["intent_topk_hit"],
+        "val_best_intent_acc": eval_metrics["best_intent_acc"],
+        "val_route_hit": eval_metrics["route_hit"],
+        "val_route_gap": eval_metrics["route_gap"],
         "score_exec": score_exec,
         "lr": lr,
     }
@@ -133,20 +157,30 @@ def init_csv_log(csv_path):
     fieldnames = [
         "epoch",
         "train_loss",
-        "train_loss_intent_joint",
+        "train_loss_intent_lat",
+        "train_loss_intent_lon",
+        "train_loss_mode",
         "train_loss_anchor",
         "train_loss_eps",
+        "train_loss_score",
         "train_loss_rank",
         "val_loss",
-        "val_loss_intent_joint",
+        "val_loss_intent_lat",
+        "val_loss_intent_lon",
+        "val_loss_mode",
         "val_loss_anchor",
         "val_loss_eps",
+        "val_loss_score",
         "val_loss_rank",
         "val_top1_ade_ft",
         "val_top1_fde_ft",
         "val_lat_acc",
         "val_lon_acc",
         "val_joint_acc",
+        "val_intent_topk_hit",
+        "val_best_intent_acc",
+        "val_route_hit",
+        "val_route_gap",
         "score_exec",
         "lr",
     ]
@@ -172,6 +206,10 @@ def write_tensorboard_log(writer, epoch, train_stats, val_stats, eval_metrics, s
     writer.add_scalar("Eval/lat_acc", eval_metrics["lat_acc"], epoch)
     writer.add_scalar("Eval/lon_acc", eval_metrics["lon_acc"], epoch)
     writer.add_scalar("Eval/joint_acc", eval_metrics["joint_acc"], epoch)
+    writer.add_scalar("Eval/intent_topk_hit", eval_metrics["intent_topk_hit"], epoch)
+    writer.add_scalar("Eval/best_intent_acc", eval_metrics["best_intent_acc"], epoch)
+    writer.add_scalar("Eval/route_hit", eval_metrics["route_hit"], epoch)
+    writer.add_scalar("Eval/route_gap", eval_metrics["route_gap"], epoch)
     writer.add_scalar("Eval/score_exec", score_exec, epoch)
     writer.add_scalar("LR", lr, epoch)
 
@@ -180,12 +218,14 @@ def print_eval_summary(epoch, total_epochs, train_stats, val_stats, eval_metrics
     print(
         f"Epoch {epoch}/{total_epochs} | "
         f"train={train_stats['loss']:.6f} | "
-        f"intent={train_stats['loss_intent_joint']:.6f} | "
+        f"lat={train_stats['loss_intent_lat']:.6f} | "
+        f"lon={train_stats['loss_intent_lon']:.6f} | "
         f"eps={train_stats['loss_eps']:.6f} | "
         f"val={val_stats['loss']:.6f} | "
         f"top1_ade={eval_metrics['top1_ade']:.4f}ft | "
         f"top1_fde={eval_metrics['top1_fde']:.4f}ft | "
-        f"joint_acc={eval_metrics['joint_acc']:.4f} | "
+        f"intent_topk={eval_metrics['intent_topk_hit']:.4f} | "
+        f"route_hit={eval_metrics['route_hit']:.4f} | "
         f"score={score_exec:.4f}"
     )
 
@@ -265,9 +305,11 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
             {
                 "loss": f"{flat_loss_parts['loss']:.6f}",
                 "avg": f"{(totals['loss'] / num_batches):.6f}",
-                "intent": f"{(totals['loss_intent_joint'] / num_batches):.6f}",
+                "lat": f"{(totals['loss_intent_lat'] / num_batches):.6f}",
+                "lon": f"{(totals['loss_intent_lon'] / num_batches):.6f}",
                 "eps": f"{(totals['loss_eps'] / num_batches):.6f}",
                 "anchor": f"{(totals['loss_anchor'] / num_batches):.6f}",
+                "score": f"{(totals['loss_score'] / num_batches):.6f}",
             }
         )
 
@@ -330,7 +372,8 @@ def evaluate(model, dataloader, device, epoch, feature_dim):
             {
                 "val": f"{(totals['loss'] / num_batches):.6f}",
                 "top1_ade": f"{(metric_totals['top1_ade'] / num_batches):.4f}",
-                "joint_acc": f"{(metric_totals['joint_acc'] / num_batches):.4f}",
+                "intent_topk": f"{(metric_totals['intent_topk_hit'] / num_batches):.4f}",
+                "route_hit": f"{(metric_totals['route_hit'] / num_batches):.4f}",
             }
         )
 

@@ -144,8 +144,10 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
                     "loss": f"{loss.item():.6f}",
                     "avg_loss": f"{(totals['loss'] / num_batches):.6f}",
                     "eps": f"{(totals['loss_eps'] / num_batches):.6f}",
-                    "joint": f"{(totals['loss_intent_joint'] / num_batches):.6f}",
+                    "lat": f"{(totals['loss_intent_lat'] / num_batches):.6f}",
+                    "lon": f"{(totals['loss_intent_lon'] / num_batches):.6f}",
                     "anchor": f"{(totals['loss_anchor'] / num_batches):.6f}",
+                    "score": f"{(totals['loss_score'] / num_batches):.6f}",
                 }
             )
 
@@ -227,7 +229,8 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
                 {
                     "val_loss": f"{(totals['loss'] / num_batches):.6f}",
                     "top1_ade": f"{(metric_totals['top1_ade'] / num_batches):.4f}",
-                    "joint_acc": f"{(metric_totals['joint_acc'] / num_batches):.4f}",
+                    "intent_topk": f"{(metric_totals['intent_topk_hit'] / num_batches):.4f}",
+                    "route_hit": f"{(metric_totals['route_hit'] / num_batches):.4f}",
                 }
             )
 

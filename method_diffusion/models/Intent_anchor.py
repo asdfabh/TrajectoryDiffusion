@@ -26,27 +26,27 @@ class AnchorDecoder(nn.Module):
 
 
 class IntentConditionedModePrior(nn.Module):
-    # 输入 global_token[B,D] → 输出横纵向/联合意图概率与结构化 anchor
-    def __init__(self, hidden_dim, mode_dim, num_lat_classes, num_lon_classes, num_submodes, future_steps, output_dim):
+    # 输入 global_token[B,D] → 输出横纵向语义、隐式联合意图与结构化 anchor
+    def __init__(self, hidden_dim, mode_dim, num_lat_classes, num_lon_classes, num_anchor_per_joint, future_steps, output_dim):
         super().__init__()
         self.num_lat_classes = int(num_lat_classes)
         self.num_lon_classes = int(num_lon_classes)
-        self.num_submodes = int(num_submodes)
+        self.num_anchor_per_joint = int(num_anchor_per_joint)
+        self.num_submodes = self.num_anchor_per_joint
         self.num_joint_classes = self.num_lat_classes * self.num_lon_classes
-        self.num_modes = self.num_joint_classes * self.num_submodes
+        self.num_modes = self.num_joint_classes * self.num_anchor_per_joint
         self.mode_dim = int(mode_dim)
 
         self.global_proj = nn.Linear(hidden_dim, mode_dim)
         self.lat_head = nn.Linear(hidden_dim, self.num_lat_classes)
         self.lon_head = nn.Linear(hidden_dim, self.num_lon_classes)
-        self.joint_head = nn.Linear(hidden_dim, self.num_joint_classes)
 
         self.lat_queries = nn.Parameter(torch.randn(self.num_lat_classes, self.mode_dim) * 0.02)
         self.lon_queries = nn.Parameter(torch.randn(self.num_lon_classes, self.mode_dim) * 0.02)
-        self.submode_queries = nn.Parameter(torch.randn(self.num_submodes, self.mode_dim) * 0.02)
+        self.anchor_queries = nn.Parameter(torch.randn(self.num_anchor_per_joint, self.mode_dim) * 0.02)
 
         self.mode_norm = nn.LayerNorm(self.mode_dim)
-        self.submode_logit_head = nn.Linear(self.mode_dim, 1)
+        self.anchor_style_logit_head = nn.Linear(self.mode_dim, 1)
         self.anchor_decoder = AnchorDecoder(self.mode_dim, hidden_dim, future_steps, output_dim)
 
     def forward(self, global_token):
@@ -56,45 +56,63 @@ class IntentConditionedModePrior(nn.Module):
             base_ctx
             + self.lat_queries.view(1, self.num_lat_classes, 1, 1, self.mode_dim)
             + self.lon_queries.view(1, 1, self.num_lon_classes, 1, self.mode_dim)
-            + self.submode_queries.view(1, 1, 1, self.num_submodes, self.mode_dim)
+            + self.anchor_queries.view(1, 1, 1, self.num_anchor_per_joint, self.mode_dim)
         )
         mode_tokens = self.mode_norm(mode_seed)
-        submode_logits = self.submode_logit_head(mode_tokens).squeeze(-1)
-        submode_log_probs = F.log_softmax(submode_logits, dim=-1)
+        anchor_style_logits = self.anchor_style_logit_head(mode_tokens).squeeze(-1)
 
         lat_logits = self.lat_head(global_token)
         lon_logits = self.lon_head(global_token)
-        joint_logits = self.joint_head(global_token)
+        joint_logits = (
+            lat_logits.unsqueeze(-1) + lon_logits.unsqueeze(-2)
+        ).reshape(bsz, self.num_joint_classes)
         joint_log_probs = F.log_softmax(joint_logits, dim=-1).view(
             bsz,
             self.num_lat_classes,
             self.num_lon_classes,
             1,
         )
-        mode_log_probs = joint_log_probs + submode_log_probs
+        anchor_prior_logits = joint_logits.view(
+            bsz,
+            self.num_lat_classes,
+            self.num_lon_classes,
+            1,
+        ) + anchor_style_logits
+        mode_log_probs = F.log_softmax(anchor_prior_logits.view(bsz, self.num_modes), dim=-1)
 
         anchor_vel_norm = torch.clamp(self.anchor_decoder(mode_tokens), -5.0, 5.0)
+        joint_mode_tokens = mode_tokens.view(bsz, self.num_joint_classes, self.num_anchor_per_joint, self.mode_dim)
+        joint_anchor_vel_norm = anchor_vel_norm.view(
+            bsz,
+            self.num_joint_classes,
+            self.num_anchor_per_joint,
+            anchor_vel_norm.size(-2),
+            anchor_vel_norm.size(-1),
+        )
+        joint_anchor_style_logits = anchor_style_logits.view(bsz, self.num_joint_classes, self.num_anchor_per_joint)
+        joint_anchor_prior_logits = anchor_prior_logits.view(bsz, self.num_joint_classes, self.num_anchor_per_joint)
+        joint_probs = torch.softmax(joint_logits, dim=-1)
         return {
             "lat_logits": lat_logits,
             "lon_logits": lon_logits,
             "joint_logits": joint_logits,
             "lat_probs": torch.softmax(lat_logits, dim=-1),
             "lon_probs": torch.softmax(lon_logits, dim=-1),
-            "joint_probs": torch.softmax(joint_logits, dim=-1),
-            "submode_logits": submode_logits,
+            "joint_probs": joint_probs,
+            "intent_logits": joint_logits,
+            "intent_probs": joint_probs,
+            "anchor_style_logits": anchor_style_logits,
             "mode_log_probs": mode_log_probs,
-            "mode_probs": torch.softmax(mode_log_probs.view(bsz, self.num_modes), dim=-1),
+            "mode_probs": torch.softmax(mode_log_probs, dim=-1),
             "mode_tokens": mode_tokens,
-            "joint_mode_tokens": mode_tokens.view(bsz, self.num_joint_classes, self.num_submodes, self.mode_dim),
+            "joint_mode_tokens": joint_mode_tokens,
             "anchor_vel_norm": anchor_vel_norm,
-            "joint_anchor_vel_norm": anchor_vel_norm.view(
-                bsz,
-                self.num_joint_classes,
-                self.num_submodes,
-                anchor_vel_norm.size(-2),
-                anchor_vel_norm.size(-1),
-            ),
-            "joint_submode_logits": submode_logits.view(bsz, self.num_joint_classes, self.num_submodes),
+            "joint_anchor_vel_norm": joint_anchor_vel_norm,
+            "joint_anchor_style_logits": joint_anchor_style_logits,
+            "joint_anchor_prior_logits": joint_anchor_prior_logits,
+            # 兼容旧命名，避免下游脚本在过渡期直接断掉。
+            "submode_logits": anchor_style_logits,
+            "joint_submode_logits": joint_anchor_style_logits,
         }
 
 
