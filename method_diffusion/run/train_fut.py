@@ -21,44 +21,49 @@ LOSS_STAT_KEYS = [
     "loss",
     "loss_intent_lat",
     "loss_intent_lon",
+    "loss_intent_joint",
     "loss_mode",
     "loss_anchor",
     "loss_div",
     "loss_eps",
+    "loss_rank",
     "loss_x0",
     "loss_end",
 ]
 VAL_METRIC_KEYS = [
     "top1_ade",
     "top1_fde",
-    "minade_m",
-    "minfde_m",
-    "mode_nll",
+    "best_pred_ade",
+    "best_pred_fde",
+    "rank_nll",
+    "lat_acc",
+    "lon_acc",
+    "joint_acc",
 ]
 
 
-def compute_selection_score(minade_m, minfde_m, mode_nll=0.0):
-    return float(minade_m) + 0.5 * float(minfde_m) + 0.1 * float(mode_nll)
+def compute_selection_score(best_pred_ade, best_pred_fde, rank_nll=0.0):
+    return float(best_pred_ade) + 0.5 * float(best_pred_fde) + 0.1 * float(rank_nll)
 
 
 def compute_exec_selection_score(top1_ade, top1_fde):
     return float(top1_ade) + 0.5 * float(top1_fde)
 
 
-def compute_joint_selection_score(top1_ade, top1_fde, minade_m, minfde_m, mode_nll=0.0):
-    return 0.5 * compute_exec_selection_score(top1_ade, top1_fde) + 0.5 * compute_selection_score(minade_m, minfde_m, mode_nll)
+def compute_joint_selection_score(top1_ade, top1_fde, best_pred_ade, best_pred_fde, rank_nll=0.0):
+    return 0.5 * compute_exec_selection_score(top1_ade, top1_fde) + 0.5 * compute_selection_score(best_pred_ade, best_pred_fde, rank_nll)
 
 
 def build_selection_scores(eval_metrics):
     return {
-        "multi": compute_selection_score(eval_metrics["minade_m"], eval_metrics["minfde_m"], eval_metrics["mode_nll"]),
+        "multi": compute_selection_score(eval_metrics["best_pred_ade"], eval_metrics["best_pred_fde"], eval_metrics["rank_nll"]),
         "exec": compute_exec_selection_score(eval_metrics["top1_ade"], eval_metrics["top1_fde"]),
         "joint": compute_joint_selection_score(
             eval_metrics["top1_ade"],
             eval_metrics["top1_fde"],
-            eval_metrics["minade_m"],
-            eval_metrics["minfde_m"],
-            eval_metrics["mode_nll"],
+            eval_metrics["best_pred_ade"],
+            eval_metrics["best_pred_fde"],
+            eval_metrics["rank_nll"],
         ),
     }
 
@@ -113,26 +118,33 @@ def write_csv_log(csv_path, epoch, train_stats, val_stats, eval_metrics, selecti
         "train_loss": train_stats["loss"],
         "train_loss_intent_lat": train_stats["loss_intent_lat"],
         "train_loss_intent_lon": train_stats["loss_intent_lon"],
+        "train_loss_intent_joint": train_stats["loss_intent_joint"],
         "train_loss_mode": train_stats["loss_mode"],
         "train_loss_anchor": train_stats["loss_anchor"],
         "train_loss_div": train_stats["loss_div"],
         "train_loss_eps": train_stats["loss_eps"],
+        "train_loss_rank": train_stats["loss_rank"],
         "train_loss_x0": train_stats["loss_x0"],
         "train_loss_end": train_stats["loss_end"],
         "val_loss": val_stats["loss"],
         "val_loss_intent_lat": val_stats["loss_intent_lat"],
         "val_loss_intent_lon": val_stats["loss_intent_lon"],
+        "val_loss_intent_joint": val_stats["loss_intent_joint"],
         "val_loss_mode": val_stats["loss_mode"],
         "val_loss_anchor": val_stats["loss_anchor"],
         "val_loss_div": val_stats["loss_div"],
         "val_loss_eps": val_stats["loss_eps"],
+        "val_loss_rank": val_stats["loss_rank"],
         "val_loss_x0": val_stats["loss_x0"],
         "val_loss_end": val_stats["loss_end"],
         "val_top1_ade_ft": eval_metrics["top1_ade"],
         "val_top1_fde_ft": eval_metrics["top1_fde"],
-        "val_minade_m_ft": eval_metrics["minade_m"],
-        "val_minfde_m_ft": eval_metrics["minfde_m"],
-        "val_mode_nll": eval_metrics["mode_nll"],
+        "val_best_pred_ade_ft": eval_metrics["best_pred_ade"],
+        "val_best_pred_fde_ft": eval_metrics["best_pred_fde"],
+        "val_rank_nll": eval_metrics["rank_nll"],
+        "val_lat_acc": eval_metrics["lat_acc"],
+        "val_lon_acc": eval_metrics["lon_acc"],
+        "val_joint_acc": eval_metrics["joint_acc"],
         "score_multi": selection_scores["multi"],
         "score_exec": selection_scores["exec"],
         "score_joint": selection_scores["joint"],
@@ -149,26 +161,33 @@ def init_csv_log(csv_path):
         "train_loss",
         "train_loss_intent_lat",
         "train_loss_intent_lon",
+        "train_loss_intent_joint",
         "train_loss_mode",
         "train_loss_anchor",
         "train_loss_div",
         "train_loss_eps",
+        "train_loss_rank",
         "train_loss_x0",
         "train_loss_end",
         "val_loss",
         "val_loss_intent_lat",
         "val_loss_intent_lon",
+        "val_loss_intent_joint",
         "val_loss_mode",
         "val_loss_anchor",
         "val_loss_div",
         "val_loss_eps",
+        "val_loss_rank",
         "val_loss_x0",
         "val_loss_end",
         "val_top1_ade_ft",
         "val_top1_fde_ft",
-        "val_minade_m_ft",
-        "val_minfde_m_ft",
-        "val_mode_nll",
+        "val_best_pred_ade_ft",
+        "val_best_pred_fde_ft",
+        "val_rank_nll",
+        "val_lat_acc",
+        "val_lon_acc",
+        "val_joint_acc",
         "score_multi",
         "score_exec",
         "score_joint",
@@ -193,9 +212,12 @@ def write_tensorboard_log(writer, epoch, train_stats, val_stats, eval_metrics, s
         writer.add_scalar(f"LossVal/{key}", val_stats[key], epoch)
     writer.add_scalar("Eval/top1_ADE_ft", eval_metrics["top1_ade"], epoch)
     writer.add_scalar("Eval/top1_FDE_ft", eval_metrics["top1_fde"], epoch)
-    writer.add_scalar("Eval/minADE_M_ft", eval_metrics["minade_m"], epoch)
-    writer.add_scalar("Eval/minFDE_M_ft", eval_metrics["minfde_m"], epoch)
-    writer.add_scalar("Eval/mode_nll", eval_metrics["mode_nll"], epoch)
+    writer.add_scalar("Eval/bestPredIntent_ADE_ft", eval_metrics["best_pred_ade"], epoch)
+    writer.add_scalar("Eval/bestPredIntent_FDE_ft", eval_metrics["best_pred_fde"], epoch)
+    writer.add_scalar("Eval/rank_nll", eval_metrics["rank_nll"], epoch)
+    writer.add_scalar("Eval/lat_acc", eval_metrics["lat_acc"], epoch)
+    writer.add_scalar("Eval/lon_acc", eval_metrics["lon_acc"], epoch)
+    writer.add_scalar("Eval/joint_acc", eval_metrics["joint_acc"], epoch)
     writer.add_scalar("Eval/score_multi", selection_scores["multi"], epoch)
     writer.add_scalar("Eval/score_exec", selection_scores["exec"], epoch)
     writer.add_scalar("Eval/score_joint", selection_scores["joint"], epoch)
@@ -211,9 +233,9 @@ def print_eval_summary(epoch, total_epochs, train_stats, val_stats, eval_metrics
         f"val_eps={val_stats['loss_eps']:.6f} | "
         f"top1_ade={eval_metrics['top1_ade']:.4f}ft | "
         f"top1_fde={eval_metrics['top1_fde']:.4f}ft | "
-        f"minade@M={eval_metrics['minade_m']:.4f}ft | "
-        f"minfde@M={eval_metrics['minfde_m']:.4f}ft | "
-        f"mode_nll={eval_metrics['mode_nll']:.4f} | "
+        f"best_pred_ade={eval_metrics['best_pred_ade']:.4f}ft | "
+        f"best_pred_fde={eval_metrics['best_pred_fde']:.4f}ft | "
+        f"joint_acc={eval_metrics['joint_acc']:.4f} | "
         f"score={selection_scores['multi']:.4f}"
     )
 
@@ -298,6 +320,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
                 "eps": f"{(totals['loss_eps'] / num_batches):.6f}",
                 "lat": f"{(totals['loss_intent_lat'] / num_batches):.6f}",
                 "lon": f"{(totals['loss_intent_lon'] / num_batches):.6f}",
+                "joint": f"{(totals['loss_intent_joint'] / num_batches):.6f}",
                 "mode": f"{(totals['loss_mode'] / num_batches):.6f}",
             }
         )
@@ -345,6 +368,9 @@ def evaluate(model, dataloader, device, epoch, feature_dim):
             op_mask,
             device,
             return_aux=True,
+            lat_targets=lat_enc,
+            lon_targets=lon_enc,
+            compute_oracle_all=False,
         )
 
         totals["loss"] += float(val_loss.item())
@@ -354,17 +380,20 @@ def evaluate(model, dataloader, device, epoch, feature_dim):
             totals[key] += float(val_parts[key].item())
         metric_totals["top1_ade"] += float(eval_aux["top1_ade"].item())
         metric_totals["top1_fde"] += float(eval_aux["top1_fde"].item())
-        metric_totals["minade_m"] += float(eval_aux["minade_m"].item())
-        metric_totals["minfde_m"] += float(eval_aux["minfde_m"].item())
-        metric_totals["mode_nll"] += float(eval_aux["mode_nll"].item())
+        metric_totals["best_pred_ade"] += float(eval_aux["best_pred_ade"].item())
+        metric_totals["best_pred_fde"] += float(eval_aux["best_pred_fde"].item())
+        metric_totals["rank_nll"] += float(eval_aux["rank_nll"].item())
+        metric_totals["lat_acc"] += float(eval_aux["lat_acc"].item())
+        metric_totals["lon_acc"] += float(eval_aux["lon_acc"].item())
+        metric_totals["joint_acc"] += float(eval_aux["joint_acc"].item())
         num_batches += 1
 
         pbar.set_postfix(
             {
                 "val_loss": f"{(totals['loss'] / num_batches):.6f}",
                 "top1_ade": f"{(metric_totals['top1_ade'] / num_batches):.4f}",
-                "minade@M": f"{(metric_totals['minade_m'] / num_batches):.4f}",
-                "mode_nll": f"{(metric_totals['mode_nll'] / num_batches):.4f}",
+                "best@pred": f"{(metric_totals['best_pred_ade'] / num_batches):.4f}",
+                "joint_acc": f"{(metric_totals['joint_acc'] / num_batches):.4f}",
             }
         )
 

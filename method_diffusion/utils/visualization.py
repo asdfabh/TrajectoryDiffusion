@@ -61,6 +61,28 @@ def _format_prob_list(prob_values):
     return "[" + ", ".join(f"{float(v):.2f}" for v in prob_arr) + "]"
 
 
+def _format_joint_label(joint_idx, num_lon_classes=3):
+    if joint_idx is None:
+        return "-"
+    joint_val = int(joint_idx)
+    lat_idx = joint_val // int(num_lon_classes)
+    lon_idx = joint_val % int(num_lon_classes)
+    return f"J{joint_val + 1}(lat_{lat_idx + 1}+lon_{lon_idx + 1})"
+
+
+def _format_optional_index(name, value, one_based=False):
+    arr = _to_numpy(value)
+    if arr is None:
+        return None
+    arr = np.asarray(arr).reshape(-1)
+    if arr.size == 0:
+        return None
+    idx_val = int(arr[0])
+    if one_based:
+        idx_val += 1
+    return f"{name}={idx_val}"
+
+
 def plot_traj_with_mask(hist_original, hist_masked, hist_pred, fig_num1=3, fig_num2=3, input_unit="ft"):
     """绘制 hist 重建结果：原始轨迹、掩码位置、预测轨迹。"""
     num_samples = len(hist_original)
@@ -138,9 +160,9 @@ def maybe_visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_t
 
 
 def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, future=None, pred=None,
-                                 pred_all=None, pred_best_idx=None,
+                                 pred_all=None, pred_best_idx=None, pred_selected_idx=None,
                                  anchor_all=None,
-                                 future_mask=None, pred_instant=None, intent_probs=None,
+                                 future_mask=None, pred_instant=None, intent_probs=None, intent_meta=None,
                                  batch_idx=0, metrics=None, input_unit="ft"):
     """绘制 future 预测结果，支持单模态与多模态最佳轨迹高亮。"""
 
@@ -255,6 +277,12 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
     pred_instant_vis = normalize_traj2d(safe_get_batch(pred_instant, idx, batch_ndim=3))
     intent_lat = safe_get_batch(None if intent_probs is None else intent_probs.get("lat"), idx, batch_ndim=2)
     intent_lon = safe_get_batch(None if intent_probs is None else intent_probs.get("lon"), idx, batch_ndim=2)
+    intent_joint = safe_get_batch(None if intent_probs is None else intent_probs.get("joint"), idx, batch_ndim=2)
+    pred_joint_idx = safe_get_batch(None if intent_meta is None else intent_meta.get("pred_joint_idx"), idx, batch_ndim=1)
+    gt_joint_idx = safe_get_batch(None if intent_meta is None else intent_meta.get("gt_joint_idx"), idx, batch_ndim=1)
+    oracle_joint_idx = safe_get_batch(None if intent_meta is None else intent_meta.get("oracle_joint_idx"), idx, batch_ndim=1)
+    routed_sub_idx = safe_get_batch(None if intent_meta is None else intent_meta.get("routed_sub_idx"), idx, batch_ndim=1)
+    best_sub_idx = safe_get_batch(None if intent_meta is None else intent_meta.get("best_sub_idx"), idx, batch_ndim=1)
 
     if pred_modes is not None:
         pred_modes = np.asarray(pred_modes)
@@ -270,6 +298,7 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
         if anchor_modes.ndim != 3 or anchor_modes.shape[-1] < 2:
             anchor_modes = None
 
+    selected_k = resolve_best_idx(pred_selected_idx, idx, 0 if pred_modes is None else pred_modes.shape[0])
     best_k = resolve_best_idx(pred_best_idx, idx, 0 if pred_modes is None else pred_modes.shape[0])
     if best_k is None and pred_modes is not None:
         best_k = select_best_by_ade(pred_modes, gt_fut, fut_mask_arr)
@@ -320,24 +349,57 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
             traj = normalize_traj2d(pred_modes[k])
             if traj is None:
                 continue
-            is_best = (best_k is not None and k == best_k)
+            is_selected = (selected_k is not None and k == selected_k)
+            is_global_best = (best_k is not None and k == best_k)
             label = None
-            if is_best:
-                label = 'Pred Best'
+            color = '#5DADE2'
+            alpha = 0.65
+            linewidth = 1.4
+            marker = '+'
+            markersize = 6
+            markeredgewidth = 1.2
+            zorder = 2
+            if is_selected and is_global_best:
+                label = 'Selected = Global Best'
+                color = '#D4AF37'
+                alpha = 0.98
+                linewidth = 2.2
+                marker = 'o'
+                markersize = 4
+                markeredgewidth = 1.0
+                zorder = 4
+            elif is_selected:
+                label = 'Selected'
+                color = '#FF0000'
+                alpha = 0.95
+                linewidth = 2.0
+                marker = 'o'
+                markersize = 4
+                markeredgewidth = 1.0
+                zorder = 4
+            elif is_global_best:
+                label = 'Global Best'
+                color = '#F39C12'
+                alpha = 0.95
+                linewidth = 2.0
+                marker = 'o'
+                markersize = 4
+                markeredgewidth = 1.0
+                zorder = 4
             elif not non_best_labeled:
                 label = 'Pred Modes'
                 non_best_labeled = True
             ax.plot(
                 traj[:, 1], traj[:, 0],
                 linestyle='-',
-                marker='o' if is_best else '+',
-                markersize=4 if is_best else 6,
-                markeredgewidth=1.2 if not is_best else 1.0,
-                linewidth=1.4 if not is_best else 2.0,
-                alpha=0.65 if not is_best else 0.95,
-                color='#FF0000' if is_best else '#5DADE2',
+                marker=marker,
+                markersize=markersize,
+                markeredgewidth=markeredgewidth,
+                linewidth=linewidth,
+                alpha=alpha,
+                color=color,
                 label=label,
-                zorder=3 if is_best else 2
+                zorder=zorder,
             )
     elif pred_best is not None:
         ax.plot(pred_best[:, 1], pred_best[:, 0], 'r-o', label='Pred', markersize=4, linewidth=2, alpha=0.9)
@@ -372,11 +434,30 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
             zorder=4,
         )
 
-    if intent_lat is not None or intent_lon is not None:
+    if intent_lat is not None or intent_lon is not None or intent_joint is not None:
+        text_lines = []
+        if intent_lat is not None:
+            text_lines.append(f"lat={_format_prob_list(intent_lat)}")
+        if intent_lon is not None:
+            text_lines.append(f"lon={_format_prob_list(intent_lon)}")
+        if intent_joint is not None:
+            text_lines.append(f"joint={_format_prob_list(intent_joint)}")
+        if pred_joint_idx is not None:
+            text_lines.append(f"pred_joint={_format_joint_label(pred_joint_idx)}")
+        if oracle_joint_idx is not None:
+            text_lines.append(f"oracle_joint={_format_joint_label(oracle_joint_idx)}")
+        if gt_joint_idx is not None:
+            text_lines.append(f"gt_joint={_format_joint_label(gt_joint_idx)}")
+        routed_sub_text = _format_optional_index("pred_sub", routed_sub_idx, one_based=True)
+        best_sub_text = _format_optional_index("best_sub", best_sub_idx, one_based=True)
+        if routed_sub_text is not None:
+            text_lines.append(routed_sub_text)
+        if best_sub_text is not None:
+            text_lines.append(best_sub_text)
         ax.text(
             0.02,
             0.98,
-            f"lat={_format_prob_list(intent_lat)}\nlon={_format_prob_list(intent_lon)}",
+            "\n".join(text_lines),
             transform=ax.transAxes,
             ha='left',
             va='top',
@@ -408,8 +489,8 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
 
 def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pred, valid_mask, stage,
                                       enable_train_vis=False, enable_eval_vis=False,
-                                      pred_all=None, pred_best_idx=None, anchor_all=None,
-                                      pred_instant=None, intent_probs=None,
+                                      pred_all=None, pred_best_idx=None, pred_selected_idx=None, anchor_all=None,
+                                      pred_instant=None, intent_probs=None, intent_meta=None,
                                       meter_per_foot=0.3048, batch_idx=0):
     """按配置开关控制 future 预测可视化。"""
     if stage == "train":
@@ -455,10 +536,12 @@ def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pr
         pred=pred,
         pred_all=pred_all,
         pred_best_idx=pred_best_idx,
+        pred_selected_idx=pred_selected_idx,
         anchor_all=anchor_all,
         future_mask=valid_mask,
         pred_instant=pred_instant,
         intent_probs=intent_probs,
+        intent_meta=intent_meta,
         batch_idx=batch_idx,
         metrics=metrics,
         input_unit="ft",

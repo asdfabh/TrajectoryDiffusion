@@ -18,7 +18,7 @@ def get_args_parser():
     parser.add_argument("--random_mask_ratio", default=0.5, type=float)
     parser.add_argument("--block_mask_start", default=1, type=int)
     parser.add_argument("--checkpoint_dir", default="./checkpoints", type=str)
-    parser.add_argument("--resume_fut", default="none", type=str)
+    parser.add_argument("--resume_fut", default="best", type=str)
     parser.add_argument("--resume_hist", default="best", type=str)
 
     # Joint train strategy
@@ -71,9 +71,11 @@ def get_args_parser():
     parser.add_argument("--num_submodes", default=2, type=int)
     parser.add_argument("--mode_dim", default=128, type=int)
     parser.add_argument("--lambda_intent", default=1.0, type=float)
+    parser.add_argument("--lambda_joint", default=1.0, type=float)
     parser.add_argument("--lambda_mode", default=0.5, type=float)
     parser.add_argument("--lambda_anchor", default=1.0, type=float)
     parser.add_argument("--lambda_div", default=0.05, type=float)
+    parser.add_argument("--lambda_rank", default=0.5, type=float)
     parser.add_argument("--lambda_x0", default=0.1, type=float)
     parser.add_argument("--lambda_end", default=0.1, type=float)
     parser.add_argument("--save_best_metric", default="multi", type=str, choices=["multi", "exec", "joint"])
@@ -81,9 +83,11 @@ def get_args_parser():
     parser.add_argument("--intent_label_smoothing", default=0.05, type=float)
     parser.add_argument("--submode_temperature", default=1.0, type=float)
     parser.add_argument("--anchor_div_margin", default=2.0, type=float)
+    parser.add_argument("--rank_temperature", default=1.0, type=float)
+    parser.add_argument("--submode_floor_weight", default=0.2, type=float)
 
     # Fut train/inference
-    parser.add_argument("--num_inference_steps", default=15, type=int)
+    parser.add_argument("--num_inference_steps", default=5, type=int)
     parser.add_argument("--ddim_eta", default=0.0, type=float)
     parser.add_argument("--x0_clip", default=5.0, type=float)
 

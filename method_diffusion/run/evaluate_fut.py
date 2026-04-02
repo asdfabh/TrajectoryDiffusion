@@ -25,6 +25,8 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     cclass = batch["cclass"]
     fut = batch["fut"]
     op_mask = batch["op_mask"]
+    lat_enc = batch["lat_enc"]
+    lon_enc = batch["lon_enc"]
     hist_nbrs = batch["nbrs"]
     va_nbrs = batch["nbrs_va"]
     lane_nbrs = batch["nbrs_lane"]
@@ -47,9 +49,11 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
 
     fut = fut.to(device)
     op_mask = op_mask.to(device)
+    lat_enc = lat_enc.to(device)
+    lon_enc = lon_enc.to(device)
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
-    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
+    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc
 
 
 def resolve_checkpoint_path(resume_arg, checkpoint_dir):
@@ -77,35 +81,45 @@ def load_checkpoint(model, resume_arg, checkpoint_dir, device):
     return model
 
 
-def print_metric_block(title, top1_metrics, multi_metrics, mode_nll):
+def print_metric_block(title, top1_metrics, multi_metrics, mode_nll, lat_acc=0.0, lon_acc=0.0, joint_acc=0.0):
+    line_width = 140
     print("\n" + "=" * 30 + f" {title} " + "=" * 30)
-    print(
-        f"Top1 ADE/FDE (m): {top1_metrics['overall_ade_m']:.6f} / {top1_metrics['overall_fde_m']:.6f} | "
-        f"minADE@M/minFDE@M (m): {multi_metrics['overall_ade_m']:.6f} / {multi_metrics['overall_fde_m']:.6f} | "
-        f"modeNLL: {mode_nll:.6f}"
-    )
-    print("-" * 90)
+    print(f"modeNLL: {mode_nll:.6f} | latAcc: {lat_acc:.4f} | lonAcc: {lon_acc:.4f} | jointAcc: {joint_acc:.4f}")
+    print("-" * line_width)
     time_pairs = [("1s", 4), ("2s", 9), ("3s", 14), ("4s", 19), ("5s", 24)]
-    print(f"{'Horizon':<8} | {'Top1 ADE(m)':<14} | {'Top1 FDE(m)':<14} | {'minADE@M(m)':<14} | {'minFDE@M(m)':<14}")
-    print("-" * 90)
+    print(
+        f"{'Horizon':<8} | {'Top1 ADE(m)':<13} | {'Top1 FDE(m)':<13} | {'Top1 RMSE(m)':<14} | "
+        f"{'min ADE(m)':<13} | {'min FDE(m)':<13} | {'min RMSE(m)':<14}"
+    )
+    print("-" * line_width)
     for label, idx in time_pairs:
-        if idx >= len(top1_metrics["ade_prefix_m"]):
+        if idx >= len(top1_metrics["rmse_per_step_m"]):
             continue
         print(
             f"{label:<8} | "
-            f"{top1_metrics['ade_prefix_m'][idx].item():<14.6f} | "
-            f"{top1_metrics['de_per_step_m'][idx].item():<14.6f} | "
-            f"{multi_metrics['ade_prefix_m'][idx].item():<14.6f} | "
-            f"{multi_metrics['de_per_step_m'][idx].item():<14.6f}"
+            f"{top1_metrics['ade_prefix_m'][idx].item():<13.6f} | "
+            f"{top1_metrics['de_per_step_m'][idx].item():<13.6f} | "
+            f"{top1_metrics['rmse_per_step_m'][idx].item():<14.6f} | "
+            f"{multi_metrics['ade_prefix_m'][idx].item():<13.6f} | "
+            f"{multi_metrics['de_per_step_m'][idx].item():<13.6f} | "
+            f"{multi_metrics['rmse_per_step_m'][idx].item():<14.6f}"
         )
-    print("=" * 90)
+    print("=" * line_width)
 
 
 def print_metrics(metrics, title, metric_name="Future"):
     mode_nll = float(metrics.get("mode_nll", 0.0)) if isinstance(metrics, dict) else 0.0
     top1_metrics = metrics.get("top1", metrics) if isinstance(metrics, dict) else metrics
     multi_metrics = metrics.get("multi", metrics) if isinstance(metrics, dict) else metrics
-    print_metric_block(title, top1_metrics, multi_metrics, mode_nll)
+    print_metric_block(
+        title,
+        top1_metrics,
+        multi_metrics,
+        mode_nll,
+        float(metrics.get("lat_acc", 0.0)),
+        float(metrics.get("lon_acc", 0.0)),
+        float(metrics.get("joint_acc", 0.0)),
+    )
 
 
 def build_test_loader(args):
@@ -142,15 +156,20 @@ def evaluate(model, dataloader, device, feature_dim):
     top1_metrics = TrajectoryMetrics(model.T)
     multi_metrics = TrajectoryMetrics(model.T)
     total_mode_nll = 0.0
+    total_lat_correct = 0.0
+    total_lon_correct = 0.0
+    total_joint_correct = 0.0
+    total_samples = 0.0
     num_batches = 0
 
     pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc="Fut explicit modes", ncols=140)
     for batch_idx, batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc = prepare_input_data(
             batch,
             feature_dim,
             device=device,
         )
+        joint_idx = (torch.argmax(lat_enc, dim=1) * lon_enc.size(1) + torch.argmax(lon_enc, dim=1)).long()
 
         _, _, aux = model.forwardEvalMulti(
             hist,
@@ -161,21 +180,36 @@ def evaluate(model, dataloader, device, feature_dim):
             op_mask,
             device,
             return_aux=True,
+            lat_targets=lat_enc,
+            lon_targets=lon_enc,
+            compute_oracle_all=True,
         )
 
         top1_metrics.update(aux["top1_pred"], fut, op_mask)
         multi_metrics.update(aux["best_pred"], fut, op_mask)
         total_mode_nll += float(aux["mode_nll"].item())
+        total_lat_correct += float((torch.argmax(aux["lat_probs"], dim=1) == torch.argmax(lat_enc, dim=1)).sum().item())
+        total_lon_correct += float((torch.argmax(aux["lon_probs"], dim=1) == torch.argmax(lon_enc, dim=1)).sum().item())
+        total_joint_correct += float((torch.argmax(aux["joint_probs"], dim=1) == joint_idx).sum().item())
+        total_samples += float(lat_enc.size(0))
         num_batches += 1
 
         top1_summary = top1_metrics.summary()
         multi_summary = multi_metrics.summary()
+        avg_lat_acc = total_lat_correct / max(total_samples, 1.0)
+        avg_lon_acc = total_lon_correct / max(total_samples, 1.0)
+        avg_joint_acc = total_joint_correct / max(total_samples, 1.0)
         pbar.set_postfix(
             {
                 "top1_ade_m": f"{top1_summary['overall_ade_m']:.4f}",
                 "top1_fde_m": f"{top1_summary['overall_fde_m']:.4f}",
+                "top1_rmse_m": f"{top1_summary['overall_rmse_m']:.4f}",
                 "minade_m": f"{multi_summary['overall_ade_m']:.4f}",
                 "minfde_m": f"{multi_summary['overall_fde_m']:.4f}",
+                "gap_m": f"{(top1_summary['overall_ade_m'] - multi_summary['overall_ade_m']):.4f}",
+                "lat_acc": f"{avg_lat_acc:.4f}",
+                "lon_acc": f"{avg_lon_acc:.4f}",
+                "joint_acc": f"{avg_joint_acc:.4f}",
                 "mode_nll": f"{(total_mode_nll / num_batches):.4f}",
             }
         )
@@ -186,16 +220,25 @@ def evaluate(model, dataloader, device, feature_dim):
                 top1_summary,
                 multi_summary,
                 total_mode_nll / max(num_batches, 1),
+                avg_lat_acc,
+                avg_lon_acc,
+                avg_joint_acc,
             )
 
     top1_summary = top1_metrics.summary()
     multi_summary = multi_metrics.summary()
     avg_mode_nll = total_mode_nll / max(num_batches, 1)
-    print_metric_block("Final Test Result - Future", top1_summary, multi_summary, avg_mode_nll)
+    avg_lat_acc = total_lat_correct / max(total_samples, 1.0)
+    avg_lon_acc = total_lon_correct / max(total_samples, 1.0)
+    avg_joint_acc = total_joint_correct / max(total_samples, 1.0)
+    print_metric_block("Final Test Result - Future", top1_summary, multi_summary, avg_mode_nll, avg_lat_acc, avg_lon_acc, avg_joint_acc)
     return {
         "top1": top1_summary,
         "multi": multi_summary,
         "mode_nll": avg_mode_nll,
+        "lat_acc": avg_lat_acc,
+        "lon_acc": avg_lon_acc,
+        "joint_acc": avg_joint_acc,
     }
 
 

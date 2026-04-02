@@ -142,6 +142,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
                     "eps": f"{(totals['loss_eps'] / num_batches):.6f}",
                     "lat": f"{(totals['loss_intent_lat'] / num_batches):.6f}",
                     "lon": f"{(totals['loss_intent_lon'] / num_batches):.6f}",
+                    "joint": f"{(totals['loss_intent_joint'] / num_batches):.6f}",
                     "mode": f"{(totals['loss_mode'] / num_batches):.6f}",
                 }
             )
@@ -204,6 +205,9 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
             op_mask,
             device,
             return_aux=True,
+            lat_targets=lat_enc,
+            lon_targets=lon_enc,
+            compute_oracle_all=False,
         )
 
         totals["loss"] += float(val_loss.item())
@@ -213,9 +217,12 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
             totals[key] += float(val_parts[key].item())
         metric_totals["top1_ade"] += float(eval_aux["top1_ade"].item())
         metric_totals["top1_fde"] += float(eval_aux["top1_fde"].item())
-        metric_totals["minade_m"] += float(eval_aux["minade_m"].item())
-        metric_totals["minfde_m"] += float(eval_aux["minfde_m"].item())
-        metric_totals["mode_nll"] += float(eval_aux["mode_nll"].item())
+        metric_totals["best_pred_ade"] += float(eval_aux["best_pred_ade"].item())
+        metric_totals["best_pred_fde"] += float(eval_aux["best_pred_fde"].item())
+        metric_totals["rank_nll"] += float(eval_aux["rank_nll"].item())
+        metric_totals["lat_acc"] += float(eval_aux["lat_acc"].item())
+        metric_totals["lon_acc"] += float(eval_aux["lon_acc"].item())
+        metric_totals["joint_acc"] += float(eval_aux["joint_acc"].item())
         num_batches += 1
 
         if is_main_process(rank):
@@ -223,8 +230,8 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
                 {
                     "val_loss": f"{(totals['loss'] / num_batches):.6f}",
                     "top1_ade": f"{(metric_totals['top1_ade'] / num_batches):.4f}",
-                    "minade@M": f"{(metric_totals['minade_m'] / num_batches):.4f}",
-                    "mode_nll": f"{(metric_totals['mode_nll'] / num_batches):.4f}",
+                    "best@pred": f"{(metric_totals['best_pred_ade'] / num_batches):.4f}",
+                    "joint_acc": f"{(metric_totals['joint_acc'] / num_batches):.4f}",
                 }
             )
 
