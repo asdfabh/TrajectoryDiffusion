@@ -71,7 +71,11 @@ def get_args_parser():
     parser.add_argument("--x0_clip", default=5.0, type=float)
 
     # Fut visualization
+    parser.add_argument("--fut_enable_eval_vis", default=0, type=int)
     parser.add_argument("--hist_enable_train_vis", default=0, type=int)
     parser.add_argument("--hist_enable_eval_vis", default=0, type=int)
+
+    # Eval
+    parser.add_argument("--num_samples", default=5, type=int)
 
     return parser

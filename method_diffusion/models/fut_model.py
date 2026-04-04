@@ -85,21 +85,39 @@ class DiffusionFut(nn.Module):
         context, _ = self.hist_encoder(hist_norm, hist_nbrs_norm, mask, temporal_mask)
         return context
 
-    def computeLoss(self, pred_x0, target_x0, valid_mask, return_parts=False):
-        loss_x0 = F.mse_loss(pred_x0, target_x0, reduction="none")
+    def computeLoss(self, pred_vel_norm, target_vel_norm, future_phys, anchor_phys, valid_mask, return_parts=False):
+        # Velocity loss (speed loss)
+        loss_vel = F.l1_loss(pred_vel_norm, target_vel_norm, reduction="none")
+
+        # Position loss - convert normalized velocity to physical coordinates and compute position loss
+        std_vel = self.vel_std.view(1, 1, 2).to(pred_vel_norm.device)
+        mean_vel = self.vel_mean.view(1, 1, 2).to(pred_vel_norm.device)
+        pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
+        pred_pos_phys = torch.cumsum(pred_vel_phys, dim=1) + anchor_phys[..., :2]
+        loss_pos = F.l1_loss(pred_pos_phys, future_phys[..., :2], reduction="none")
+
+        # Combined loss: velocity + 0.5 * position (fixed weight, not from config)
+        pos_loss_weight = 0.5
+        total_loss = loss_vel + pos_loss_weight * loss_pos
+
         valid = valid_mask.unsqueeze(-1)
-        denom = valid.sum() * target_x0.size(-1) + 1e-6
-        loss_total = (loss_x0 * valid).sum() / denom
+        numer = (total_loss * valid).sum(dim=(1, 2))
+        denom = valid.sum(dim=(1, 2)) + 1e-6
+        total_mean = (numer / denom).mean()
 
         if not return_parts:
-            return loss_total
+            return total_mean
 
+        vel_mean = ((loss_vel * valid).sum(dim=(1, 2)) / denom).mean()
+        pos_mean = ((loss_pos * valid).sum(dim=(1, 2)) / denom).mean()
         parts = {
-            "loss_total": loss_total.detach(),
-            "loss_diffusion": loss_total.detach(),
-            "loss_x0": loss_total.detach(),
+            "loss_total": total_mean.detach(),
+            "loss_diffusion": total_mean.detach(),
+            "loss_x0": total_mean.detach(),
+            "loss_vel": vel_mean.detach(),
+            "loss_pos": pos_mean.detach(),
         }
-        return loss_total, parts
+        return total_mean, parts
 
     # 执行推理阶段的 DDIM 采样并输出最终预测结果（归一化速度 x0）。
     def sampleFromXt(self, x_t, context_tokens, infer_scheduler):
@@ -155,7 +173,7 @@ class DiffusionFut(nn.Module):
         # 网络输出：预测的归一化速度 x0。
         pred_x0 = self.predictX0(x_t, timesteps, context_tokens)
 
-        loss, loss_parts = self.computeLoss(pred_x0, target_vel_norm, valid_mask, return_parts=True)
+        loss, loss_parts = self.computeLoss(pred_x0, target_vel_norm, future_phys, anchor_phys, valid_mask, return_parts=True)
 
         if return_components:
             return loss, loss_parts
@@ -164,14 +182,7 @@ class DiffusionFut(nn.Module):
     @torch.no_grad()
     # 执行单模态推理评估并返回预测轨迹。
     def forwardEval(self, hist, hist_nbrs, mask, temporal_mask, future, device):
-        (
-            bsz,
-            t_len,
-            anchor_phys,
-            future_phys,
-            context_tokens,
-            infer_scheduler,
-        ) = self.prepareEvalInputs(hist, hist_nbrs, mask, temporal_mask, future, device)
+        bsz, t_len, anchor_phys, future_phys, context_tokens, infer_scheduler = self.prepareEvalInputs(hist, hist_nbrs, mask, temporal_mask, future, device)
 
         x_t = torch.randn((bsz, t_len, self.input_dim), device=device)
         pred_vel_norm = self.sampleFromXt(x_t, context_tokens, infer_scheduler)
@@ -189,14 +200,7 @@ class DiffusionFut(nn.Module):
     @torch.no_grad()
     # 执行并行多模态推理评估并返回多模态预测轨迹集合。
     def forwardEvalMulti(self, hist, hist_nbrs, mask, temporal_mask, future, device, K=5):
-        (
-            bsz,
-            t_len,
-            anchor_phys,
-            future_phys,
-            context_tokens,
-            infer_scheduler,
-        ) = self.prepareEvalInputs(hist, hist_nbrs, mask, temporal_mask, future, device)
+        bsz, t_len, anchor_phys, future_phys, context_tokens, infer_scheduler = self.prepareEvalInputs(hist, hist_nbrs, mask, temporal_mask, future, device)
 
         # 核心提速优化：在 Batch 维度上并行展开 K 倍。
         context_tokens_k = context_tokens.repeat_interleave(K, dim=0)

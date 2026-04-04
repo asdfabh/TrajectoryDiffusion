@@ -23,6 +23,8 @@ BEST_MODEL_FDE_WEIGHT = 0.5
 LOSS_STAT_KEYS = [
     "loss",
     "loss_x0",
+    "loss_vel",
+    "loss_pos",
 ]
 
 
@@ -76,8 +78,12 @@ def write_csv_log(csv_path, epoch, train_stats, val_stats, eval_ade, eval_fde, s
         "epoch": epoch,
         "train_loss": train_stats["loss"],
         "train_x0_loss": train_stats["loss_x0"],
+        "train_vel_loss": train_stats["loss_vel"],
+        "train_pos_loss": train_stats["loss_pos"],
         "val_loss": val_stats["loss"],
         "val_x0_loss": val_stats["loss_x0"],
+        "val_vel_loss": val_stats["loss_vel"],
+        "val_pos_loss": val_stats["loss_pos"],
         "val_ade_ft": eval_ade,
         "val_fde_ft": eval_fde,
         "val_ade_m": eval_ade * 0.3048,
@@ -95,8 +101,12 @@ def init_csv_log(csv_path):
         "epoch",
         "train_loss",
         "train_x0_loss",
+        "train_vel_loss",
+        "train_pos_loss",
         "val_loss",
         "val_x0_loss",
+        "val_vel_loss",
+        "val_pos_loss",
         "val_ade_ft",
         "val_fde_ft",
         "val_ade_m",
@@ -118,8 +128,12 @@ def build_zero_loss_stats():
 def write_tensorboard_log(writer, epoch, train_stats, val_stats, eval_ade, eval_fde, selection_score, lr):
     writer.add_scalar("Loss/Train", train_stats["loss"], epoch)
     writer.add_scalar("Loss/TrainX0", train_stats["loss_x0"], epoch)
+    writer.add_scalar("Loss/TrainVel", train_stats["loss_vel"], epoch)
+    writer.add_scalar("Loss/TrainPos", train_stats["loss_pos"], epoch)
     writer.add_scalar("Loss/Val", val_stats["loss"], epoch)
     writer.add_scalar("Loss/ValX0", val_stats["loss_x0"], epoch)
+    writer.add_scalar("Loss/ValVel", val_stats["loss_vel"], epoch)
+    writer.add_scalar("Loss/ValPos", val_stats["loss_pos"], epoch)
     writer.add_scalar("Eval/ADE_ft", eval_ade, epoch)
     writer.add_scalar("Eval/FDE_ft", eval_fde, epoch)
     writer.add_scalar("Eval/SelectionScore_ft", selection_score, epoch)
@@ -132,8 +146,12 @@ def print_eval_summary(epoch, total_epochs, train_stats, val_stats, eval_ade, ev
         f"Epoch {epoch}/{total_epochs} | "
         f"train={train_stats['loss']:.6f} | "
         f"train_x0={train_stats['loss_x0']:.6f} | "
+        f"train_vel={train_stats['loss_vel']:.6f} | "
+        f"train_pos={train_stats['loss_pos']:.6f} | "
         f"val={val_stats['loss']:.6f} | "
         f"val_x0={val_stats['loss_x0']:.6f} | "
+        f"val_vel={val_stats['loss_vel']:.6f} | "
+        f"val_pos={val_stats['loss_pos']:.6f} | "
         f"ade={eval_ade:.4f}ft | "
         f"fde={eval_fde:.4f}ft | "
         f"score={selection_score:.4f}"
@@ -186,21 +204,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
     )
 
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
-            batch,
-            feature_dim,
-            device=device,
-        )
-        loss, loss_parts = model.forwardTrain(
-            hist,
-            hist_nbrs,
-            mask,
-            temporal_mask,
-            fut,
-            op_mask,
-            device,
-            return_components=True,
-        )
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
+        loss, loss_parts = model.forwardTrain(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, return_components=True)
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -216,6 +221,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
             "loss": f"{loss.item():.6f}",
             "avg_loss": f"{(totals['loss'] / num_batches):.6f}",
             "x0": f"{(totals['loss_x0'] / num_batches):.6f}",
+            "vel": f"{(totals['loss_vel'] / num_batches):.6f}",
+            "pos": f"{(totals['loss_pos'] / num_batches):.6f}",
         })
 
     denom = max(num_batches, 1)
@@ -236,29 +243,9 @@ def evaluate(model, dataloader, device, epoch, feature_dim):
 
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Val", dynamic_ncols=True)
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
-            batch,
-            feature_dim,
-            device=device,
-        )
-        val_loss, val_parts = model.forwardTrain(
-            hist,
-            hist_nbrs,
-            mask,
-            temporal_mask,
-            fut,
-            op_mask,
-            device,
-            return_components=True,
-        )
-        pred_fut = model.forwardEval(
-            hist,
-            hist_nbrs,
-            mask,
-            temporal_mask,
-            fut,
-            device,
-        )
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
+        val_loss, val_parts = model.forwardTrain(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, return_components=True)
+        pred_fut = model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, device)
         eval_ade, eval_fde = compute_batch_ade_fde(pred_fut, fut, op_mask)
 
         totals["loss"] += float(val_loss.item())
@@ -272,6 +259,8 @@ def evaluate(model, dataloader, device, epoch, feature_dim):
         pbar.set_postfix({
             "val_loss": f"{(totals['loss'] / num_batches):.6f}",
             "val_x0": f"{(totals['loss_x0'] / num_batches):.6f}",
+            "val_vel": f"{(totals['loss_vel'] / num_batches):.6f}",
+            "val_pos": f"{(totals['loss_pos'] / num_batches):.6f}",
             "avg_ade_ft": f"{(total_ade / num_batches):.4f}",
             "avg_fde_ft": f"{(total_fde / num_batches):.4f}",
         })

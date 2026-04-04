@@ -18,6 +18,8 @@ from method_diffusion.utils.visualization import maybe_visualize_future_predicti
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
 METER_PER_FOOT = 0.3048
+
+
 # 整理 batch 数据并按特征维度拼接评估输入。
 def prepare_input_data(batch, feature_dim, device="cuda"):
     hist = batch["hist"]
@@ -52,6 +54,7 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     temporal_mask = temporal_mask.to(device)
     return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
 
+
 # 解析 fut checkpoint 标识并返回实际文件路径。
 def resolve_checkpoint_path(resume_arg, checkpoint_dir):
     checkpoint_dir = Path(checkpoint_dir)
@@ -65,6 +68,7 @@ def resolve_checkpoint_path(resume_arg, checkpoint_dir):
         return checkpoint_dir / f"{resume_arg}.pth"
     return None
 
+
 # 加载 fut 模型参数并切换到评估模式。
 def load_checkpoint(model, resume_arg, checkpoint_dir, device):
     ckpt_path = resolve_checkpoint_path(resume_arg, checkpoint_dir)
@@ -76,6 +80,7 @@ def load_checkpoint(model, resume_arg, checkpoint_dir, device):
     model.eval()
     print(f"[FutEval] Loaded checkpoint: {ckpt_path}")
     return model
+
 
 # 按 TAME 风格打印阶段性评估摘要。
 def print_metrics(metrics, title):
@@ -104,6 +109,7 @@ def print_metrics(metrics, title):
         )
     print("=" * 75)
 
+
 # 构建 TestSet dataloader。
 def build_test_loader(args):
     dataset_name = str(args.dataset).lower()
@@ -114,14 +120,8 @@ def build_test_loader(args):
         test_path = data_root / "ValSet.mat"
     print(f"[FutEval] Dataset: {dataset_name}")
     print(f"[FutEval] Test path: {test_path}")
-    test_dataset = NgsimDataset(
-        str(test_path),
-        t_h=30,
-        t_f=50,
-        d_s=2,
-        enc_size=args.encoder_input_dim,
-        feature_dim=args.feature_dim,
-    )
+    test_dataset = NgsimDataset(str(test_path), t_h=30, t_f=50, d_s=2, enc_size=args.encoder_input_dim, feature_dim=args.feature_dim)
+
     return DataLoader(
         test_dataset,
         batch_size=args.batch_size,
@@ -133,6 +133,7 @@ def build_test_loader(args):
         drop_last=False,
     )
 
+
 # 执行 TestSet 评估并打印周期性与最终指标。
 @torch.no_grad()
 def evaluate(model, dataloader, device, feature_dim, num_samples, enable_eval_vis):
@@ -143,22 +144,10 @@ def evaluate(model, dataloader, device, feature_dim, num_samples, enable_eval_vi
 
     pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc=eval_name, ncols=120)
     for batch_idx, batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
-            batch,
-            feature_dim,
-            device=device,
-        )
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
 
         if k_samples > 1:
-            all_preds = model.forwardEvalMulti(
-                hist,
-                hist_nbrs,
-                mask,
-                temporal_mask,
-                fut,
-                device,
-                K=k_samples,
-            )
+            all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=k_samples)
             pred_fut, best_idx, _ = select_minade_prediction(all_preds, fut, op_mask)
             if enable_eval_vis:
                 maybe_visualize_future_prediction(
@@ -173,14 +162,7 @@ def evaluate(model, dataloader, device, feature_dim, num_samples, enable_eval_vi
                     meter_per_foot=METER_PER_FOOT,
                 )
         else:
-            pred_fut = model.forwardEval(
-                hist,
-                hist_nbrs,
-                mask,
-                temporal_mask,
-                fut,
-                device,
-            )
+            pred_fut = model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, device)
 
         metrics.update(pred_fut, fut, op_mask)
         summary = metrics.summary()
@@ -211,8 +193,7 @@ def main():
     test_loader = build_test_loader(args)
     model = DiffusionFut(args).to(device)
     load_checkpoint(model, args.resume_fut, args.checkpoint_dir, device)
-    evaluate(model, test_loader, device, args.feature_dim, args.num_samples,
-             enable_eval_vis=int(args.fut_enable_eval_vis) > 0)
+    evaluate(model, test_loader, device, args.feature_dim, args.num_samples, enable_eval_vis=int(args.fut_enable_eval_vis) > 0)
 
 
 if __name__ == "__main__":
