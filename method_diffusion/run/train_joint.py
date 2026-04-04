@@ -2,7 +2,6 @@ import sys
 import os
 import re
 import csv
-import math
 from pathlib import Path
 
 import torch
@@ -16,6 +15,7 @@ from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.models.hist_model import DiffusionPast
+from method_diffusion.utils.fut_utils import compute_batch_ade_fde
 from method_diffusion.utils.mask_util import mixed_mask
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -32,8 +32,6 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
     cclass = batch["cclass"]
     fut = batch["fut"]
     op_mask = batch["op_mask"]
-    lat_enc = batch["lat_enc"]
-    lon_enc = batch["lon_enc"]
     hist_nbrs = batch["nbrs"]
     va_nbrs = batch["nbrs_va"]
     lane_nbrs = batch["nbrs_lane"]
@@ -56,11 +54,9 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
 
     fut = fut.to(device)
     op_mask = op_mask.to(device)
-    lat_enc = lat_enc.to(device)
-    lon_enc = lon_enc.to(device)
     mask = mask.to(device)
     temporal_mask = temporal_mask.to(device)
-    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc
+    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
 
 
 def build_hist_masked(hist, mask_ratio, random_mask_ratio, block_mask_start):
@@ -175,7 +171,7 @@ def init_csv_log(csv_path):
         "train_hist_loss",
         "train_hist_loss_weighted",
         "train_fut_loss",
-        "train_fut_eps_loss",
+        "train_fut_x0_loss",
         "val_ade_ft",
         "val_fde_ft",
         "val_ade_m",
@@ -195,7 +191,7 @@ def write_csv_log(csv_path, epoch, train_stats, eval_ade, eval_fde, lr_fut, lr_h
         "train_hist_loss": train_stats["loss_hist"],
         "train_hist_loss_weighted": train_stats["loss_hist_weighted"],
         "train_fut_loss": train_stats["loss_fut"],
-        "train_fut_eps_loss": train_stats["loss_eps"],
+        "train_fut_x0_loss": train_stats["loss_x0"],
         "val_ade_ft": eval_ade,
         "val_fde_ft": eval_fde,
         "val_ade_m": eval_ade * 0.3048,
@@ -259,12 +255,12 @@ def train_epoch(
     total_hist_loss = 0.0
     total_hist_loss_weighted = 0.0
     total_fut_loss = 0.0
-    total_eps_loss = 0.0
+    total_x0_loss = 0.0
     num_batches = 0
 
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Train", ncols=140)
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
             batch,
             feature_dim,
             device=device,
@@ -288,10 +284,7 @@ def train_epoch(
             op_mask,
             device,
             return_components=True,
-            lat_targets=lat_enc,
-            lon_targets=lon_enc,
         )
-        # 多模态评估统一使用 forwardEval(..., return_aux=True)
 
         loss_hist_weighted = hist_loss_weight * loss_hist
         loss = loss_fut + loss_hist_weighted
@@ -309,14 +302,14 @@ def train_epoch(
         total_hist_loss += float(loss_hist.item())
         total_hist_loss_weighted += float(loss_hist_weighted.item())
         total_fut_loss += float(loss_fut.item())
-        total_eps_loss += float(fut_parts["losses"]["eps"].item())
+        total_x0_loss += float(fut_parts["loss_x0"].item())
         num_batches += 1
         pbar.set_postfix({
             "loss": f"{loss.item():.6f}",
             "avg": f"{(total_loss / num_batches):.6f}",
             "hist": f"{(total_hist_loss / num_batches):.6f}",
             "fut": f"{(total_fut_loss / num_batches):.6f}",
-            "eps": f"{(total_eps_loss / num_batches):.6f}",
+            "x0": f"{(total_x0_loss / num_batches):.6f}",
         })
 
     denom = max(num_batches, 1)
@@ -325,16 +318,12 @@ def train_epoch(
         "loss_hist": total_hist_loss / denom,
         "loss_hist_weighted": total_hist_loss_weighted / denom,
         "loss_fut": total_fut_loss / denom,
-        "loss_eps": total_eps_loss / denom,
+        "loss_x0": total_x0_loss / denom,
     }
 
 
 @torch.no_grad()
-def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval_ratio, mask_ratio, random_mask_ratio, block_mask_start):
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-
+def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, mask_ratio, random_mask_ratio, block_mask_start):
     model_fut.eval()
     model_hist.eval()
     total_ade = 0.0
@@ -347,18 +336,9 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval
             model_hist.train()
         return 0.0, 0.0
 
-    total_batches = len(dataloader)
-    if eval_ratio <= 0.0 or eval_ratio >= 1.0:
-        target_batches = total_batches
-    else:
-        target_batches = max(1, int(math.ceil(total_batches * float(eval_ratio))))
-
-    pbar = tqdm(dataloader, total=target_batches, desc=f"Ep{epoch} Val", ncols=120)
+    pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Val", ncols=120)
     for batch in pbar:
-        if num_batches >= target_batches:
-            break
-
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, _, _ = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
             batch,
             feature_dim,
             device=device,
@@ -373,18 +353,15 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval
             freeze_hist=True,
             detach_hist_for_fut=True,
         )
-        _, eval_aux = model_fut.forwardEval(
+        pred_fut = model_fut.forwardEval(
             hist_for_fut,
             hist_nbrs,
             mask,
             temporal_mask,
             fut,
-            op_mask,
             device,
-            return_aux=True,
         )
-        eval_ade = eval_aux["metrics"]["top1_ade"]
-        eval_fde = eval_aux["metrics"]["top1_fde"]
+        eval_ade, eval_fde = compute_batch_ade_fde(pred_fut, fut, op_mask)
 
         total_ade += float(eval_ade.item())
         total_fde += float(eval_fde.item())
@@ -480,7 +457,6 @@ def main():
     optimizer = torch.optim.AdamW(param_groups, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
     start_epoch, best_ade = load_fut_checkpoint(args, model_fut, optimizer, scheduler, device)
-    eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
     mask_ratio = max(0.0, min(1.0, float(args.mask_prob)))
     random_mask_ratio = max(0.0, min(1.0, float(args.random_mask_ratio)))
     block_mask_start = int(args.block_mask_start) > 0
@@ -515,7 +491,6 @@ def main():
             device=device,
             epoch=epoch + 1,
             feature_dim=args.feature_dim,
-            eval_ratio=eval_ratio,
             mask_ratio=mask_ratio,
             random_mask_ratio=random_mask_ratio,
             block_mask_start=block_mask_start,
@@ -526,7 +501,7 @@ def main():
         writer.add_scalar("Loss/TrainHist", train_stats["loss_hist"], epoch + 1)
         writer.add_scalar("Loss/TrainHistWeighted", train_stats["loss_hist_weighted"], epoch + 1)
         writer.add_scalar("Loss/TrainFut", train_stats["loss_fut"], epoch + 1)
-        writer.add_scalar("Loss/TrainEps", train_stats["loss_eps"], epoch + 1)
+        writer.add_scalar("Loss/TrainX0", train_stats["loss_x0"], epoch + 1)
         writer.add_scalar("Eval/ADE_ft", eval_ade, epoch + 1)
         writer.add_scalar("Eval/FDE_ft", eval_fde, epoch + 1)
 

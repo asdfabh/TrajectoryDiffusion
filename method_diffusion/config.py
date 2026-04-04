@@ -10,7 +10,7 @@ def get_args_parser():
 
     # Train runtime
     parser.add_argument("--batch_size", default=512, type=int)
-    parser.add_argument("--num_epochs", default=40, type=int)
+    parser.add_argument("--num_epochs", default=30, type=int)
     parser.add_argument("--num_workers", default=10, type=int)
     parser.add_argument("--learning_rate", default=1e-4, type=float)
     parser.add_argument("--save_interval", default=5, type=int)
@@ -64,17 +64,6 @@ def get_args_parser():
     parser.add_argument("--num_train_timesteps_fut", default=200, type=int)
     parser.add_argument("--time_embedding_size_fut", default=256, type=int)
     parser.add_argument("--T_f", default=25, type=int)
-    parser.add_argument("--num_lat_classes", default=3, type=int)
-    parser.add_argument("--num_lon_classes", default=3, type=int)
-    parser.add_argument("--num_submodes", default=2, type=int)
-    parser.add_argument("--num_anchor_per_joint", default=2, type=int)
-    parser.add_argument("--mode_dim", default=128, type=int)
-    parser.add_argument("--topk_intents", default=3, type=int)
-    parser.add_argument("--lambda_fde_route", default=0.5, type=float)
-    parser.add_argument("--tau_anchor_teacher", default=1.0, type=float)
-    parser.add_argument("--tau_score_teacher", default=1.0, type=float)
-    parser.add_argument("--route_beta", default=1.0, type=float)
-    parser.add_argument("--use_joint_semantic_head", default=0, type=int)
 
     # Fut train/inference
     parser.add_argument("--num_inference_steps", default=5, type=int)
@@ -84,8 +73,5 @@ def get_args_parser():
     # Fut visualization
     parser.add_argument("--hist_enable_train_vis", default=0, type=int)
     parser.add_argument("--hist_enable_eval_vis", default=0, type=int)
-
-    # Eval
-    parser.add_argument("--eval_ratio", default=0.5, type=float)
 
     return parser

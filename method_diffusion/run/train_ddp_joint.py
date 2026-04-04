@@ -27,6 +27,7 @@ from method_diffusion.run.train_joint import (
     prepare_input_data,
     write_csv_log,
 )
+from method_diffusion.utils.fut_utils import compute_batch_ade_fde
 
 
 def setup_ddp():
@@ -121,7 +122,7 @@ def train_epoch(
     total_hist_loss = 0.0
     total_hist_loss_weighted = 0.0
     total_fut_loss = 0.0
-    total_noise_loss = 0.0
+    total_x0_loss = 0.0
     num_batches = 0
 
     pbar = tqdm(
@@ -133,7 +134,7 @@ def train_epoch(
     )
 
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, lat_enc, lon_enc = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
             batch,
             feature_dim,
             device=device,
@@ -157,8 +158,6 @@ def train_epoch(
             op_mask,
             device,
             return_components=True,
-            lat_targets=lat_enc,
-            lon_targets=lon_enc,
         )
 
         loss_hist_weighted = hist_loss_weight * loss_hist
@@ -177,7 +176,7 @@ def train_epoch(
         total_hist_loss += float(loss_hist.item())
         total_hist_loss_weighted += float(loss_hist_weighted.item())
         total_fut_loss += float(loss_fut.item())
-        total_noise_loss += float(fut_parts["losses"]["eps"].item())
+        total_x0_loss += float(fut_parts["loss_x0"].item())
         num_batches += 1
 
         if is_main_process(rank):
@@ -186,7 +185,7 @@ def train_epoch(
                 "avg": f"{(total_loss / num_batches):.6f}",
                 "hist": f"{(total_hist_loss / num_batches):.6f}",
                 "fut": f"{(total_fut_loss / num_batches):.6f}",
-                "noise": f"{(total_noise_loss / num_batches):.6f}",
+                "x0": f"{(total_x0_loss / num_batches):.6f}",
             })
 
     stats = torch.tensor(
@@ -195,7 +194,7 @@ def train_epoch(
             total_hist_loss,
             total_hist_loss_weighted,
             total_fut_loss,
-            total_noise_loss,
+            total_x0_loss,
             float(num_batches),
         ],
         device=device,
@@ -209,16 +208,12 @@ def train_epoch(
         "loss_hist": float(stats[1].item()) / denom,
         "loss_hist_weighted": float(stats[2].item()) / denom,
         "loss_fut": float(stats[3].item()) / denom,
-        "loss_eps": float(stats[4].item()) / denom,
+        "loss_x0": float(stats[4].item()) / denom,
     }
 
 
 @torch.no_grad()
-def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval_ratio, rank, mask_ratio, random_mask_ratio, block_mask_start):
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-
+def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, rank, mask_ratio, random_mask_ratio, block_mask_start):
     was_fut_training = model_fut.training
     was_hist_training = model_hist.training
     fut_model = model_fut.module if hasattr(model_fut, "module") else model_fut
@@ -236,25 +231,16 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval
             model_hist.train()
         return 0.0, 0.0
 
-    total_batches = len(dataloader)
-    if eval_ratio <= 0.0 or eval_ratio >= 1.0:
-        target_batches = total_batches
-    else:
-        target_batches = max(1, int(total_batches * float(eval_ratio) + 0.999999))
-
     pbar = tqdm(
         dataloader,
-        total=target_batches,
+        total=len(dataloader),
         desc=f"Ep{epoch} Val",
         ncols=120,
         disable=not is_main_process(rank),
     )
 
     for batch in pbar:
-        if num_batches >= target_batches:
-            break
-
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask, _, _ = prepare_input_data(
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
             batch,
             feature_dim,
             device=device,
@@ -269,18 +255,15 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, eval
             freeze_hist=True,
             detach_hist_for_fut=True,
         )
-        _, eval_aux = fut_model.forwardEval(
+        pred_fut = fut_model.forwardEval(
             hist_for_fut,
             hist_nbrs,
             mask,
             temporal_mask,
             fut,
-            op_mask,
             device,
-            return_aux=True,
         )
-        eval_ade = eval_aux["metrics"]["top1_ade"]
-        eval_fde = eval_aux["metrics"]["top1_fde"]
+        eval_ade, eval_fde = compute_batch_ade_fde(pred_fut, fut, op_mask)
 
         total_ade += float(eval_ade.item())
         total_fde += float(eval_fde.item())
@@ -392,7 +375,6 @@ def main():
         else:
             model_fut = DDP(model_fut, find_unused_parameters=False)
 
-    eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
     mask_ratio = max(0.0, min(1.0, float(args.mask_prob)))
     random_mask_ratio = max(0.0, min(1.0, float(args.random_mask_ratio)))
     block_mask_start = int(args.block_mask_start) > 0
@@ -432,7 +414,6 @@ def main():
             device=device,
             epoch=epoch + 1,
             feature_dim=args.feature_dim,
-            eval_ratio=eval_ratio,
             rank=rank,
             mask_ratio=mask_ratio,
             random_mask_ratio=random_mask_ratio,
@@ -445,7 +426,7 @@ def main():
             writer.add_scalar("Loss/TrainHist", train_stats["loss_hist"], epoch + 1)
             writer.add_scalar("Loss/TrainHistWeighted", train_stats["loss_hist_weighted"], epoch + 1)
             writer.add_scalar("Loss/TrainFut", train_stats["loss_fut"], epoch + 1)
-            writer.add_scalar("Loss/TrainEps", train_stats["loss_eps"], epoch + 1)
+            writer.add_scalar("Loss/TrainX0", train_stats["loss_x0"], epoch + 1)
             writer.add_scalar("Eval/ADE_ft", eval_ade, epoch + 1)
             writer.add_scalar("Eval/FDE_ft", eval_fde, epoch + 1)
             print(

@@ -77,6 +77,48 @@ def prepare_fut_batch(
     return prepared
 
 
+def normalize_traj_valid_mask(valid_mask, pred):
+    """将不同形状的 future 有效位掩码统一成 `[B, T]` 浮点张量。"""
+    if valid_mask is None:
+        return torch.ones(pred.shape[0], pred.shape[1], device=pred.device, dtype=pred.dtype)
+    if valid_mask.dim() == 3:
+        valid_mask = valid_mask[..., 0]
+    return (valid_mask > 0.5).to(pred.device).float()
+
+
+def compute_batch_ade_fde(pred, target, valid_mask=None):
+    """计算单个 batch 的 ADE / FDE。"""
+    pred_xy = pred[..., :2]
+    target_xy = target[..., :2]
+    valid_mask = normalize_traj_valid_mask(valid_mask, pred_xy)
+
+    diff = pred_xy - target_xy
+    dist = torch.norm(diff, dim=-1)
+    ade = (dist * valid_mask).sum() / (valid_mask.sum() + 1e-6)
+
+    valid_counts = valid_mask.sum(dim=1).long()
+    has_valid = valid_counts > 0
+    last_idx = torch.clamp(valid_counts - 1, min=0)
+    final_dist = dist.gather(1, last_idx.unsqueeze(1)).squeeze(1)
+    fde = (final_dist * has_valid.float()).sum() / (has_valid.float().sum() + 1e-6)
+    return ade, fde
+
+
+def select_minade_prediction(all_preds, target, valid_mask=None):
+    """从多模态预测中选择 minADE 对应轨迹。"""
+    target_xy = target[..., :2].unsqueeze(1)
+    valid_mask = normalize_traj_valid_mask(valid_mask, all_preds[:, 0]).unsqueeze(1)
+
+    diff = torch.norm(all_preds[..., :2] - target_xy, dim=-1)
+    ade_k = (diff * valid_mask).sum(dim=2) / (valid_mask.sum(dim=2) + 1e-6)
+    best_idx = torch.argmin(ade_k, dim=1)
+
+    bsz, _, t_len, feat_dim = all_preds.shape
+    gather_idx = best_idx.view(bsz, 1, 1, 1).expand(bsz, 1, t_len, feat_dim)
+    best_pred = all_preds.gather(1, gather_idx).squeeze(1)
+    return best_pred, best_idx, ade_k
+
+
 class TrajectoryMetrics:
     """累计 future 轨迹的 RMSE / DE / ADE / FDE 统计量。"""
 
@@ -96,11 +138,7 @@ class TrajectoryMetrics:
     @staticmethod
     def normalize_valid_mask(valid_mask, pred):
         """将不同形状的有效位掩码统一成 `[B, T]` 浮点张量。"""
-        if valid_mask is None:
-            return torch.ones(pred.shape[0], pred.shape[1], device=pred.device, dtype=pred.dtype)
-        if valid_mask.dim() == 3:
-            valid_mask = valid_mask[..., 0]
-        return (valid_mask > 0.5).to(pred.device).float()
+        return normalize_traj_valid_mask(valid_mask, pred)
 
     def update(self, pred, target, valid_mask=None):
         """累积一个 batch 的轨迹误差。"""
@@ -176,50 +214,3 @@ def format_timestep_metrics(metric_tensor, meter_per_unit=0.3048, time_step_labe
             val_ft = float(metric_tensor[t_idx].item())
             values.append(f"{label}: {val_ft:.3f} ft ({val_ft * meter_per_unit:.3f} m)")
     return " | ".join(values) if values else "no valid timestep"
-
-
-def to_valid_mask(op_mask, device):
-    # op_mask[B,T,C] → valid_mask[B,T] float；通道0>0.5为有效帧
-    return (op_mask[..., 0] > 0.5).float().to(device)
-
-
-def gather_by_index(x, idx):
-    # x[B,K,...] + idx[B] → x[B,...]；按模态索引取单条轨迹
-    view_shape = [idx.size(0), 1] + [1] * (x.dim() - 2)
-    gather_idx = idx.view(*view_shape).expand(idx.size(0), 1, *x.shape[2:])
-    return x.gather(1, gather_idx).squeeze(1)
-
-
-def gather_last_by_valid(seq, valid_mask):
-    # seq[B,T,D] + valid_mask[B,T] → (last_valid[B,D], has_valid[B])
-    valid_counts = valid_mask.sum(dim=1).long()
-    last_idx = torch.clamp(valid_counts - 1, min=0)
-    gather_idx = last_idx.view(seq.size(0), 1, 1).expand(seq.size(0), 1, seq.size(-1))
-    gathered = seq.gather(1, gather_idx).squeeze(1)
-    has_valid = valid_counts > 0
-    return gathered, has_valid
-
-
-def compute_ade_fde(pred, target, valid_mask):
-    # pred/target[B,T,D] + valid_mask[B,T] → scalar ade, scalar fde
-    diff = pred[..., :2] - target[..., :2]
-    dist = torch.norm(diff, dim=-1)
-    ade = (dist * valid_mask).sum() / (valid_mask.sum() + 1e-6)
-    final_pred, has_valid = gather_last_by_valid(pred[..., :2], valid_mask)
-    final_target, _ = gather_last_by_valid(target[..., :2], valid_mask)
-    fde = (torch.norm(final_pred - final_target, dim=-1) * has_valid.float()).sum() / (has_valid.float().sum() + 1e-6)
-    return ade, fde
-
-
-def compute_per_mode_distance(all_pred_phys, future_phys, valid_mask):
-    # all_pred_phys[B,K,T,2] + future_phys[B,T,2] + valid_mask[B,T] → ade[B,K], fde[B,K]
-    diff = torch.norm(all_pred_phys[..., :2] - future_phys.unsqueeze(1), dim=-1)
-    valid = valid_mask.unsqueeze(1)
-    ade_per_mode = (diff * valid).sum(dim=-1) / (valid.sum(dim=-1) + 1e-6)
-    valid_counts = valid_mask.sum(dim=1).long()
-    last_idx = torch.clamp(valid_counts - 1, min=0)
-    gather_idx = last_idx.view(-1, 1, 1).expand(-1, all_pred_phys.size(1), 1)
-    final_diff = diff.gather(-1, gather_idx).squeeze(-1)
-    has_valid = (valid_counts > 0).float().unsqueeze(1)
-    fde_per_mode = final_diff * has_valid
-    return ade_per_mode, fde_per_mode

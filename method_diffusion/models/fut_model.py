@@ -1,437 +1,237 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
+from diffusers.schedulers import DDIMScheduler
 
-from method_diffusion.models.Intent_anchor import (
-    IntentConditionedModePrior,
-    FutureMotionCodec,
-    FutureDiffusionRefiner,
-)
-from method_diffusion.models.fut_loss import FutureLossComputer
+from method_diffusion.models import dit_fut as dit
 from method_diffusion.models.hist_encoder import HistEncoder
-from method_diffusion.utils.fut_utils import (
-    compute_ade_fde,
-    compute_per_mode_distance,
-    gather_by_index,
-    to_valid_mask,
-)
+from method_diffusion.utils.position_encoding import SequentialPositionalEncoding
 
 
 class DiffusionFut(nn.Module):
+
     def __init__(self, args):
-        super().__init__()
+        super(DiffusionFut, self).__init__()
+        self.args = args
         self.dataset_name = str(getattr(args, "dataset", "ngsim")).strip().lower()
 
+        # 模型结构参数：控制 DiT 主干维度、层数和 future 序列长度。
         self.hidden_dim = int(args.hidden_dim_fut)
         self.input_dim = int(args.input_dim_fut)
         self.output_dim = int(args.output_dim_fut)
+        self.heads = int(args.heads_fut)
+        self.depth = int(args.depth_fut)
+        self.dropout = float(args.dropout_fut)
+        self.mlp_ratio = int(args.mlp_ratio_fut)
+        self.time_embedding_size = int(args.time_embedding_size_fut)
         self.T = int(args.T_f)
-        self.mode_dim = int(args.mode_dim)
-        self.num_lat_classes = int(getattr(args, "num_lat_classes", 3))
-        self.num_lon_classes = int(getattr(args, "num_lon_classes", 3))
-        self.num_joint_classes = self.num_lat_classes * self.num_lon_classes
-        self.num_anchor_per_joint = int(getattr(args, "num_anchor_per_joint", getattr(args, "num_submodes", 2)))
-        self.num_submodes = self.num_anchor_per_joint
-        self.num_modes = self.num_joint_classes * self.num_anchor_per_joint
-        self.topk_intents = max(1, min(int(getattr(args, "topk_intents", 3)), self.num_joint_classes))
-        self.topk_refine = self.topk_intents * self.num_anchor_per_joint
-        self.lambda_fde_route = max(0.0, float(getattr(args, "lambda_fde_route", 0.5)))
-        self.route_beta = float(getattr(args, "route_beta", 1.0))
 
+        # 扩散与推理参数：控制训练时间步、推理步数和 DDIM 采样行为。
+        self.num_train_timesteps = int(args.num_train_timesteps_fut)
+        self.num_inference_steps = int(args.num_inference_steps)
+        self.ddim_eta = float(args.ddim_eta)
+        self.x0_clip = float(args.x0_clip) if float(args.x0_clip) > 0 else None
+
+        # 输入编码模块：分别处理 future 噪声序列和 history context。
+        self.input_embedding = nn.Linear(self.input_dim, self.hidden_dim)
+        self.context_embedding = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.pos_embedding = SequentialPositionalEncoding(self.hidden_dim)
         self.hist_encoder = HistEncoder(args)
-        self.mode_prior = IntentConditionedModePrior(
-            hidden_dim=self.hidden_dim,
-            mode_dim=self.mode_dim,
-            num_lat_classes=self.num_lat_classes,
-            num_lon_classes=self.num_lon_classes,
-            num_anchor_per_joint=self.num_anchor_per_joint,
-            future_steps=self.T,
-            output_dim=self.output_dim,
-        )
-        self.motion_codec = FutureMotionCodec(self.dataset_name, output_dim=self.output_dim)
-        self.refiner = FutureDiffusionRefiner(
-            args=args,
-            hidden_dim=self.hidden_dim,
-            input_dim=self.input_dim,
-            output_dim=self.output_dim,
-            mode_dim=self.mode_dim,
-            future_steps=self.T,
-        )
-        self.loss_helper = FutureLossComputer(
-            dataset_name=self.dataset_name,
-            num_joint_classes=self.num_joint_classes,
-            num_anchor_per_joint=self.num_anchor_per_joint,
-            future_steps=self.T,
-            output_dim=self.output_dim,
-            num_train_timesteps=args.num_train_timesteps_fut,
-            lambda_fde_route=self.lambda_fde_route,
-            tau_anchor_teacher=float(getattr(args, "tau_anchor_teacher", 1.0)),
-            tau_score_teacher=float(getattr(args, "tau_score_teacher", 1.0)),
+
+        # DiT 主干与扩散调度器：负责时间嵌入、去噪建模和 DDIM 调度。
+        self.timestep_embedder = dit.TimestepEmbedder(self.hidden_dim, self.time_embedding_size)
+        self.diffusion_scheduler = DDIMScheduler(
+            num_train_timesteps=self.num_train_timesteps,
+            beta_schedule="squaredcos_cap_v2",
+            prediction_type="sample",
+            clip_sample=False,
         )
 
-        # 兼容旧代码的只读别名。
-        self.vel_mean = self.motion_codec.vel_mean
-        self.vel_std = self.motion_codec.vel_std
-        self.diffusion_scheduler = self.refiner.diffusion_scheduler
+        dit_block = dit.DiTBlock(self.hidden_dim, self.heads, self.dropout, self.mlp_ratio)
+        final_layer = dit.FinalLayer(self.hidden_dim, self.T, self.output_dim)
+        self.dit = dit.DiT(dit_block=dit_block, final_layer=final_layer, depth=self.depth, model_type="x_start")
 
-    def buildTargetVelNorm(self, hist, future, device):
-        return self.motion_codec.buildTargetVelNorm(hist, future, device)
-
-    def decodeVelocityToTrajectory(self, pred_vel_norm, anchor_phys):
-        return self.motion_codec.decodeVelocityToTrajectory(pred_vel_norm, anchor_phys)
-
-    def decodeAnchorToPosition(self, anchor_vel_norm, anchor_phys):
-        return self.motion_codec.decodeAnchorToPosition(anchor_vel_norm, anchor_phys)
-
-    def flattenStructuredModes(self, tensor):
-        return self.motion_codec.flattenStructuredModes(tensor)
-
-    def selectJointGroup(self, tensor, joint_idx):
-        return self.motion_codec.selectJointGroup(tensor, joint_idx)
-
-    def runDiffusionForModes(self, ctx, mode_tokens, anchor_vel_norm, anchor_phys, device):
-        return self.refiner.runDiffusionForModes(ctx, mode_tokens, anchor_vel_norm, anchor_phys, device, self.motion_codec)
-
-    def gatherTopIntents(self, tensor, top_intent_idx):
-        if tensor is None:
-            return None
-        expand_shape = [top_intent_idx.size(0), top_intent_idx.size(1)] + [1] * (tensor.dim() - 2)
-        gather_idx = top_intent_idx.view(*expand_shape).expand(
-            top_intent_idx.size(0),
-            top_intent_idx.size(1),
-            *tensor.shape[2:],
-        )
-        return tensor.gather(1, gather_idx)
-
-    @staticmethod
-    def flattenIntentAnchors(tensor):
-        if tensor is None:
-            return None
-        return tensor.reshape(tensor.size(0), -1, *tensor.shape[3:])
-
-    def buildTopIntentCandidates(
-        self,
-        top_intent_idx,
-        joint_mode_tokens,
-        joint_anchor_vel_norm,
-        joint_anchor_prior_logits,
-        joint_q_anchor=None,
-    ):
-        selected_mode_tokens = self.gatherTopIntents(joint_mode_tokens, top_intent_idx)
-        selected_anchor_vel_norm = self.gatherTopIntents(joint_anchor_vel_norm, top_intent_idx)
-        selected_anchor_prior_logits = self.gatherTopIntents(joint_anchor_prior_logits, top_intent_idx)
-        selected_q_anchor = self.gatherTopIntents(joint_q_anchor, top_intent_idx) if joint_q_anchor is not None else None
-
-        local_anchor_idx = torch.arange(
-            self.num_anchor_per_joint,
-            device=top_intent_idx.device,
-        ).view(1, 1, self.num_anchor_per_joint)
-        global_mode_idx = top_intent_idx.unsqueeze(-1) * self.num_anchor_per_joint + local_anchor_idx
-
-        return {
-            "top_intent_idx": top_intent_idx,
-            "selected_mode_tokens": selected_mode_tokens,
-            "selected_anchor_vel_norm": selected_anchor_vel_norm,
-            "selected_anchor_prior_logits": selected_anchor_prior_logits,
-            "selected_q_anchor": selected_q_anchor,
-            "selected_mode_idx": global_mode_idx,
-            "flat_mode_tokens": self.flattenIntentAnchors(selected_mode_tokens),
-            "flat_anchor_vel_norm": self.flattenIntentAnchors(selected_anchor_vel_norm),
-            "flat_anchor_prior_logits": self.flattenIntentAnchors(selected_anchor_prior_logits),
-            "flat_q_anchor": self.flattenIntentAnchors(selected_q_anchor),
-            "flat_mode_idx": self.flattenIntentAnchors(global_mode_idx),
-        }
-
-    def getIntentScores(self, prior):
-        return torch.logsumexp(prior["joint_anchor_prior_logits"], dim=-1)
-
-    def getAllModePredictions(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, select_topk=None):
-        bsz = future.size(0)
-        valid_mask = to_valid_mask(op_mask, device)
-        anchor_phys, future_phys, _ = self.motion_codec.buildTargetVelNorm(hist, future, device)
-        ctx = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
-        prior = self.mode_prior(ctx["global_token"])
-
-        mode_logits = prior["mode_log_probs"].view(bsz, self.num_modes)
-        mode_tokens = self.motion_codec.flattenStructuredModes(prior["mode_tokens"])
-        anchor_vel_norm = self.motion_codec.flattenStructuredModes(prior["anchor_vel_norm"])
-        mode_indices = torch.arange(self.num_modes, device=device).view(1, self.num_modes).expand(bsz, -1)
-
-        if select_topk is not None and select_topk < self.num_modes:
-            topk = max(1, int(select_topk))
-            topk_idx = torch.topk(mode_logits, k=topk, dim=1).indices
-            mode_logits = mode_logits.gather(1, topk_idx)
-            mode_indices = mode_indices.gather(1, topk_idx)
-            mode_tokens = torch.gather(mode_tokens, 1, topk_idx.unsqueeze(-1).expand(-1, -1, mode_tokens.size(-1)))
-            anchor_vel_norm = torch.gather(
-                anchor_vel_norm,
-                1,
-                topk_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, anchor_vel_norm.size(2), anchor_vel_norm.size(3)),
+        # 双空间归一化参数
+        # 物理坐标归一化参数 (给历史轨迹编码和宏观位置 Loss 使用)
+        if self.dataset_name == "ngsim":
+            self.register_buffer("pos_mean", torch.tensor([0.05076411229651117, -31.318518632454474], dtype=torch.float32), persistent=False)
+            self.register_buffer("pos_std", torch.tensor([9.67614343193339, 59.53730335210165], dtype=torch.float32), persistent=False)
+            self.register_buffer("va_mean", torch.tensor([21.150308365503957, 0.006041414014469039], dtype=torch.float32), persistent=False)
+            self.register_buffer("va_std", torch.tensor([13.598306447881924, 4.505736504111998], dtype=torch.float32), persistent=False)
+            self.register_buffer("vel_mean", torch.tensor([-0.004181504611623526, 5.041936610524995], dtype=torch.float32), persistent=False)
+            self.register_buffer("vel_std", torch.tensor([0.1502223350250087, 2.951254134709027], dtype=torch.float32), persistent=False)
+        elif self.dataset_name == "highd":
+            self.register_buffer("pos_mean", torch.tensor([-0.39106148272179536, -115.63853904936501], dtype=torch.float32), persistent=False)
+            self.register_buffer("pos_std", torch.tensor([9.266579303046143, 98.49671326349531], dtype=torch.float32), persistent=False)
+            self.register_buffer("va_mean", torch.tensor([78.09292302772707, -0.04991240184019581], dtype=torch.float32), persistent=False)
+            self.register_buffer("va_std", torch.tensor([29.215909315170098, 1.1700240860076556], dtype=torch.float32), persistent=False)
+            self.register_buffer("vel_mean", torch.tensor([0.004845835373614644, 17.01558226555126], dtype=torch.float32), persistent=False)
+            self.register_buffer("vel_std", torch.tensor([0.10621210903901461, 4.838376260255577], dtype=torch.float32), persistent=False)
+        else:
+            raise ValueError(
+                f"Unsupported dataset '{self.dataset_name}' for fut normalization. Supported: highd, ngsim"
             )
 
-        denoise_outputs = self.runDiffusionForModes(ctx, mode_tokens, anchor_vel_norm, anchor_phys, device)
-        _, anchor_pos_phys = self.motion_codec.decodeAnchorToPosition(anchor_vel_norm, anchor_phys)
+    # 基于当前噪声状态与 history context 预测归一化速度 x0。
+    def predictX0(self, x_t, timesteps, context_tokens):
+        t_emb = self.timestep_embedder(timesteps)
+        input_embedded = self.input_embedding(x_t) + self.pos_embedding(x_t)
+        cross_encoded = self.context_embedding(context_tokens)
+        return self.dit(x=input_embedded, t_cond=t_emb, cross=cross_encoded)
 
-        all_preds = future.clone().unsqueeze(1).repeat(1, mode_logits.size(1), 1, 1)
-        all_preds[..., :2] = denoise_outputs["pred_pos_phys"]
-        ade_per_mode, fde_per_mode = compute_per_mode_distance(denoise_outputs["pred_pos_phys"], future_phys, valid_mask)
-        dist_per_mode = ade_per_mode + self.lambda_fde_route * fde_per_mode
-        best_mode_pos = torch.argmin(dist_per_mode, dim=1)
-        best_mode_idx = mode_indices.gather(1, best_mode_pos.unsqueeze(1)).squeeze(1)
+    def encodeContext(self, hist, hist_nbrs, mask, temporal_mask):
+        hist_norm = self.normalize(hist)
+        hist_nbrs_norm = self.normalize(hist_nbrs)
+        context, _ = self.hist_encoder(hist_norm, hist_nbrs_norm, mask, temporal_mask)
+        return context
 
-        return {
-            "mode_probs": torch.softmax(mode_logits, dim=1),
-            "anchor_pos_phys": anchor_pos_phys,
-            "all_pred_phys": all_preds,
-            "ade_per_mode": ade_per_mode,
-            "fde_per_mode": fde_per_mode,
-            "dist_per_mode": dist_per_mode,
-            "mode_indices": mode_indices,
-            "best_mode_pos": best_mode_pos,
-            "best_mode_idx": best_mode_idx,
-            "mode_nll": F.cross_entropy(mode_logits, best_mode_pos).detach(),
+    def computeLoss(self, pred_x0, target_x0, valid_mask, return_parts=False):
+        loss_x0 = F.mse_loss(pred_x0, target_x0, reduction="none")
+        valid = valid_mask.unsqueeze(-1)
+        denom = valid.sum() * target_x0.size(-1) + 1e-6
+        loss_total = (loss_x0 * valid).sum() / denom
+
+        if not return_parts:
+            return loss_total
+
+        parts = {
+            "loss_total": loss_total.detach(),
+            "loss_diffusion": loss_total.detach(),
+            "loss_x0": loss_total.detach(),
         }
+        return loss_total, parts
 
-    def forwardTrain(
-        self,
-        hist,
-        hist_nbrs,
-        mask,
-        temporal_mask,
-        future,
-        op_mask,
-        device,
-        return_components=False,
-        lat_targets=None,
-        lon_targets=None,
-        joint_targets=None,
-    ):
-        bsz = hist.size(0)
-        valid_mask = to_valid_mask(op_mask, device)
-        anchor_phys, future_phys, target_vel_norm = self.motion_codec.buildTargetVelNorm(hist, future, device)
-        ctx = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
-        prior = self.mode_prior(ctx["global_token"])
-        intent_parts = self.loss_helper.buildSemanticLosses(prior, lat_targets, lon_targets, joint_targets)
+    # 执行推理阶段的 DDIM 采样并输出最终预测结果（归一化速度 x0）。
+    def sampleFromXt(self, x_t, context_tokens, infer_scheduler):
+        pred_x0 = None
+        for t in infer_scheduler.timesteps:
+            t_scalar = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
+            timesteps = torch.full((x_t.size(0),), t_scalar, device=x_t.device, dtype=torch.long)
+            pred_x0 = self.predictX0(x_t, timesteps, context_tokens)
+            if self.x0_clip is not None:
+                pred_x0 = torch.clamp(pred_x0, -self.x0_clip, self.x0_clip)
+            try:
+                x_t = infer_scheduler.step(pred_x0, t, x_t, eta=self.ddim_eta).prev_sample
+            except TypeError:
+                x_t = infer_scheduler.step(pred_x0, t, x_t).prev_sample
+        return pred_x0
 
-        all_anchor_vel_norm = self.motion_codec.flattenStructuredModes(prior["anchor_vel_norm"])
-        _, all_anchor_pos_phys = self.motion_codec.decodeAnchorToPosition(all_anchor_vel_norm, anchor_phys)
-        global_metrics = self.loss_helper.computeGlobalMetrics(
-            prior["mode_log_probs"].view(bsz, self.num_modes),
-            all_anchor_pos_phys,
-            future_phys,
-            valid_mask,
-        )
+    # 统一准备评估阶段所需的条件编码、掩码和调度器参数。
+    def prepareEvalInputs(self, hist, hist_nbrs, mask, temporal_mask, future, device):
+        bsz, t_len, _ = future.shape
+        anchor_phys = hist[:, -1:, :self.output_dim]
+        future_phys = future[..., :self.output_dim]
+        context_tokens = self.encodeContext(hist, hist_nbrs, mask, temporal_mask)
+        infer_scheduler = DDIMScheduler.from_config(self.diffusion_scheduler.config)
+        infer_scheduler.set_timesteps(self.num_inference_steps)
+        return bsz, t_len, anchor_phys, future_phys, context_tokens, infer_scheduler
 
-        joint_mode_tokens = prior["joint_mode_tokens"]
-        joint_anchor_vel_norm = prior["joint_anchor_vel_norm"]
-        joint_anchor_prior_logits = prior["joint_anchor_prior_logits"]
-        _, joint_anchor_pos_phys = self.motion_codec.decodeAnchorToPosition(joint_anchor_vel_norm, anchor_phys)
+    # 执行单个 batch 的 fut 训练前向与损失计算。
+    def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, return_components=False):
+        bsz, t_len, _ = future.shape  # [B, T_f, D]
+        valid_mask = (op_mask[..., 0] > 0.5).float().to(device)  # [B, T_f]
 
-        anchor_parts = self.loss_helper.computeGlobalAnchorLosses(
-            joint_anchor_prior_logits,
-            joint_anchor_pos_phys,
-            future_phys,
-            valid_mask,
-        )
-        q_anchor_joint = anchor_parts["q_anchor"].view(bsz, self.num_joint_classes, self.num_anchor_per_joint)
-        top_intent_idx = torch.topk(anchor_parts["q_intent"], k=self.topk_intents, dim=1).indices
-        selected = self.buildTopIntentCandidates(
-            top_intent_idx=top_intent_idx,
-            joint_mode_tokens=joint_mode_tokens,
-            joint_anchor_vel_norm=joint_anchor_vel_norm,
-            joint_anchor_prior_logits=joint_anchor_prior_logits,
-            joint_q_anchor=q_anchor_joint,
-        )
+        anchor_phys = hist[:, -1:, :self.output_dim]  # [B, 1, 2]
+        future_phys = future[..., :self.output_dim]  # [B, T_f, 2]
 
-        ref_parts = self.loss_helper.computeTopKRefinementLosses(
-            ctx=ctx,
-            selected_mode_tokens=selected["flat_mode_tokens"],
-            selected_anchor_vel_norm=selected["flat_anchor_vel_norm"],
-            selected_anchor_prior_logits=selected["flat_anchor_prior_logits"],
-            selected_q_anchor=selected["flat_q_anchor"],
-            anchor_phys=anchor_phys,
-            future_phys=future_phys,
-            target_vel_norm=target_vel_norm,
-            valid_mask=valid_mask,
-            device=device,
-            refiner=self.refiner,
-            motion_codec=self.motion_codec,
-            route_beta=self.route_beta,
-        )
+        # 坐标空间转换：计算 GT 的真实物理帧间位移 (Velocity)。
+        shifted_future_phys = torch.cat([anchor_phys, future_phys[:, :-1, :]], dim=1)
+        target_vel_phys = future_phys - shifted_future_phys  # [B, T_f, 2]
 
-        loss = self.loss_helper.combineTrainingLosses(intent_parts, anchor_parts, ref_parts)
-        best_intent_acc = (
-            torch.argmax(self.getIntentScores(prior), dim=1) == anchor_parts["best_intent_idx"]
-        ).float().mean().detach()
-        intent_topk_hit = (
-            top_intent_idx == anchor_parts["best_intent_idx"].unsqueeze(1)
-        ).any(dim=1).float().mean().detach()
+        # 归一化：将物理速度变为正态分布。
+        std_vel = self.vel_std.view(1, 1, 2).to(device)
+        mean_vel = self.vel_mean.view(1, 1, 2).to(device)
+        target_vel_norm = target_vel_phys.clone()
+        target_vel_norm[..., :2] = (target_vel_phys[..., :2] - mean_vel) / std_vel
+        target_vel_norm[..., :2] = torch.clamp(target_vel_norm[..., :2], -5.0, 5.0)
+
+        # 加噪过程。
+        noise = torch.randn_like(target_vel_norm)
+        timesteps = torch.randint(0, self.num_train_timesteps, (bsz,), device=device).long()
+        x_t = self.diffusion_scheduler.add_noise(target_vel_norm, noise, timesteps)
+
+        context_tokens = self.encodeContext(hist, hist_nbrs, mask, temporal_mask)
+
+        # 网络输出：预测的归一化速度 x0。
+        pred_x0 = self.predictX0(x_t, timesteps, context_tokens)
+
+        loss, loss_parts = self.computeLoss(pred_x0, target_vel_norm, valid_mask, return_parts=True)
 
         if return_components:
-            return loss, {
-                "loss_total": loss.detach(),
-                "losses": {
-                    "intent_lat": intent_parts["loss_intent_lat"].detach(),
-                    "intent_lon": intent_parts["loss_intent_lon"].detach(),
-                    "mode": anchor_parts["loss_mode"].detach(),
-                    "anchor": anchor_parts["loss_anchor"].detach(),
-                    "div": anchor_parts["loss_div"].detach(),
-                    "eps": ref_parts["loss_eps"].detach(),
-                    "score": ref_parts["loss_score"].detach(),
-                    "rank": ref_parts["loss_rank"].detach(),
-                    "x0": ref_parts["loss_x0"].detach(),
-                    "end": ref_parts["loss_end"].detach(),
-                },
-                "metrics": {
-                    "coarse_top1_ade": global_metrics["top1_ade"],
-                    "coarse_top1_fde": global_metrics["top1_fde"],
-                    "coarse_minade": global_metrics["minade_m"],
-                    "coarse_minfde": global_metrics["minfde_m"],
-                    "coarse_mode_nll": global_metrics["mode_nll"],
-                    "intent_topk_hit": intent_topk_hit,
-                    "best_intent_acc": best_intent_acc,
-                    "route_hit": ref_parts["route_hit"],
-                    "route_gap": ref_parts["route_gap"],
-                    "lat_acc": (torch.argmax(intent_parts["lat_probs"], dim=1) == intent_parts["lat_idx"]).float().mean().detach(),
-                    "lon_acc": (torch.argmax(intent_parts["lon_probs"], dim=1) == intent_parts["lon_idx"]).float().mean().detach(),
-                    "joint_acc": (torch.argmax(intent_parts["joint_probs"], dim=1) == intent_parts["joint_idx"]).float().mean().detach(),
-                },
-            }
+            return loss, loss_parts
         return loss
 
     @torch.no_grad()
-    def forwardEval(
-        self,
-        hist,
-        hist_nbrs,
-        mask,
-        temporal_mask,
-        future,
-        op_mask,
-        device,
-        return_aux=False,
-        lat_targets=None,
-        lon_targets=None,
-        joint_targets=None,
-    ):
-        bsz = hist.size(0)
-        valid_mask = to_valid_mask(op_mask, device)
-        anchor_phys, future_phys, _ = self.motion_codec.buildTargetVelNorm(hist, future, device)
-        ctx = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
-        prior = self.mode_prior(ctx["global_token"])
-        intent_parts = self.loss_helper.buildSemanticLosses(prior, lat_targets, lon_targets, joint_targets)
-
-        joint_mode_tokens = prior["joint_mode_tokens"]
-        joint_anchor_vel_norm = prior["joint_anchor_vel_norm"]
-        joint_anchor_prior_logits = prior["joint_anchor_prior_logits"]
-        intent_scores = self.getIntentScores(prior)
-        top_intent_idx = torch.topk(intent_scores, k=self.topk_intents, dim=1).indices
-        selected = self.buildTopIntentCandidates(
-            top_intent_idx=top_intent_idx,
-            joint_mode_tokens=joint_mode_tokens,
-            joint_anchor_vel_norm=joint_anchor_vel_norm,
-            joint_anchor_prior_logits=joint_anchor_prior_logits,
-        )
-
-        pred_group_out = self.runDiffusionForModes(
-            ctx,
-            selected["flat_mode_tokens"],
-            selected["flat_anchor_vel_norm"],
+    # 执行单模态推理评估并返回预测轨迹。
+    def forwardEval(self, hist, hist_nbrs, mask, temporal_mask, future, device):
+        (
+            bsz,
+            t_len,
             anchor_phys,
-            device,
-        )
-        pred_group_preds = future.clone().unsqueeze(1).repeat(1, self.topk_refine, 1, 1)
-        pred_group_preds[..., :2] = pred_group_out["pred_pos_phys"]
-        pred_group_ade, pred_group_fde = compute_per_mode_distance(pred_group_out["pred_pos_phys"], future_phys, valid_mask)
-        final_dist = pred_group_ade + self.lambda_fde_route * pred_group_fde
-        route_logits = selected["flat_anchor_prior_logits"] + self.route_beta * pred_group_out["score_logits"]
-        routed_idx = torch.argmax(route_logits, dim=1)
-        best_pred_idx = torch.argmin(final_dist, dim=1)
-        selected_mode_idx = selected["flat_mode_idx"].gather(1, routed_idx.unsqueeze(1)).squeeze(1)
-        top1_pred = gather_by_index(pred_group_preds, routed_idx)
-        top1_ade, top1_fde = compute_ade_fde(top1_pred, future, valid_mask)
-
-        _, joint_anchor_pos_phys = self.motion_codec.decodeAnchorToPosition(joint_anchor_vel_norm, anchor_phys)
-        anchor_parts = self.loss_helper.computeGlobalAnchorLosses(
-            joint_anchor_prior_logits,
-            joint_anchor_pos_phys,
             future_phys,
-            valid_mask,
-        )
-        best_intent_acc = (
-            torch.argmax(intent_scores, dim=1) == anchor_parts["best_intent_idx"]
-        ).float().mean().detach()
-        intent_topk_hit = (
-            top_intent_idx == anchor_parts["best_intent_idx"].unsqueeze(1)
-        ).any(dim=1).float().mean().detach()
-        route_hit = (routed_idx == best_pred_idx).float().mean().detach()
-        route_gap = (
-            final_dist.gather(1, routed_idx.unsqueeze(1)).squeeze(1) - final_dist.min(dim=1).values
-        ).mean().detach()
+            context_tokens,
+            infer_scheduler,
+        ) = self.prepareEvalInputs(hist, hist_nbrs, mask, temporal_mask, future, device)
 
-        aux = {
-            "predictions": {
-                "candidates": pred_group_preds,
-                "top1": top1_pred,
-            },
-            "metrics": {
-                "top1_ade": top1_ade.detach(),
-                "top1_fde": top1_fde.detach(),
-                "intent_topk_hit": intent_topk_hit,
-                "best_intent_acc": best_intent_acc,
-                "route_hit": route_hit,
-                "route_gap": route_gap,
-                "lat_acc": (torch.argmax(prior["lat_probs"], dim=1) == intent_parts["lat_idx"]).float().mean().detach(),
-                "lon_acc": (torch.argmax(prior["lon_probs"], dim=1) == intent_parts["lon_idx"]).float().mean().detach(),
-                "joint_acc": (torch.argmax(prior["joint_probs"], dim=1) == intent_parts["joint_idx"]).float().mean().detach(),
-            },
-            "routing": {
-                "mode_probs": prior["mode_probs"],
-                "lat_probs": prior["lat_probs"],
-                "lon_probs": prior["lon_probs"],
-                "joint_probs": prior["joint_probs"],
-                "intent_scores": intent_scores,
-                "top_intent_idx": top_intent_idx,
-                "selected_mode_idx": selected_mode_idx,
-                "selected_global_mode_idx": selected["flat_mode_idx"],
-                "best_intent_idx": anchor_parts["best_intent_idx"],
-                "routed_idx": routed_idx,
-                "best_pred_idx": best_pred_idx,
-                "score_logits": pred_group_out["score_logits"],
-                "route_logits": route_logits,
-                "candidate_ade": pred_group_ade,
-                "candidate_fde": pred_group_fde,
-                "candidate_dist": final_dist,
-            },
-        }
-        if return_aux:
-            return top1_pred, aux
-        return top1_pred
+        x_t = torch.randn((bsz, t_len, self.input_dim), device=device)
+        pred_vel_norm = self.sampleFromXt(x_t, context_tokens, infer_scheduler)
 
-    def forward(
-        self,
-        hist,
-        hist_nbrs,
-        mask,
-        temporal_mask,
-        future,
-        op_mask,
-        device,
-        return_components=False,
-        lat_targets=None,
-        lon_targets=None,
-        joint_targets=None,
-    ):
-        return self.forwardTrain(
-            hist,
-            hist_nbrs,
-            mask,
-            temporal_mask,
-            future,
-            op_mask,
-            device,
-            return_components=return_components,
-            lat_targets=lat_targets,
-            lon_targets=lon_targets,
-            joint_targets=joint_targets,
-        )
+        # 积分还原：解归一化 -> 累加 -> 拼接绝对锚点。
+        std_vel = self.vel_std.view(1, 1, 2).to(device)
+        mean_vel = self.vel_mean.view(1, 1, 2).to(device)
+        pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
+        pred_pos_phys = torch.cumsum(pred_vel_phys, dim=1) + anchor_phys[..., :2]
+        pred_phys_abs = future_phys.clone()
+        pred_phys_abs[..., :2] = pred_pos_phys
+
+        return pred_phys_abs
+
+    @torch.no_grad()
+    # 执行并行多模态推理评估并返回多模态预测轨迹集合。
+    def forwardEvalMulti(self, hist, hist_nbrs, mask, temporal_mask, future, device, K=5):
+        (
+            bsz,
+            t_len,
+            anchor_phys,
+            future_phys,
+            context_tokens,
+            infer_scheduler,
+        ) = self.prepareEvalInputs(hist, hist_nbrs, mask, temporal_mask, future, device)
+
+        # 核心提速优化：在 Batch 维度上并行展开 K 倍。
+        context_tokens_k = context_tokens.repeat_interleave(K, dim=0)
+
+        # 一次性生成 bsz * K 份随机噪声，并行执行完整的去噪过程。
+        x_t_k = torch.randn((bsz * K, t_len, self.input_dim), device=device)
+        pred_vel_norm_k = self.sampleFromXt(x_t_k, context_tokens_k, infer_scheduler)
+
+        # 把并发结果 Reshape 回 [bsz, K, t_len, dim]。
+        pred_vel_norm = pred_vel_norm_k.view(bsz, K, t_len, self.output_dim)
+
+        # 积分还原物理坐标 (张量广播)。
+        std_vel = self.vel_std.view(1, 1, 1, 2).to(device)
+        mean_vel = self.vel_mean.view(1, 1, 1, 2).to(device)
+        pred_vel_phys = pred_vel_norm * std_vel + mean_vel
+        anchor_phys_k = anchor_phys[..., :2].unsqueeze(1)
+        pred_pos_phys = torch.cumsum(pred_vel_phys, dim=2) + anchor_phys_k
+
+        # 兼容多维度输出，前两维写入还原后的物理坐标。
+        all_preds = future_phys.unsqueeze(1).repeat(1, K, 1, 1).clone()
+        all_preds[..., :2] = pred_pos_phys
+
+        return all_preds
+
+    # 统一前向入口，默认复用训练路径。
+    def forward(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, return_components=False):
+        return self.forwardTrain(hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, return_components=return_components)
+
+    # 对历史输入的坐标与运动学特征做归一化。
+    def normalize(self, x):
+        x_norm = x.clone()
+        x_norm[..., 0:2] = (x[..., 0:2] - self.pos_mean) / self.pos_std
+        x_norm[..., 0:2] = torch.clamp(x_norm[..., 0:2], -10.0, 10.0)
+        channels = x_norm.shape[-1]
+        if channels >= 4:
+            x_norm[..., 2:4] = (x[..., 2:4] - self.va_mean) / self.va_std
+            x_norm[..., 2:4] = torch.clamp(x_norm[..., 2:4], -10.0, 10.0)
+        return x_norm

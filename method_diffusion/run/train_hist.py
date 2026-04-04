@@ -2,7 +2,6 @@ import sys
 import os
 import re
 import csv
-import math
 from pathlib import Path
 
 import torch
@@ -208,11 +207,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, mask_r
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, mask_ratio, random_mask_ratio, block_mask_start):
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-
+def evaluate(model, dataloader, device, epoch, feature_dim, mask_ratio, random_mask_ratio, block_mask_start):
     model.eval()
     total_loss = 0.0
     total_masked_ade = 0.0
@@ -222,17 +217,8 @@ def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, mask_rat
         model.train()
         return {"loss": 0.0, "masked_ade_ft": 0.0}
 
-    total_batches = len(dataloader)
-    if eval_ratio <= 0.0 or eval_ratio >= 1.0:
-        target_batches = total_batches
-    else:
-        target_batches = max(1, int(math.ceil(total_batches * float(eval_ratio))))
-
-    pbar = tqdm(dataloader, total=target_batches, desc=f"Ep{epoch} Val", dynamic_ncols=True)
+    pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Val", dynamic_ncols=True)
     for batch in pbar:
-        if num_batches >= target_batches:
-            break
-
         batch = filter_valid_batch(batch)
         hist = prepare_input_data(batch, feature_dim, device=device)
         if hist.shape[0] == 0:
@@ -316,7 +302,6 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
 
     start_epoch, best_loss = load_checkpoint(args, model, optimizer, scheduler, device)
-    eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
     mask_ratio = max(0.0, min(1.0, float(args.mask_prob)))
     random_mask_ratio = max(0.0, min(1.0, float(args.random_mask_ratio)))
     block_mask_start = int(args.block_mask_start) > 0
@@ -339,7 +324,6 @@ def main():
             device,
             epoch + 1,
             args.feature_dim,
-            eval_ratio,
             mask_ratio,
             random_mask_ratio,
             block_mask_start,

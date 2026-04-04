@@ -23,7 +23,7 @@ from method_diffusion.run.evaluate_fut import (
     print_metrics as print_fut_metrics,
 )
 from method_diffusion.run.train_joint import JOINT_FUT_CHECKPOINT_DIR, JOINT_HIST_CHECKPOINT_DIR
-from method_diffusion.utils.fut_utils import TrajectoryMetrics, gather_by_index
+from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_minade_prediction
 from method_diffusion.utils.mask_util import mixed_mask
 
 
@@ -134,16 +134,12 @@ def build_test_loader(args):
 
 
 @torch.no_grad()
-def evaluate(model_hist, model_fut, dataloader, device, feature_dim, mask_ratio, random_mask_ratio, block_mask_start):
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-
+def evaluate(model_hist, model_fut, dataloader, device, feature_dim, num_samples, mask_ratio, random_mask_ratio, block_mask_start):
     model_hist.eval()
     model_fut.eval()
     hist_metrics = HistReconstructionMetrics()
     fut_metrics = TrajectoryMetrics(model_fut.T)
-    k_samples = max(1, int(model_fut.num_modes))
+    k_samples = max(1, int(num_samples))
 
     pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc="Eval Joint", ncols=140)
     for batch_idx, batch in pbar:
@@ -159,27 +155,24 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, mask_ratio,
         hist_metrics.update(pred_hist, hist, hist_mask)
 
         if k_samples > 1:
-            fut_outputs = model_fut.getAllModePredictions(
-                hist=pred_hist,
-                hist_nbrs=hist_nbrs,
-                mask=mask,
-                temporal_mask=temporal_mask,
-                future=fut,
-                op_mask=op_mask,
-                device=device,
-                select_topk=min(k_samples, model_fut.num_modes),
-            )
-            pred_fut = gather_by_index(fut_outputs["all_pred_phys"], fut_outputs["best_mode_pos"])
-        else:
-            pred_fut, _ = model_fut.forwardEval(
+            all_preds = model_fut.forwardEvalMulti(
                 pred_hist,
                 hist_nbrs,
                 mask,
                 temporal_mask,
                 fut,
-                op_mask,
                 device,
-                return_aux=True,
+                K=k_samples,
+            )
+            pred_fut, _, _ = select_minade_prediction(all_preds, fut, op_mask)
+        else:
+            pred_fut = model_fut.forwardEval(
+                pred_hist,
+                hist_nbrs,
+                mask,
+                temporal_mask,
+                fut,
+                device,
             )
         fut_metrics.update(pred_fut, fut, op_mask)
 
@@ -208,15 +201,15 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     hist_checkpoint_dir = resolve_hist_checkpoint_dir(args.resume_hist)
     fut_checkpoint_dir = JOINT_FUT_CHECKPOINT_DIR
-    model_fut = DiffusionFut(args).to(device)
 
     print(f"[JointEval] Device: {device}")
     print(f"[JointEval] Hist checkpoint dir: {hist_checkpoint_dir}")
     print(f"[JointEval] Fut checkpoint dir: {fut_checkpoint_dir}")
-    print(f"[JointEval] num_modes={model_fut.num_modes}, num_inference_steps={args.num_inference_steps}")
+    print(f"[JointEval] num_samples={args.num_samples}, num_inference_steps={args.num_inference_steps}")
 
     dataloader = build_test_loader(args)
     model_hist = DiffusionPast(args).to(device)
+    model_fut = DiffusionFut(args).to(device)
     load_hist_checkpoint(model_hist, args.resume_hist, hist_checkpoint_dir, device, model_name="JointHistEval")
     load_fut_checkpoint(model_fut, args.resume_fut, fut_checkpoint_dir, device)
     evaluate(
@@ -225,6 +218,7 @@ def main():
         dataloader=dataloader,
         device=device,
         feature_dim=args.feature_dim,
+        num_samples=args.num_samples,
         mask_ratio=max(0.0, min(1.0, float(args.mask_prob))),
         random_mask_ratio=max(0.0, min(1.0, float(args.random_mask_ratio))),
         block_mask_start=int(args.block_mask_start) > 0,
