@@ -86,28 +86,30 @@ class DiffusionFut(nn.Module):
         return context
 
     def computeLoss(self, pred_vel_norm, target_vel_norm, future_phys, anchor_phys, valid_mask, timesteps=None, return_parts=False):
-        # SNR 权重（Min-SNR-5）：训练时按噪声步长对损失加权，修正 x0 预测的梯度分配偏差。
-        # 高信噪比（低噪声步）权重大，低信噪比（高噪声步）权重趋近 0，上限 5.0 防止极低噪声步主导。
-        # 推理时不传 timesteps，snr_weight=1 不影响推理逻辑。
+        # SimDiff 权重：训练时按噪声步长对损失加权，使用 1/√(1-ᾱₜ) 权重。
+        # 低噪声步权重极大，高噪声步权重为1，直接优化轨迹预测精度指标。
+        # 添加clamp防止t→0时权重爆炸，上限50.0保持训练稳定性。
+        # 推理时不传 timesteps，simdiff_weight=1 不影响推理逻辑。
         if timesteps is not None:
             alphas_cumprod = self.diffusion_scheduler.alphas_cumprod.to(pred_vel_norm.device)
             alpha_t = alphas_cumprod[timesteps]                        # [B]
-            snr = alpha_t / (1.0 - alpha_t + 1e-8)                    # [B]
-            snr_weight = torch.clamp(snr, max=5.0).view(-1, 1, 1)     # [B, 1, 1]
+            simdiff_weight = 1.0 / torch.sqrt(1.0 - alpha_t + 1e-8)   # [B]
+            simdiff_weight = torch.clamp(simdiff_weight, max=50.0)     # 防止权重爆炸
+            simdiff_weight = simdiff_weight.view(-1, 1, 1)             # [B, 1, 1]
         else:
-            snr_weight = 1.0
+            simdiff_weight = 1.0
 
-        # Velocity loss: L1 → MSE，加 SNR 权重
-        loss_vel = snr_weight * F.mse_loss(pred_vel_norm, target_vel_norm, reduction="none")
+        # Velocity loss: 使用SimDiff加权的L1损失
+        loss_vel = simdiff_weight * F.l1_loss(pred_vel_norm, target_vel_norm, reduction="none")
 
         # Position loss - convert normalized velocity to physical coordinates and compute position loss
         std_vel = self.vel_std.view(1, 1, 2).to(pred_vel_norm.device)
         mean_vel = self.vel_mean.view(1, 1, 2).to(pred_vel_norm.device)
         pred_vel_phys = pred_vel_norm[..., :2] * std_vel + mean_vel
         pred_pos_phys = torch.cumsum(pred_vel_phys, dim=1) + anchor_phys[..., :2]
-        loss_pos = snr_weight * F.mse_loss(pred_pos_phys, future_phys[..., :2], reduction="none")
+        loss_pos = simdiff_weight * F.l1_loss(pred_pos_phys, future_phys[..., :2], reduction="none")
 
-        # Combined loss: velocity + 0.1 * position（两项均带 SNR 权重，比例稳定）
+        # Combined loss: velocity + 0.1 * position（两项均带 SimDiff 权重，比例稳定）
         pos_loss_weight = 0.1
         total_loss = loss_vel + pos_loss_weight * loss_pos
 
