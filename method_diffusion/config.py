@@ -30,7 +30,7 @@ def get_args_parser():
     # Hist diffusion model
     parser.add_argument("--input_dim", default=128, type=int)
     parser.add_argument("--hidden_dim", default=128, type=int)
-    parser.add_argument("--output_dim", default=6, type=int)
+    parser.add_argument("--output_dim", default=4, type=int)
     parser.add_argument("--hist_length", default=16, type=int)
     parser.add_argument("--pred_length", default=25, type=int)
     parser.add_argument("--heads", default=4, type=int)
@@ -44,7 +44,7 @@ def get_args_parser():
     parser.add_argument("--T", default=16, type=int)
 
     # Social/history encoder
-    parser.add_argument("--feature_dim", default=6, type=int)
+    parser.add_argument("--feature_dim", default=4, type=int)
     parser.add_argument("--attn_nhead", default=4, type=int)
     parser.add_argument("--attn_out", default=16, type=int)
     parser.add_argument("--encoder_input_dim", default=64, type=int)
@@ -66,16 +66,14 @@ def get_args_parser():
     parser.add_argument("--T_f", default=25, type=int)
 
     # Fut train/inference
-    parser.add_argument("--num_inference_steps", default=5, type=int)
+    parser.add_argument("--num_inference_steps", default=10, type=int)
     parser.add_argument("--ddim_eta", default=0.0, type=float)
     parser.add_argument("--x0_clip", default=5.0, type=float)
+    parser.add_argument("--num_samples", default=5, type=int)
 
     # Fut visualization
     parser.add_argument("--fut_enable_eval_vis", default=0, type=int)
     parser.add_argument("--hist_enable_train_vis", default=0, type=int)
     parser.add_argument("--hist_enable_eval_vis", default=0, type=int)
-
-    # Eval
-    parser.add_argument("--num_samples", default=5, type=int)
 
     return parser
