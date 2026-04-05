@@ -82,17 +82,11 @@ def load_checkpoint(model, resume_arg, checkpoint_dir, device):
     return model
 
 
-# 按 TAME 风格打印阶段性评估摘要。
 def print_metrics(metrics, title):
     time_pairs = [("1s", 4), ("2s", 9), ("3s", 14), ("4s", 19), ("5s", 24)]
     valid_pairs = [(label, idx) for label, idx in time_pairs if idx < len(metrics["rmse_per_step_m"])]
 
     print("\n" + "=" * 30 + f" {title} " + "=" * 30)
-    print(f"Average ADE (m): {metrics['overall_ade_m']:.6f}")
-    print(f"Average FDE (m): {metrics['overall_fde_m']:.6f}")
-    print(f"Average RMSE (m): {metrics['overall_rmse_m']:.6f}")
-    print("-" * 75)
-
     if not valid_pairs:
         print("No valid per-second horizon in current prediction length.")
         print("=" * 75)
@@ -104,8 +98,8 @@ def print_metrics(metrics, title):
         print(
             f"{label:<8} | "
             f"{metrics['rmse_per_step_m'][idx].item():<12.6f} | "
-            f"{metrics['ade_prefix_m'][idx].item():<12.6f} | "
-            f"{metrics['de_per_step_m'][idx].item():<12.6f}"
+            f"{metrics['ade_per_step_m'][idx].item():<12.6f} | "
+            f"{metrics['fde_per_step_m'][idx].item():<12.6f}"
         )
     print("=" * 75)
 
@@ -166,10 +160,11 @@ def evaluate(model, dataloader, device, feature_dim, num_samples, enable_eval_vi
 
         metrics.update(pred_fut, fut, op_mask)
         summary = metrics.summary()
+        last_idx = min(model.T, len(summary["rmse_per_step_m"])) - 1
         pbar.set_postfix({
-            "ade_m": f"{summary['overall_ade_m']:.4f}",
-            "fde_m": f"{summary['overall_fde_m']:.4f}",
-            "rmse_m": f"{summary['overall_rmse_m']:.4f}",
+            "ade_5s": f"{summary['ade_per_step_m'][last_idx]:.4f}",
+            "fde_5s": f"{summary['fde_per_step_m'][last_idx]:.4f}",
+            "rmse_5s": f"{summary['rmse_per_step_m'][last_idx]:.4f}",
         })
 
         if batch_idx % 100 == 0:

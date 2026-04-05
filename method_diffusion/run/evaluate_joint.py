@@ -178,11 +178,13 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, num_samples
 
         hist_summary = hist_metrics.summary()
         fut_summary = fut_metrics.summary()
+        last_idx = min(model_fut.T, len(fut_summary["rmse_per_step_m"])) - 1
         pbar.set_postfix({
             "hist_ade_m": f"{hist_summary['xy_ade_m']['masked']:.4f}",
             "hist_rmse_m": f"{hist_summary['xy_rmse_m']['masked']:.4f}",
-            "fut_ade_m": f"{fut_summary['overall_ade_m']:.4f}",
-            "fut_fde_m": f"{fut_summary['overall_fde_m']:.4f}",
+            "fut_ade_5s": f"{fut_summary['ade_per_step_m'][last_idx]:.4f}",
+            "fut_fde_5s": f"{fut_summary['fde_per_step_m'][last_idx]:.4f}",
+            "fut_rmse_5s": f"{fut_summary['rmse_per_step_m'][last_idx]:.4f}",
         })
 
         if batch_idx % 100 == 0:
