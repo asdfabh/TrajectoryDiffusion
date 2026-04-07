@@ -156,7 +156,7 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis):
                     meter_per_foot=METER_PER_FOOT,
                 )
         else:
-            pred_fut = model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, device)
+            pred_fut = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=1).squeeze(1)
 
         metrics.update(pred_fut, fut, op_mask)
         summary = metrics.summary()

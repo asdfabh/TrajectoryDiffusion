@@ -166,16 +166,11 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
     model.train()
     totals = {key: 0.0 for key in LOSS_STAT_KEYS}
     num_batches = 0
-    pbar = tqdm(
-        dataloader,
-        total=len(dataloader),
-        desc=f"Ep{epoch} Train",
-        dynamic_ncols=True
-    )
+    pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Train", dynamic_ncols=True)
 
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        loss, loss_parts = model.forwardTrain(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, return_components=True)
+        loss, loss_parts = model.forwardTrain(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -213,12 +208,12 @@ def evaluate(model, dataloader, device, epoch, feature_dim):
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Val", dynamic_ncols=True)
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        val_loss, val_parts = model.forwardTrain(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, return_components=True)
+        val_loss, val_parts = model.forwardTrain(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
         if int(model.fut_k) > 1:
             all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=model.fut_k)
             pred_fut, _, _ = select_minade_prediction(all_preds, fut, op_mask)
         else:
-            pred_fut = model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, device)
+            pred_fut = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=1).squeeze(1)
         eval_ade, eval_fde = compute_batch_ade_fde(pred_fut, fut, op_mask)
         eval_ade = float(eval_ade.item()) * METER_PER_FOOT
         eval_fde = float(eval_fde.item()) * METER_PER_FOOT

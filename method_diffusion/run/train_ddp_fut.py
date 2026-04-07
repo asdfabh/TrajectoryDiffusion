@@ -94,30 +94,11 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
     model.train()
     totals = {key: 0.0 for key in LOSS_STAT_KEYS}
     num_batches = 0
-    pbar = tqdm(
-        dataloader,
-        total=len(dataloader),
-        desc=f"Ep{epoch} Train",
-        ncols=120,
-        disable=not is_main_process(rank),
-    )
+    pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Train", dynamic_ncols=True, disable=not is_main_process(rank))
 
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
-            batch,
-            feature_dim,
-            device=device,
-        )
-        loss, loss_parts = model(
-            hist,
-            hist_nbrs,
-            mask,
-            temporal_mask,
-            fut,
-            op_mask,
-            device,
-            return_components=True,
-        )
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
+        loss, loss_parts = model(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
 
         optimizer.zero_grad()
         loss.backward()
@@ -158,7 +139,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
 @torch.no_grad()
 def evaluate(model, dataloader, device, epoch, feature_dim, rank):
     fut_model = model.module if hasattr(model, "module") else model
-    fut_model.eval()
+    model.eval()
 
     totals = {key: 0.0 for key in LOSS_STAT_KEYS}
     total_ade = 0.0
@@ -166,53 +147,25 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
     num_batches = 0
 
     if len(dataloader) == 0:
-        fut_model.train()
+        model.train()
         return build_zero_loss_stats(), 0.0, 0.0
 
     pbar = tqdm(
         dataloader,
         total=len(dataloader),
         desc=f"Ep{epoch} Val",
-        ncols=120,
+        dynamic_ncols=True,
         disable=not is_main_process(rank),
     )
 
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
-            batch,
-            feature_dim,
-            device=device,
-        )
-        val_loss, val_parts = fut_model.forwardTrain(
-            hist,
-            hist_nbrs,
-            mask,
-            temporal_mask,
-            fut,
-            op_mask,
-            device,
-            return_components=True,
-        )
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
+        val_loss, val_parts = fut_model.forwardTrain(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
         if int(fut_model.fut_k) > 1:
-            all_preds = fut_model.forwardEvalMulti(
-                hist,
-                hist_nbrs,
-                mask,
-                temporal_mask,
-                fut,
-                device,
-                K=fut_model.fut_k,
-            )
+            all_preds = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=fut_model.fut_k)
             pred_fut, _, _ = select_minade_prediction(all_preds, fut, op_mask)
         else:
-            pred_fut = fut_model.forwardEval(
-                hist,
-                hist_nbrs,
-                mask,
-                temporal_mask,
-                fut,
-                device,
-            )
+            pred_fut = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=1).squeeze(1)
         eval_ade, eval_fde = compute_batch_ade_fde(pred_fut, fut, op_mask)
         eval_ade = float(eval_ade.item()) * METER_PER_FOOT
         eval_fde = float(eval_fde.item()) * METER_PER_FOOT
@@ -241,7 +194,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
         dtype=torch.float64,
     )
     stats = reduce_tensor(stats)
-    fut_model.train()
+    model.train()
 
     offset = len(LOSS_STAT_KEYS)
     denom = max(int(stats[offset + 2].item()), 1)

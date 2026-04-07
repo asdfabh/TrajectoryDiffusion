@@ -59,53 +59,49 @@ class DiffusionFut(nn.Module):
         else:
             raise ValueError(f"Unsupported dataset '{self.dataset_name}' for fut normalization. Supported: highd, ngsim")
 
-    def computeLoss(self, pred_x0, target_x0, valid_mask, return_parts=False):
+    # best of K赢者通吃
+    def computeLoss(self, pred_x0, target_x0, valid_mask, bsz, k):
         loss_map = F.smooth_l1_loss(pred_x0, target_x0, reduction="none")
         valid = valid_mask.unsqueeze(-1)
         numer = (loss_map * valid).sum(dim=(1, 2))
         denom = valid.sum(dim=(1, 2)) + 1e-6
-        loss = (numer / denom).mean()
-
-        if not return_parts:
-            return loss
-
-        parts = {
-            "loss_total": loss.detach(),
-            "loss_diffusion": loss.detach(),
-            "loss_x0": loss.detach(),
-        }
-        return loss, parts
+        loss_per_traj = numer / denom
+        loss_per_traj = loss_per_traj.view(bsz, k)
+        best_loss, _ = torch.min(loss_per_traj, dim=1)
+        loss = best_loss.mean()
+        logs = {"loss_x0": loss.detach()}
+        return loss, logs
 
     # 多模态训练
-    def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, return_components=False):
+    def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
         bsz, t_len, _ = future.shape
-        valid_mask = (op_mask[..., 0] > 0.5).float().to(device)
-        target_x0 = self.norm(future)
+        valid_mask = (op_mask[..., 0] > 0.5).float().to(device)  # [B, T]
+        target_x0 = self.norm(future)  # [B, T, D]
+        # 注意：多模态方式有两个方案，一个是加噪之后，再做复制，保证起点一致，另一个是对GT做不同的加噪，然后输出结果，可能存在对比的不公平，倾向于选择小噪声的起点的结果
+        # 同一样本的 K 条候选共享同一份噪声与时间步，保证 best-of-K 对比公平。
+        noise = torch.randn_like(target_x0)  # [B, T, D]
+        timesteps = torch.randint(0, self.num_train_timesteps, (bsz,), device=device).long()  # [B]
+        x_t = self.diffusion_scheduler.add_noise(target_x0, noise, timesteps)  # [B, T, D]
 
         target_x0 = target_x0.unsqueeze(1).repeat(1, self.fut_k, 1, 1).reshape(bsz * self.fut_k, t_len, self.output_dim)
         valid_mask = valid_mask.unsqueeze(1).repeat(1, self.fut_k, 1).reshape(bsz * self.fut_k, t_len)
+        x_t = x_t.unsqueeze(1).repeat(1, self.fut_k, 1, 1).reshape(bsz * self.fut_k, t_len, self.output_dim)
+        timesteps = timesteps.unsqueeze(1).repeat(1, self.fut_k).reshape(bsz * self.fut_k)
 
-        noise = torch.randn_like(target_x0)
-        timesteps = torch.randint(0, self.num_train_timesteps, (bsz * self.fut_k,), device=device).long()
-        x_t = self.diffusion_scheduler.add_noise(target_x0, noise, timesteps)
-
-        context_tokens, _ = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
-        context_tokens = context_tokens.repeat_interleave(self.fut_k, dim=0)
+        context_tokens, _ = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask) # [B, T, D]
+        context_tokens = context_tokens.repeat_interleave(self.fut_k, dim=0) # [B*K, T, D]
 
         t_emb = self.timestep_embedder(timesteps)
         input_embedded = self.input_embedding(x_t) + self.pos_embedding(x_t)
         pred_x0 = self.dit(input_embedded, t_emb, context_tokens)
 
-        loss, loss_parts = self.computeLoss(pred_x0, target_x0, valid_mask, return_parts=True)
-        if return_components:
-            return loss, loss_parts
-        return loss
+        loss, loss_logs = self.computeLoss(pred_x0, target_x0, valid_mask, bsz, self.fut_k)
+        return loss, loss_logs
 
     @torch.no_grad()
     def forwardEvalMulti(self, hist, hist_nbrs, mask, temporal_mask, future, device, K=None):
         bsz, t_len, _ = future.shape
         k = self.fut_k if K is None else max(1, int(K))
-        future_phys = future[..., :self.output_dim]
 
         context_tokens, _ = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
         context_tokens = context_tokens.repeat_interleave(k, dim=0)
@@ -125,18 +121,13 @@ class DiffusionFut(nn.Module):
 
         pred_x0 = pred_x0.view(bsz, k, t_len, self.output_dim)
         pred_phys = self.denorm(pred_x0)
-        all_preds = future_phys.unsqueeze(1).repeat(1, k, 1, 1).clone()
+        all_preds = future.unsqueeze(1).repeat(1, k, 1, 1).clone()
         all_preds[..., :2] = pred_phys[..., :2]
         return all_preds
 
-    @torch.no_grad()
-    # 单模态推理接口，兼容旧调用链。
-    def forwardEval(self, hist, hist_nbrs, mask, temporal_mask, future, device):
-        return self.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, future, device, K=1).squeeze(1)
-
     # 统一前向入口，默认复用训练路径。
-    def forward(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, return_components=False):
-        return self.forwardTrain(hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, return_components=return_components)
+    def forward(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
+        return self.forwardTrain(hist, hist_nbrs, mask, temporal_mask, future, op_mask, device)
 
     # 归一化与反归一化，仅处理 future xy。
     def norm(self, x):

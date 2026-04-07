@@ -9,7 +9,7 @@ def get_args_parser():
     parser.add_argument("--data_root_highd", default="/mnt/datasets/highDdata", type=str)
 
     # Train runtime
-    parser.add_argument("--batch_size", default=512, type=int)
+    parser.add_argument("--batch_size", default=256, type=int)
     parser.add_argument("--num_epochs", default=30, type=int)
     parser.add_argument("--num_workers", default=10, type=int)
     parser.add_argument("--learning_rate", default=1e-4, type=float)
