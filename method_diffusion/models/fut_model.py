@@ -77,16 +77,20 @@ class DiffusionFut(nn.Module):
         bsz, t_len, _ = future.shape
         valid_mask = (op_mask[..., 0] > 0.5).float().to(device)  # [B, T]
         target_x0 = self.norm(future)  # [B, T, D]
-        # 注意：多模态方式有两个方案，一个是加噪之后，再做复制，保证起点一致，另一个是对GT做不同的加噪，然后输出结果，可能存在对比的不公平，倾向于选择小噪声的起点的结果
-        # 同一样本的 K 条候选共享同一份噪声与时间步，保证 best-of-K 对比公平。
-        noise = torch.randn_like(target_x0)  # [B, T, D]
-        timesteps = torch.randint(0, self.num_train_timesteps, (bsz,), device=device).long()  # [B]
-        x_t = self.diffusion_scheduler.add_noise(target_x0, noise, timesteps)  # [B, T, D]
+        # 对每条 GT 复制 K 份，K 个分支共享同一个扩散步 t，但各自采样独立噪声。
+        # 先以 [B, K, T, D] 直接加噪，再在进入 DiT 前折叠 K 维，保持现有主干接口不变。
+        target_x0 = target_x0.unsqueeze(1).repeat(1, self.fut_k, 1, 1)  # [B, K, T, D]
+        valid_mask = valid_mask.unsqueeze(1).repeat(1, self.fut_k, 1)  # [B, K, T]
+        noise = torch.randn_like(target_x0)  # [B, K, T, D]
+        timesteps = torch.randint(0, self.num_train_timesteps, (bsz, 1), device=device).long()  # [B, 1]
+        # add noise会将t进行压缩，然后进行广播，这里的实现是正确的
+        x_t = self.diffusion_scheduler.add_noise(target_x0, noise, timesteps)  # [B, K, T, D]
 
-        target_x0 = target_x0.unsqueeze(1).repeat(1, self.fut_k, 1, 1).reshape(bsz * self.fut_k, t_len, self.output_dim)
-        valid_mask = valid_mask.unsqueeze(1).repeat(1, self.fut_k, 1).reshape(bsz * self.fut_k, t_len)
-        x_t = x_t.unsqueeze(1).repeat(1, self.fut_k, 1, 1).reshape(bsz * self.fut_k, t_len, self.output_dim)
-        timesteps = timesteps.unsqueeze(1).repeat(1, self.fut_k).reshape(bsz * self.fut_k)
+        # 初步先将K折叠进入B维度，进行时间交互，后续考虑折叠T*D维度，进行模态交互
+        timesteps = timesteps.expand(-1, self.fut_k).reshape(bsz * self.fut_k)  # [B*K]
+        x_t = x_t.reshape(bsz * self.fut_k, t_len, self.output_dim)
+        target_x0 = target_x0.reshape(bsz * self.fut_k, t_len, self.output_dim)
+        valid_mask = valid_mask.reshape(bsz * self.fut_k, t_len)
 
         context_tokens, _ = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask) # [B, T, D]
         context_tokens = context_tokens.repeat_interleave(self.fut_k, dim=0) # [B*K, T, D]
