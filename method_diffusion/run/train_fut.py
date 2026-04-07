@@ -14,17 +14,16 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
-from method_diffusion.utils.fut_utils import compute_batch_ade_fde
+from method_diffusion.utils.fut_utils import compute_batch_ade_fde, select_minade_prediction
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
 BEST_MODEL_ADE_WEIGHT = 1.0
 BEST_MODEL_FDE_WEIGHT = 0.5
+METER_PER_FOOT = 0.3048
 LOSS_STAT_KEYS = [
     "loss",
     "loss_x0",
-    "loss_vel",
-    "loss_pos",
 ]
 
 
@@ -62,12 +61,7 @@ def load_checkpoint(args, model, optimizer, scheduler, device):
         except Exception:
             pass
         start_epoch = int(state.get("epoch", 0))
-        if "best_score" in state:
-            best_score = float(state["best_score"])
-        elif "eval_ade" in state and "eval_fde" in state:
-            best_score = compute_selection_score(state["eval_ade"], state["eval_fde"])
-        else:
-            best_score = float(state.get("best_ade", state.get("best_loss", best_score)))
+        best_score = float(state.get("best_score", best_score))
         print(f"Resumed from {ckpt_path} @ epoch {start_epoch}")
 
     return start_epoch, best_score
@@ -77,19 +71,12 @@ def write_csv_log(csv_path, epoch, train_stats, val_stats, eval_ade, eval_fde, s
     row = {
         "epoch": epoch,
         "train_loss": train_stats["loss"],
-        "train_x0_loss": train_stats["loss_x0"],
-        "train_vel_loss": train_stats["loss_vel"],
-        "train_pos_loss": train_stats["loss_pos"],
         "val_loss": val_stats["loss"],
-        "val_x0_loss": val_stats["loss_x0"],
-        "val_vel_loss": val_stats["loss_vel"],
-        "val_pos_loss": val_stats["loss_pos"],
-        "val_ade_ft": eval_ade,
-        "val_fde_ft": eval_fde,
-        "val_ade_m": eval_ade * 0.3048,
-        "val_fde_m": eval_fde * 0.3048,
-        "val_score_ft": selection_score,
+        "val_ade_m": eval_ade,
+        "val_fde_m": eval_fde,
+        "val_score_m": selection_score,
         "lr": lr,
+        "fut_k": train_stats.get("fut_k", 0),
     }
     with csv_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))
@@ -100,19 +87,12 @@ def init_csv_log(csv_path):
     fieldnames = [
         "epoch",
         "train_loss",
-        "train_x0_loss",
-        "train_vel_loss",
-        "train_pos_loss",
         "val_loss",
-        "val_x0_loss",
-        "val_vel_loss",
-        "val_pos_loss",
-        "val_ade_ft",
-        "val_fde_ft",
         "val_ade_m",
         "val_fde_m",
-        "val_score_ft",
+        "val_score_m",
         "lr",
+        "fut_k",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -127,17 +107,12 @@ def build_zero_loss_stats():
 # 将训练和验证指标统一写入 TensorBoard。
 def write_tensorboard_log(writer, epoch, train_stats, val_stats, eval_ade, eval_fde, selection_score, lr):
     writer.add_scalar("Loss/Train", train_stats["loss"], epoch)
-    writer.add_scalar("Loss/TrainX0", train_stats["loss_x0"], epoch)
-    writer.add_scalar("Loss/TrainVel", train_stats["loss_vel"], epoch)
-    writer.add_scalar("Loss/TrainPos", train_stats["loss_pos"], epoch)
     writer.add_scalar("Loss/Val", val_stats["loss"], epoch)
-    writer.add_scalar("Loss/ValX0", val_stats["loss_x0"], epoch)
-    writer.add_scalar("Loss/ValVel", val_stats["loss_vel"], epoch)
-    writer.add_scalar("Loss/ValPos", val_stats["loss_pos"], epoch)
-    writer.add_scalar("Eval/ADE_ft", eval_ade, epoch)
-    writer.add_scalar("Eval/FDE_ft", eval_fde, epoch)
-    writer.add_scalar("Eval/SelectionScore_ft", selection_score, epoch)
+    writer.add_scalar("Eval/ADE_m", eval_ade, epoch)
+    writer.add_scalar("Eval/FDE_m", eval_fde, epoch)
+    writer.add_scalar("Eval/SelectionScore_m", selection_score, epoch)
     writer.add_scalar("LR", lr, epoch)
+    writer.add_scalar("Config/FutK", train_stats.get("fut_k", 0), epoch)
 
 
 # 打印每个 epoch 的训练与验证摘要。
@@ -145,16 +120,11 @@ def print_eval_summary(epoch, total_epochs, train_stats, val_stats, eval_ade, ev
     print(
         f"Epoch {epoch}/{total_epochs} | "
         f"train={train_stats['loss']:.6f} | "
-        f"train_x0={train_stats['loss_x0']:.6f} | "
-        f"train_vel={train_stats['loss_vel']:.6f} | "
-        f"train_pos={train_stats['loss_pos']:.6f} | "
         f"val={val_stats['loss']:.6f} | "
-        f"val_x0={val_stats['loss_x0']:.6f} | "
-        f"val_vel={val_stats['loss_vel']:.6f} | "
-        f"val_pos={val_stats['loss_pos']:.6f} | "
-        f"ade={eval_ade:.4f}ft | "
-        f"fde={eval_fde:.4f}ft | "
-        f"score={selection_score:.4f}"
+        f"ade_m={eval_ade:.4f} | "
+        f"fde_m={eval_fde:.4f} | "
+        f"score_m={selection_score:.4f} | "
+        f"k={int(train_stats.get('fut_k', 0))}"
     )
 
 # 整理 batch 数据并按特征维度拼接模型输入。
@@ -220,13 +190,12 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
         pbar.set_postfix({
             "loss": f"{loss.item():.6f}",
             "avg_loss": f"{(totals['loss'] / num_batches):.6f}",
-            "x0": f"{(totals['loss_x0'] / num_batches):.6f}",
-            "vel": f"{(totals['loss_vel'] / num_batches):.6f}",
-            "pos": f"{(totals['loss_pos'] / num_batches):.6f}",
         })
 
     denom = max(num_batches, 1)
-    return {key: totals[key] / denom for key in LOSS_STAT_KEYS}
+    stats = {key: totals[key] / denom for key in LOSS_STAT_KEYS}
+    stats["fut_k"] = int(getattr(model, "fut_k", 0))
+    return stats
 
 @torch.no_grad()
 # 使用完整验证集评估模型并返回平均指标。
@@ -245,24 +214,27 @@ def evaluate(model, dataloader, device, epoch, feature_dim):
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
         val_loss, val_parts = model.forwardTrain(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, return_components=True)
-        pred_fut = model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, device)
+        if int(model.fut_k) > 1:
+            all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=model.fut_k)
+            pred_fut, _, _ = select_minade_prediction(all_preds, fut, op_mask)
+        else:
+            pred_fut = model.forwardEval(hist, hist_nbrs, mask, temporal_mask, fut, device)
         eval_ade, eval_fde = compute_batch_ade_fde(pred_fut, fut, op_mask)
+        eval_ade = float(eval_ade.item()) * METER_PER_FOOT
+        eval_fde = float(eval_fde.item()) * METER_PER_FOOT
 
         totals["loss"] += float(val_loss.item())
         for key in LOSS_STAT_KEYS:
             if key == "loss":
                 continue
             totals[key] += float(val_parts[key].item())
-        total_ade += float(eval_ade.item())
-        total_fde += float(eval_fde.item())
+        total_ade += eval_ade
+        total_fde += eval_fde
         num_batches += 1
         pbar.set_postfix({
             "val_loss": f"{(totals['loss'] / num_batches):.6f}",
-            "val_x0": f"{(totals['loss_x0'] / num_batches):.6f}",
-            "val_vel": f"{(totals['loss_vel'] / num_batches):.6f}",
-            "val_pos": f"{(totals['loss_pos'] / num_batches):.6f}",
-            "avg_ade_ft": f"{(total_ade / num_batches):.4f}",
-            "avg_fde_ft": f"{(total_fde / num_batches):.4f}",
+            "avg_ade_m": f"{(total_ade / num_batches):.4f}",
+            "avg_fde_m": f"{(total_fde / num_batches):.4f}",
         })
 
     model.train()
@@ -271,6 +243,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim):
 
     denom = float(num_batches)
     val_stats = {key: totals[key] / denom for key in LOSS_STAT_KEYS}
+    val_stats["fut_k"] = int(getattr(model, "fut_k", 0))
     return val_stats, total_ade / denom, total_fde / denom
 
 
@@ -344,8 +317,8 @@ def main():
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "loss": train_stats["loss"],
-            "eval_ade": eval_ade,
-            "eval_fde": eval_fde,
+            "eval_ade_m": eval_ade,
+            "eval_fde_m": eval_fde,
             "selection_score": selection_score,
             "best_score": best_score,
         }

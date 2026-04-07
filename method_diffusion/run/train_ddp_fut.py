@@ -18,6 +18,7 @@ from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.run.train_fut import (
     FUT_CHECKPOINT_DIR,
     LOSS_STAT_KEYS,
+    METER_PER_FOOT,
     build_zero_loss_stats,
     compute_selection_score,
     init_csv_log,
@@ -27,7 +28,7 @@ from method_diffusion.run.train_fut import (
     write_csv_log,
     write_tensorboard_log,
 )
-from method_diffusion.utils.fut_utils import compute_batch_ade_fde
+from method_diffusion.utils.fut_utils import compute_batch_ade_fde, select_minade_prediction
 
 
 def setup_ddp():
@@ -135,7 +136,6 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
                 {
                     "loss": f"{loss.item():.6f}",
                     "avg_loss": f"{(totals['loss'] / num_batches):.6f}",
-                    "x0": f"{(totals['loss_x0'] / num_batches):.6f}",
                 }
             )
 
@@ -147,10 +147,12 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
     stats = reduce_tensor(stats)
     denom = max(int(stats[len(LOSS_STAT_KEYS)].item()), 1)
 
-    return {
+    stats_dict = {
         key: float(stats[idx].item()) / denom
         for idx, key in enumerate(LOSS_STAT_KEYS)
     }
+    stats_dict["fut_k"] = int(getattr(model.module if hasattr(model, "module") else model, "fut_k", 0))
+    return stats_dict
 
 
 @torch.no_grad()
@@ -191,32 +193,45 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
             device,
             return_components=True,
         )
-        pred_fut = fut_model.forwardEval(
-            hist,
-            hist_nbrs,
-            mask,
-            temporal_mask,
-            fut,
-            device,
-        )
+        if int(fut_model.fut_k) > 1:
+            all_preds = fut_model.forwardEvalMulti(
+                hist,
+                hist_nbrs,
+                mask,
+                temporal_mask,
+                fut,
+                device,
+                K=fut_model.fut_k,
+            )
+            pred_fut, _, _ = select_minade_prediction(all_preds, fut, op_mask)
+        else:
+            pred_fut = fut_model.forwardEval(
+                hist,
+                hist_nbrs,
+                mask,
+                temporal_mask,
+                fut,
+                device,
+            )
         eval_ade, eval_fde = compute_batch_ade_fde(pred_fut, fut, op_mask)
+        eval_ade = float(eval_ade.item()) * METER_PER_FOOT
+        eval_fde = float(eval_fde.item()) * METER_PER_FOOT
 
         totals["loss"] += float(val_loss.item())
         for key in LOSS_STAT_KEYS:
             if key == "loss":
                 continue
             totals[key] += float(val_parts[key].item())
-        total_ade += float(eval_ade.item())
-        total_fde += float(eval_fde.item())
+        total_ade += eval_ade
+        total_fde += eval_fde
         num_batches += 1
 
         if is_main_process(rank):
             pbar.set_postfix(
                 {
                     "val_loss": f"{(totals['loss'] / num_batches):.6f}",
-                    "val_x0": f"{(totals['loss_x0'] / num_batches):.6f}",
-                    "avg_ade_ft": f"{(total_ade / num_batches):.4f}",
-                    "avg_fde_ft": f"{(total_fde / num_batches):.4f}",
+                    "avg_ade_m": f"{(total_ade / num_batches):.4f}",
+                    "avg_fde_m": f"{(total_fde / num_batches):.4f}",
                 }
             )
 
@@ -234,6 +249,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
         key: float(stats[idx].item()) / denom
         for idx, key in enumerate(LOSS_STAT_KEYS)
     }
+    val_stats["fut_k"] = int(getattr(fut_model, "fut_k", 0))
     return val_stats, float(stats[offset].item()) / denom, float(stats[offset + 1].item()) / denom
 
 
@@ -344,8 +360,8 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "loss": train_stats["loss"],
-                "eval_ade": eval_ade,
-                "eval_fde": eval_fde,
+                "eval_ade_m": eval_ade,
+                "eval_fde_m": eval_fde,
                 "selection_score": selection_score,
                 "best_score": best_score,
             }

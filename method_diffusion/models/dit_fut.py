@@ -39,19 +39,6 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
 
-
-class SplitConditionModulator(nn.Module):
-    def __init__(self, hidden_size, output_size):
-        super().__init__()
-        self.time_mod = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, output_size, bias=True),
-        )
-
-    def forward(self, t_cond):
-        return self.time_mod(t_cond)
-
-
 class DiTBlock(nn.Module):
 
     def __init__(self, dim=128, heads=4, dropout=0.1, mlp_ratio=4.0):
@@ -62,7 +49,10 @@ class DiTBlock(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp1 = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
-        self.adaLN_modulation = SplitConditionModulator(dim, 6 * dim)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 6 * dim, bias=True)
+        )
         self.norm3 = nn.LayerNorm(dim)
         self.cross_attn = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
         self.norm4 = nn.LayerNorm(dim)
@@ -99,7 +89,10 @@ class FinalLayer(nn.Module):
             nn.Linear(hidden_size * 4, output_dim, bias=True)
         )
 
-        self.adaLN_modulation = SplitConditionModulator(hidden_size, 2 * hidden_size)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+        )
 
     def forward(self, x, t_cond):
         shift, scale = self.adaLN_modulation(t_cond).chunk(2, dim=1)
@@ -111,16 +104,8 @@ class FinalLayer(nn.Module):
 class DiT(nn.Module):
     def __init__(self, dit_block, final_layer, depth, model_type="x_start"):
         super().__init__()
-
-        assert model_type in ["score", "x_start"], f"Unknown model type: {model_type}"
-        self._model_type = model_type
-
         self.blocks = nn.ModuleList([copy.deepcopy(dit_block) for _ in range(depth)])
         self.final_layer = final_layer
-
-    @property
-    def model_type(self):
-        return self._model_type
 
     def forward(self, x, t_cond, cross):
         for block in self.blocks:

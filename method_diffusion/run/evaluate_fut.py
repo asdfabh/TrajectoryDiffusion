@@ -130,10 +130,10 @@ def build_test_loader(args):
 
 # 执行 TestSet 评估并打印周期性与最终指标。
 @torch.no_grad()
-def evaluate(model, dataloader, device, feature_dim, num_samples, enable_eval_vis):
+def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis):
     model.eval()
     metrics = TrajectoryMetrics(model.T)
-    k_samples = max(1, int(num_samples))
+    k_samples = max(1, int(fut_k))
     eval_name = f"Fut minADE@{k_samples}" if k_samples > 1 else "Fut single-mode"
 
     pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc=eval_name, ncols=120)
@@ -183,12 +183,12 @@ def main():
 
     print(f"[FutEval] Device: {device}")
     print(f"[FutEval] Checkpoint dir: {args.checkpoint_dir}")
-    print(f"[FutEval] num_samples={args.num_samples}, num_inference_steps={args.num_inference_steps}")
+    print(f"[FutEval] fut_k={args.fut_k}, num_inference_steps={args.num_inference_steps}")
 
     test_loader = build_test_loader(args)
     model = DiffusionFut(args).to(device)
     load_checkpoint(model, args.resume_fut, args.checkpoint_dir, device)
-    evaluate(model, test_loader, device, args.feature_dim, args.num_samples, enable_eval_vis=int(args.fut_enable_eval_vis) > 0)
+    evaluate(model, test_loader, device, args.feature_dim, args.fut_k, enable_eval_vis=int(args.fut_enable_eval_vis) > 0)
 
 
 if __name__ == "__main__":

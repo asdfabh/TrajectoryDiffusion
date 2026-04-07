@@ -67,9 +67,7 @@ def get_args_parser():
 
     # Fut train/inference
     parser.add_argument("--num_inference_steps", default=10, type=int)
-    parser.add_argument("--ddim_eta", default=0.0, type=float)
-    parser.add_argument("--x0_clip", default=5.0, type=float)
-    parser.add_argument("--num_samples", default=5, type=int)
+    parser.add_argument("--fut_k", default=6, type=int)
 
     # Fut visualization
     parser.add_argument("--fut_enable_eval_vis", default=0, type=int)
