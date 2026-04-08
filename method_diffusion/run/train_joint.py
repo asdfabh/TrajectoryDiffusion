@@ -15,7 +15,7 @@ from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.models.hist_model import DiffusionPast
-from method_diffusion.utils.fut_utils import compute_batch_ade_fde
+from method_diffusion.utils.fut_utils import compute_batch_ade_fde, select_minade_prediction
 from method_diffusion.utils.mask_util import mixed_mask
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -23,6 +23,7 @@ HIST_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "hist"
 JOINT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "joint"
 JOINT_FUT_CHECKPOINT_DIR = JOINT_CHECKPOINT_DIR / "fut"
 JOINT_HIST_CHECKPOINT_DIR = JOINT_CHECKPOINT_DIR / "hist"
+METER_PER_FOOT = 0.3048
 
 
 def prepare_input_data(batch, feature_dim, device="cuda"):
@@ -171,13 +172,11 @@ def init_csv_log(csv_path):
         "train_hist_loss",
         "train_hist_loss_weighted",
         "train_fut_loss",
-        "train_fut_x0_loss",
-        "val_ade_ft",
-        "val_fde_ft",
         "val_ade_m",
         "val_fde_m",
         "lr_fut",
         "lr_hist",
+        "fut_k",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -191,13 +190,11 @@ def write_csv_log(csv_path, epoch, train_stats, eval_ade, eval_fde, lr_fut, lr_h
         "train_hist_loss": train_stats["loss_hist"],
         "train_hist_loss_weighted": train_stats["loss_hist_weighted"],
         "train_fut_loss": train_stats["loss_fut"],
-        "train_fut_x0_loss": train_stats["loss_x0"],
-        "val_ade_ft": eval_ade,
-        "val_fde_ft": eval_fde,
-        "val_ade_m": eval_ade * 0.3048,
-        "val_fde_m": eval_fde * 0.3048,
+        "val_ade_m": eval_ade,
+        "val_fde_m": eval_fde,
         "lr_fut": lr_fut,
         "lr_hist": lr_hist,
+        "fut_k": train_stats.get("fut_k", 0),
     }
     with csv_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))
@@ -283,7 +280,6 @@ def train_epoch(
             fut,
             op_mask,
             device,
-            return_components=True,
         )
 
         loss_hist_weighted = hist_loss_weight * loss_hist
@@ -309,7 +305,6 @@ def train_epoch(
             "avg": f"{(total_loss / num_batches):.6f}",
             "hist": f"{(total_hist_loss / num_batches):.6f}",
             "fut": f"{(total_fut_loss / num_batches):.6f}",
-            "x0": f"{(total_x0_loss / num_batches):.6f}",
         })
 
     denom = max(num_batches, 1)
@@ -319,6 +314,7 @@ def train_epoch(
         "loss_hist_weighted": total_hist_loss_weighted / denom,
         "loss_fut": total_fut_loss / denom,
         "loss_x0": total_x0_loss / denom,
+        "fut_k": int(getattr(model_fut, "fut_k", 0)),
     }
 
 
@@ -353,22 +349,37 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, mask
             freeze_hist=True,
             detach_hist_for_fut=True,
         )
-        pred_fut = model_fut.forwardEval(
-            hist_for_fut,
-            hist_nbrs,
-            mask,
-            temporal_mask,
-            fut,
-            device,
-        )
+        if int(model_fut.fut_k) > 1:
+            all_preds = model_fut.forwardEvalMulti(
+                hist_for_fut,
+                hist_nbrs,
+                mask,
+                temporal_mask,
+                fut,
+                device,
+                K=model_fut.fut_k,
+            )
+            pred_fut, _, _ = select_minade_prediction(all_preds, fut, op_mask)
+        else:
+            pred_fut = model_fut.forwardEvalMulti(
+                hist_for_fut,
+                hist_nbrs,
+                mask,
+                temporal_mask,
+                fut,
+                device,
+                K=1,
+            ).squeeze(1)
         eval_ade, eval_fde = compute_batch_ade_fde(pred_fut, fut, op_mask)
+        eval_ade = float(eval_ade.item()) * METER_PER_FOOT
+        eval_fde = float(eval_fde.item()) * METER_PER_FOOT
 
-        total_ade += float(eval_ade.item())
-        total_fde += float(eval_fde.item())
+        total_ade += eval_ade
+        total_fde += eval_fde
         num_batches += 1
         pbar.set_postfix({
-            "avg_ade_ft": f"{(total_ade / num_batches):.4f}",
-            "avg_fde_ft": f"{(total_fde / num_batches):.4f}",
+            "avg_ade_m": f"{(total_ade / num_batches):.4f}",
+            "avg_fde_m": f"{(total_fde / num_batches):.4f}",
         })
 
     model_fut.train()
@@ -501,17 +512,18 @@ def main():
         writer.add_scalar("Loss/TrainHist", train_stats["loss_hist"], epoch + 1)
         writer.add_scalar("Loss/TrainHistWeighted", train_stats["loss_hist_weighted"], epoch + 1)
         writer.add_scalar("Loss/TrainFut", train_stats["loss_fut"], epoch + 1)
-        writer.add_scalar("Loss/TrainX0", train_stats["loss_x0"], epoch + 1)
-        writer.add_scalar("Eval/ADE_ft", eval_ade, epoch + 1)
-        writer.add_scalar("Eval/FDE_ft", eval_fde, epoch + 1)
+        writer.add_scalar("Eval/ADE_m", eval_ade, epoch + 1)
+        writer.add_scalar("Eval/FDE_m", eval_fde, epoch + 1)
+        writer.add_scalar("Config/FutK", train_stats.get("fut_k", 0), epoch + 1)
 
         print(
             f"Epoch {epoch + 1}/{args.num_epochs} | "
             f"train={train_stats['loss']:.6f} | "
             f"hist={train_stats['loss_hist']:.6f} | "
             f"fut={train_stats['loss_fut']:.6f} | "
-            f"ade={eval_ade:.4f}ft | "
-            f"fde={eval_fde:.4f}ft"
+            f"ade_m={eval_ade:.4f} | "
+            f"fde_m={eval_fde:.4f} | "
+            f"k={int(train_stats.get('fut_k', 0))}"
         )
 
         scheduler.step()
@@ -525,8 +537,8 @@ def main():
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "loss": train_stats["loss"],
-            "eval_ade": eval_ade,
-            "eval_fde": eval_fde,
+            "eval_ade_m": eval_ade,
+            "eval_fde_m": eval_fde,
             "best_ade": best_ade,
             "joint_freeze_hist": int(freeze_hist),
             "joint_hist_loss_weight": hist_loss_weight,

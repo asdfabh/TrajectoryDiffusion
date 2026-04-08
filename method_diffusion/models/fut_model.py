@@ -92,7 +92,7 @@ class DiffusionFut(nn.Module):
         target_x0 = target_x0.reshape(bsz * self.fut_k, t_len, self.output_dim)
         valid_mask = valid_mask.reshape(bsz * self.fut_k, t_len)
 
-        context_tokens, _ = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask) # [B, T, D]
+        context_tokens = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
         context_tokens = context_tokens.repeat_interleave(self.fut_k, dim=0) # [B*K, T, D]
 
         t_emb = self.timestep_embedder(timesteps)
@@ -107,7 +107,7 @@ class DiffusionFut(nn.Module):
         bsz, t_len, _ = future.shape
         k = self.fut_k if K is None else max(1, int(K))
 
-        context_tokens, _ = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
+        context_tokens = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
         context_tokens = context_tokens.repeat_interleave(k, dim=0)
 
         infer_scheduler = DDIMScheduler.from_config(self.diffusion_scheduler.config)

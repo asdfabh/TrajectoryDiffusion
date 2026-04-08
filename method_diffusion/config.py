@@ -44,7 +44,7 @@ def get_args_parser():
     parser.add_argument("--T", default=16, type=int)
 
     # Social/history encoder
-    parser.add_argument("--feature_dim", default=4, type=int)
+    parser.add_argument("--feature_dim", default=6, type=int)
     parser.add_argument("--attn_nhead", default=4, type=int)
     parser.add_argument("--attn_out", default=16, type=int)
     parser.add_argument("--encoder_input_dim", default=64, type=int)
