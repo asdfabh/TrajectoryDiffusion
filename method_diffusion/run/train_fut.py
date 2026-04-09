@@ -21,10 +21,7 @@ FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
 BEST_MODEL_ADE_WEIGHT = 1.0
 BEST_MODEL_FDE_WEIGHT = 0.5
 METER_PER_FOOT = 0.3048
-LOSS_STAT_KEYS = [
-    "loss",
-    "loss_x0",
-]
+LOSS_STAT_KEYS = ["loss"]
 
 
 def compute_selection_score(eval_ade, eval_fde):
@@ -42,10 +39,10 @@ def resolve_resume_checkpoint(resume_arg, checkpoint_dir):
     return None
 
 # 按需恢复训练状态并返回起始 epoch 与最佳联合分数。
-def load_checkpoint(args, model, optimizer, scheduler, device):
+def load_checkpoint(resume_arg, checkpoint_dir, model, optimizer, scheduler, device):
     start_epoch = 0
     best_score = float("inf")
-    ckpt_path = resolve_resume_checkpoint(args.resume_fut, Path(args.checkpoint_dir))
+    ckpt_path = resolve_resume_checkpoint(resume_arg, Path(checkpoint_dir))
 
     if ckpt_path is not None:
         if not ckpt_path.exists():
@@ -67,16 +64,14 @@ def load_checkpoint(args, model, optimizer, scheduler, device):
     return start_epoch, best_score
 
 # 将单个 epoch 的训练和验证结果追加写入 CSV。
-def write_csv_log(csv_path, epoch, train_stats, val_stats, eval_ade, eval_fde, selection_score, lr):
+def write_csv_log(csv_path, epoch, train_stats, eval_ade, eval_fde, selection_score, lr):
     row = {
         "epoch": epoch,
         "train_loss": train_stats["loss"],
-        "val_loss": val_stats["loss"],
         "val_ade_m": eval_ade,
         "val_fde_m": eval_fde,
         "val_score_m": selection_score,
         "lr": lr,
-        "fut_k": train_stats.get("fut_k", 0),
     }
     with csv_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))
@@ -87,44 +82,33 @@ def init_csv_log(csv_path):
     fieldnames = [
         "epoch",
         "train_loss",
-        "val_loss",
         "val_ade_m",
         "val_fde_m",
         "val_score_m",
         "lr",
-        "fut_k",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
 
-# 返回统一格式的空损失统计。
-def build_zero_loss_stats():
-    return {key: 0.0 for key in LOSS_STAT_KEYS}
-
-
 # 将训练和验证指标统一写入 TensorBoard。
-def write_tensorboard_log(writer, epoch, train_stats, val_stats, eval_ade, eval_fde, selection_score, lr):
+def write_tensorboard_log(writer, epoch, train_stats, eval_ade, eval_fde, selection_score, lr):
     writer.add_scalar("Loss/Train", train_stats["loss"], epoch)
-    writer.add_scalar("Loss/Val", val_stats["loss"], epoch)
     writer.add_scalar("Eval/ADE_m", eval_ade, epoch)
     writer.add_scalar("Eval/FDE_m", eval_fde, epoch)
     writer.add_scalar("Eval/SelectionScore_m", selection_score, epoch)
     writer.add_scalar("LR", lr, epoch)
-    writer.add_scalar("Config/FutK", train_stats.get("fut_k", 0), epoch)
 
 
 # 打印每个 epoch 的训练与验证摘要。
-def print_eval_summary(epoch, total_epochs, train_stats, val_stats, eval_ade, eval_fde, selection_score):
+def print_eval_summary(epoch, total_epochs, train_stats, eval_ade, eval_fde, selection_score):
     print(
         f"Epoch {epoch}/{total_epochs} | "
         f"train={train_stats['loss']:.6f} | "
-        f"val={val_stats['loss']:.6f} | "
         f"ade_m={eval_ade:.4f} | "
         f"fde_m={eval_fde:.4f} | "
-        f"score_m={selection_score:.4f} | "
-        f"k={int(train_stats.get('fut_k', 0))}"
+        f"score_m={selection_score:.4f}"
     )
 
 # 整理 batch 数据并按特征维度拼接模型输入。
@@ -164,51 +148,43 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
 # 执行单个训练 epoch 并汇总平均损失。
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
     model.train()
-    totals = {key: 0.0 for key in LOSS_STAT_KEYS}
+    total_loss = 0.0
     num_batches = 0
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Train", dynamic_ncols=True)
 
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        loss, loss_parts = model.forwardTrain(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+        loss, _ = model.forwardTrain(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        totals["loss"] += float(loss.item())
-        for key in LOSS_STAT_KEYS:
-            if key == "loss":
-                continue
-            totals[key] += float(loss_parts[key].item())
+        total_loss += float(loss.item())
         num_batches += 1
         pbar.set_postfix({
             "loss": f"{loss.item():.6f}",
-            "avg_loss": f"{(totals['loss'] / num_batches):.6f}",
+            "avg_loss": f"{(total_loss / num_batches):.6f}",
         })
 
     denom = max(num_batches, 1)
-    stats = {key: totals[key] / denom for key in LOSS_STAT_KEYS}
-    stats["fut_k"] = int(getattr(model, "fut_k", 0))
-    return stats
+    return {"loss": total_loss / denom}
 
 @torch.no_grad()
 # 使用完整验证集评估模型并返回平均指标。
 def evaluate(model, dataloader, device, epoch, feature_dim):
     model.eval()
-    totals = {key: 0.0 for key in LOSS_STAT_KEYS}
     total_ade = 0.0
     total_fde = 0.0
     num_batches = 0
 
     if len(dataloader) == 0:
         model.train()
-        return build_zero_loss_stats(), 0.0, 0.0
+        return 0.0, 0.0
 
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Val", dynamic_ncols=True)
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        val_loss, val_parts = model.forwardTrain(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
         if int(model.fut_k) > 1:
             all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=model.fut_k)
             pred_fut, _, _ = select_minade_prediction(all_preds, fut, op_mask)
@@ -218,36 +194,28 @@ def evaluate(model, dataloader, device, epoch, feature_dim):
         eval_ade = float(eval_ade.item()) * METER_PER_FOOT
         eval_fde = float(eval_fde.item()) * METER_PER_FOOT
 
-        totals["loss"] += float(val_loss.item())
-        for key in LOSS_STAT_KEYS:
-            if key == "loss":
-                continue
-            totals[key] += float(val_parts[key].item())
         total_ade += eval_ade
         total_fde += eval_fde
         num_batches += 1
         pbar.set_postfix({
-            "val_loss": f"{(totals['loss'] / num_batches):.6f}",
             "avg_ade_m": f"{(total_ade / num_batches):.4f}",
             "avg_fde_m": f"{(total_fde / num_batches):.4f}",
         })
 
     model.train()
     if num_batches == 0:
-        return build_zero_loss_stats(), 0.0, 0.0
+        return 0.0, 0.0
 
     denom = float(num_batches)
-    val_stats = {key: totals[key] / denom for key in LOSS_STAT_KEYS}
-    val_stats["fut_k"] = int(getattr(model, "fut_k", 0))
-    return val_stats, total_ade / denom, total_fde / denom
+    return total_ade / denom, total_fde / denom
 
 
 # 初始化训练组件并执行 fut 训练主流程。
 def main():
     args = get_args_parser().parse_args()
-    args.checkpoint_dir = str(FUT_CHECKPOINT_DIR)
-    Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-    tensorboard_log_dir = Path(args.checkpoint_dir) / "log"
+    checkpoint_dir = FUT_CHECKPOINT_DIR
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    tensorboard_log_dir = checkpoint_dir / "log"
     tensorboard_log_dir.mkdir(parents=True, exist_ok=True)
     log_csv_path = tensorboard_log_dir / "train_log.csv"
     init_csv_log(log_csv_path)
@@ -290,16 +258,16 @@ def main():
     model = DiffusionFut(args).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
-    start_epoch, best_score = load_checkpoint(args, model, optimizer, scheduler, device)
+    start_epoch, best_score = load_checkpoint(args.resume_fut, checkpoint_dir, model, optimizer, scheduler, device)
 
     for epoch in range(start_epoch, args.num_epochs):
         train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim)
-        val_stats, eval_ade, eval_fde = evaluate(model, val_loader, device, epoch + 1, args.feature_dim)
+        eval_ade, eval_fde = evaluate(model, val_loader, device, epoch + 1, args.feature_dim)
         selection_score = compute_selection_score(eval_ade, eval_fde)
         current_lr = optimizer.param_groups[0]["lr"]
-        write_csv_log(log_csv_path, epoch + 1, train_stats, val_stats, eval_ade, eval_fde, selection_score, current_lr)
-        write_tensorboard_log(writer, epoch + 1, train_stats, val_stats, eval_ade, eval_fde, selection_score, current_lr)
-        print_eval_summary(epoch + 1, args.num_epochs, train_stats, val_stats, eval_ade, eval_fde, selection_score)
+        write_csv_log(log_csv_path, epoch + 1, train_stats, eval_ade, eval_fde, selection_score, current_lr)
+        write_tensorboard_log(writer, epoch + 1, train_stats, eval_ade, eval_fde, selection_score, current_lr)
+        print_eval_summary(epoch + 1, args.num_epochs, train_stats, eval_ade, eval_fde, selection_score)
 
         scheduler.step()
         is_best = selection_score < best_score
@@ -319,9 +287,9 @@ def main():
         }
 
         if (epoch + 1) % args.save_interval == 0:
-            torch.save(state, Path(args.checkpoint_dir) / f"epoch_{epoch + 1}.pth")
+            torch.save(state, checkpoint_dir / f"epoch_{epoch + 1}.pth")
         if is_best:
-            torch.save(state, Path(args.checkpoint_dir) / "best.pth")
+            torch.save(state, checkpoint_dir / "best.pth")
 
     writer.close()
 

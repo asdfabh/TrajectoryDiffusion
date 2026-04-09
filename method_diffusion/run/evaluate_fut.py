@@ -12,47 +12,13 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
+from method_diffusion.run.train_fut import prepare_input_data
 from method_diffusion.utils.fut_utils import TrajectoryMetrics, normalize_traj_valid_mask, select_minade_prediction
 from method_diffusion.utils.visualization import maybe_visualize_future_prediction
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
 METER_PER_FOOT = 0.3048
-
-
-# 整理 batch 数据并按特征维度拼接评估输入。
-def prepare_input_data(batch, feature_dim, device="cuda"):
-    hist = batch["hist"]
-    va = batch["va"]
-    lane = batch["lane"]
-    cclass = batch["cclass"]
-    fut = batch["fut"]
-    op_mask = batch["op_mask"]
-    hist_nbrs = batch["nbrs"]
-    va_nbrs = batch["nbrs_va"]
-    lane_nbrs = batch["nbrs_lane"]
-    cclass_nbrs = batch["nbrs_class"]
-    mask = batch["mask"]
-    temporal_mask = batch["temporal_mask"]
-
-    if feature_dim == 6:
-        hist = torch.cat((hist, va, lane, cclass), dim=-1).to(device)
-        hist_nbrs = torch.cat((hist_nbrs, va_nbrs, lane_nbrs, cclass_nbrs), dim=-1).to(device)
-    elif feature_dim == 5:
-        hist = torch.cat((hist, va, lane), dim=-1).to(device)
-        hist_nbrs = torch.cat((hist_nbrs, va_nbrs, lane_nbrs), dim=-1).to(device)
-    elif feature_dim == 4:
-        hist = torch.cat((hist, va), dim=-1).to(device)
-        hist_nbrs = torch.cat((hist_nbrs, va_nbrs), dim=-1).to(device)
-    else:
-        hist = hist.to(device)
-        hist_nbrs = hist_nbrs.to(device)
-
-    fut = fut.to(device)
-    op_mask = op_mask.to(device)
-    mask = mask.to(device)
-    temporal_mask = temporal_mask.to(device)
-    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
 
 
 # 解析 fut checkpoint 标识并返回实际文件路径。

@@ -15,6 +15,7 @@ from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.models.hist_model import DiffusionPast
+from method_diffusion.run.train_fut import prepare_input_data
 from method_diffusion.utils.fut_utils import compute_batch_ade_fde, select_minade_prediction
 from method_diffusion.utils.mask_util import mixed_mask
 
@@ -24,41 +25,6 @@ JOINT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "joint"
 JOINT_FUT_CHECKPOINT_DIR = JOINT_CHECKPOINT_DIR / "fut"
 JOINT_HIST_CHECKPOINT_DIR = JOINT_CHECKPOINT_DIR / "hist"
 METER_PER_FOOT = 0.3048
-
-
-def prepare_input_data(batch, feature_dim, device="cuda"):
-    hist = batch["hist"]
-    va = batch["va"]
-    lane = batch["lane"]
-    cclass = batch["cclass"]
-    fut = batch["fut"]
-    op_mask = batch["op_mask"]
-    hist_nbrs = batch["nbrs"]
-    va_nbrs = batch["nbrs_va"]
-    lane_nbrs = batch["nbrs_lane"]
-    cclass_nbrs = batch["nbrs_class"]
-    mask = batch["mask"]
-    temporal_mask = batch["temporal_mask"]
-
-    if feature_dim == 6:
-        hist = torch.cat((hist, va, lane, cclass), dim=-1).to(device)
-        hist_nbrs = torch.cat((hist_nbrs, va_nbrs, lane_nbrs, cclass_nbrs), dim=-1).to(device)
-    elif feature_dim == 5:
-        hist = torch.cat((hist, va, lane), dim=-1).to(device)
-        hist_nbrs = torch.cat((hist_nbrs, va_nbrs, lane_nbrs), dim=-1).to(device)
-    elif feature_dim == 4:
-        hist = torch.cat((hist, va), dim=-1).to(device)
-        hist_nbrs = torch.cat((hist_nbrs, va_nbrs), dim=-1).to(device)
-    else:
-        hist = hist.to(device)
-        hist_nbrs = hist_nbrs.to(device)
-
-    fut = fut.to(device)
-    op_mask = op_mask.to(device)
-    mask = mask.to(device)
-    temporal_mask = temporal_mask.to(device)
-    return hist, hist_nbrs, mask, temporal_mask, fut, op_mask
-
 
 def build_hist_masked(hist, mask_ratio, random_mask_ratio, block_mask_start):
     hist_mask = mixed_mask(

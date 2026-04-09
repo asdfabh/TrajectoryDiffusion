@@ -16,6 +16,7 @@ from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.models.hist_model import DiffusionPast
+from method_diffusion.run.train_fut import prepare_input_data
 from method_diffusion.run.train_joint import (
     HIST_CHECKPOINT_DIR,
     JOINT_FUT_CHECKPOINT_DIR,
@@ -25,7 +26,6 @@ from method_diffusion.run.train_joint import (
     init_csv_log,
     load_fut_checkpoint,
     load_hist_checkpoint,
-    prepare_input_data,
     write_csv_log,
 )
 from method_diffusion.utils.fut_utils import compute_batch_ade_fde, select_minade_prediction

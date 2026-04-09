@@ -33,50 +33,6 @@ def build_hist_mask(hist, mask_ratio=0.4, random_mask_ratio=0.7, block_mask_star
         block_start=block_mask_start,
     )
 
-
-def prepare_fut_batch(
-    batch,
-    feature_dim,
-    device="cuda",
-    include_hist_mask=False,
-    mask_ratio=0.4,
-    random_mask_ratio=0.7,
-    block_mask_start=False,
-):
-    """整理 future 分支所需的 batch 字段。"""
-    if int(feature_dim) != 4:
-        raise ValueError("future 分支当前仅支持 feature_dim=4: [rel_x, rel_y, v, a]。")
-
-    hist = torch.cat((batch["hist"], batch["va"]), dim=-1).to(device)
-    hist_nbrs = torch.cat((batch["nbrs"], batch["nbrs_va"]), dim=-1).to(device)
-
-    prepared = {
-        "hist": hist,
-        "hist_nbrs": hist_nbrs,
-        "fut": batch["fut"].to(device),
-        "op_mask": batch["op_mask"].to(device),
-        "mask": batch["mask"].to(device),
-        "temporal_mask": batch["temporal_mask"].to(device),
-        "extras": {
-            "ego_lane": batch["lane"].to(device),
-            "nbr_lane": batch["nbrs_lane"].to(device),
-        },
-    }
-
-    if include_hist_mask:
-        hist_mask = build_hist_mask(
-            hist,
-            mask_ratio=mask_ratio,
-            random_mask_ratio=random_mask_ratio,
-            block_mask_start=block_mask_start,
-        ).to(device)
-        hist_masked = torch.cat((hist_mask * hist, hist_mask), dim=-1).to(device)
-        prepared["hist_mask"] = hist_mask
-        prepared["hist_masked"] = hist_masked
-
-    return prepared
-
-
 def normalize_traj_valid_mask(valid_mask, pred):
     """将不同形状的 future 有效位掩码统一成 `[B, T]` 浮点张量。"""
     if valid_mask is None:
