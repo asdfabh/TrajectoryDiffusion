@@ -54,7 +54,7 @@ def get_args_parser():
     parser.add_argument("--activation", default="relu", type=str)
 
     # Fut diffusion model
-    parser.add_argument("--hidden_dim_fut", default=256, type=int)
+    parser.add_argument("--hidden_dim_fut", default=128, type=int)
     parser.add_argument("--input_dim_fut", default=2, type=int)
     parser.add_argument("--output_dim_fut", default=2, type=int)
     parser.add_argument("--heads_fut", default=4, type=int)
@@ -63,7 +63,6 @@ def get_args_parser():
     parser.add_argument("--mlp_ratio_fut", default=4, type=int)
     parser.add_argument("--num_train_timesteps_fut", default=200, type=int)
     parser.add_argument("--time_embedding_size_fut", default=256, type=int)
-    parser.add_argument("--traj_pos_embed_dim_fut", default=64, type=int)
     parser.add_argument("--T_f", default=25, type=int)
 
     # Fut train/inference

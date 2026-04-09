@@ -35,7 +35,7 @@ def build_hist_mask(hist, mask_ratio=0.4, random_mask_ratio=0.7, block_mask_star
     )
 
 
-def build_future_traj_pos_embed(pos_tensor, hidden_dim=64):
+def build_future_traj_pos_embed(pos_tensor, hidden_dim=128):
     """为 `[B, K, T, 2]` 形式的 future 物理轨迹构造点级正弦位置编码。"""
     half_hidden_dim = int(hidden_dim) // 2
     if half_hidden_dim <= 0:

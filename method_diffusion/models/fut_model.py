@@ -24,7 +24,6 @@ class DiffusionFut(nn.Module):
         self.dropout = float(args.dropout_fut)
         self.mlp_ratio = int(args.mlp_ratio_fut)
         self.time_embedding_size = int(args.time_embedding_size_fut)
-        self.traj_pos_embed_dim = int(args.traj_pos_embed_dim_fut)
         self.T = int(args.T_f)
         self.fut_k = max(1, int(args.fut_k))
 
@@ -34,11 +33,10 @@ class DiffusionFut(nn.Module):
 
         # 输入编码模块：先对物理坐标做点级位置编码，再将整条轨迹展平成 mode token。
         self.input_embedding = nn.Sequential(
-            nn.LayerNorm(self.T * self.traj_pos_embed_dim),
-            nn.Linear(self.T * self.traj_pos_embed_dim, self.hidden_dim),
+            nn.LayerNorm(self.T * self.hidden_dim),
+            nn.Linear(self.T * self.hidden_dim, self.hidden_dim),
         )
         self.hist_encoder = HistEncoder(args)
-        self.context_projection = nn.Linear(int(args.encoder_input_dim) * 2, self.hidden_dim)
 
         # DiT 主干与扩散调度器。
         self.timestep_embedder = dit.TimestepEmbedder(self.hidden_dim, self.time_embedding_size)
@@ -90,11 +88,10 @@ class DiffusionFut(nn.Module):
         x_t = self.diffusion_scheduler.add_noise(target_x0, noise, timesteps)  # [B, K, T, D]
 
         context_tokens = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
-        context_tokens = self.context_projection(context_tokens)  # [B, T_ctx, hidden]
 
         t_emb = self.timestep_embedder(timesteps)
         x_t_phys = self.denorm(x_t)[..., :2]
-        x_t_pos_embed = build_future_traj_pos_embed(x_t_phys, hidden_dim=self.traj_pos_embed_dim)
+        x_t_pos_embed = build_future_traj_pos_embed(x_t_phys, hidden_dim=self.hidden_dim)
         input_embedded = self.input_embedding(x_t_pos_embed.flatten(start_dim=2))
         pred_x0 = self.dit(input_embedded, t_emb, context_tokens).reshape(bsz, self.fut_k, t_len, self.output_dim)
 
@@ -107,7 +104,6 @@ class DiffusionFut(nn.Module):
         k = self.fut_k if K is None else max(1, int(K))
 
         context_tokens = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
-        context_tokens = self.context_projection(context_tokens)
 
         infer_scheduler = DDIMScheduler.from_config(self.diffusion_scheduler.config)
         infer_scheduler.set_timesteps(self.num_inference_steps)
@@ -119,7 +115,7 @@ class DiffusionFut(nn.Module):
             timesteps = torch.full((bsz,), t_scalar, device=x_t.device, dtype=torch.long)
             t_emb = self.timestep_embedder(timesteps)
             x_t_phys = self.denorm(x_t)[..., :2]
-            x_t_pos_embed = build_future_traj_pos_embed(x_t_phys, hidden_dim=self.traj_pos_embed_dim)
+            x_t_pos_embed = build_future_traj_pos_embed(x_t_phys, hidden_dim=self.hidden_dim)
             input_embedded = self.input_embedding(x_t_pos_embed.flatten(start_dim=2))
             pred_x0 = self.dit(input_embedded, t_emb, context_tokens).reshape(bsz, k, t_len, self.output_dim)
             x_t = infer_scheduler.step(pred_x0, t, x_t).prev_sample
