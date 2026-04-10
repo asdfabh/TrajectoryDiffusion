@@ -1,4 +1,3 @@
-import math
 import inspect
 
 import torch
@@ -33,26 +32,6 @@ def build_hist_mask(hist, mask_ratio=0.4, random_mask_ratio=0.7, block_mask_star
         random_ratio=random_mask_ratio,
         block_start=block_mask_start,
     )
-
-
-def build_future_traj_pos_embed(pos_tensor, hidden_dim=128):
-    """为 `[B, K, T, 2]` 形式的 future 物理轨迹构造点级正弦位置编码。"""
-    half_hidden_dim = int(hidden_dim) // 2
-    if half_hidden_dim <= 0:
-        raise ValueError(f"hidden_dim must be >= 2, got {hidden_dim}")
-
-    scale = 2 * math.pi
-    dim_t = torch.arange(half_hidden_dim, dtype=torch.float32, device=pos_tensor.device)
-    dim_t = 10000 ** (2 * (dim_t // 2) / half_hidden_dim)
-
-    x_embed = pos_tensor[..., 0] * scale
-    y_embed = pos_tensor[..., 1] * scale
-    pos_x = x_embed[..., None] / dim_t
-    pos_y = y_embed[..., None] / dim_t
-    pos_x = torch.stack((pos_x[..., 0::2].sin(), pos_x[..., 1::2].cos()), dim=-1).flatten(-2)
-    pos_y = torch.stack((pos_y[..., 0::2].sin(), pos_y[..., 1::2].cos()), dim=-1).flatten(-2)
-    return torch.cat((pos_y, pos_x), dim=-1)
-
 
 def normalize_traj_valid_mask(valid_mask, pred):
     """将不同形状的 future 有效位掩码统一成 `[B, T]` 浮点张量。"""
