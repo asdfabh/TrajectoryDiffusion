@@ -67,7 +67,7 @@ def get_args_parser():
 
     # Fut train/inference
     parser.add_argument("--num_inference_steps", default=3, type=int)
-    parser.add_argument("--fut_k", default=6, type=int)
+    parser.add_argument("--fut_k", default=9, type=int)
 
     # Fut visualization
     parser.add_argument("--fut_enable_eval_vis", default=0, type=int)
