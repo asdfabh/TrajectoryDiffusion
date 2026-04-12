@@ -66,18 +66,24 @@ class DiffusionFut(nn.Module):
         plan_anchor = torch.load(anchor_path, map_location="cpu")
         self.plan_anchor = nn.Parameter(plan_anchor.float(), requires_grad=False)
 
-    # best of K赢者通吃
-    # pred_x0 [B*K,T,D]; target_x0 [B,T,D]; valid_mask [B,T]
-    def computeLoss(self, pred_x0, target_x0, valid_mask, bsz, k):
+    # 先按GT最近anchor分配mode，再只对该mode回传回归损失。
+    # pred_x0 [B*K,T,D]; target_x0 [B,T,D]; anchor_x0 [B,K,T,D]; valid_mask [B,T]
+    def computeLoss(self, pred_x0, target_x0, anchor_x0, valid_mask, bsz, k):
         pred_x0 = pred_x0.view(bsz, k, self.T, self.output_dim) # [B,K,T,D]
-        target_x0 = target_x0.unsqueeze(1).expand(-1, k, -1, -1) # [B,K,T,D]
-        valid = valid_mask.unsqueeze(1).unsqueeze(-1).expand(-1, k, -1, self.output_dim) # [B,K,T,D]
-        loss_map = F.smooth_l1_loss(pred_x0, target_x0, reduction="none") # [B,K,T,D]
-        numer = (loss_map * valid).sum(dim=(2, 3)) # [B,K]
-        denom = valid.sum(dim=(2, 3)) + 1e-6 # [B,K]
-        loss_per_traj = numer / denom
-        best_loss, _ = torch.min(loss_per_traj, dim=1) # [B]
-        loss = best_loss.mean()
+        valid_time = valid_mask.unsqueeze(1) # [B,1,T]
+
+        dist = torch.linalg.norm(target_x0.unsqueeze(1) - anchor_x0, dim=-1) # [B,K,T]
+        numer = (dist * valid_time).sum(dim=-1) # [B,K]
+        denom = valid_time.sum(dim=-1) + 1e-6 # [B,1]
+        mode_idx = torch.argmin(numer / denom, dim=-1) # [B]
+
+        gather_index = mode_idx.view(bsz, 1, 1, 1).expand(-1, 1, self.T, self.output_dim)
+        best_pred = torch.gather(pred_x0, 1, gather_index).squeeze(1) # [B,T,D]
+        valid = valid_mask.unsqueeze(-1).expand(-1, -1, self.output_dim) # [B,T,D]
+        loss_map = F.l1_loss(best_pred, target_x0, reduction="none") # [B,T,D]
+        numer = (loss_map * valid).sum(dim=(1, 2)) # [B]
+        denom = valid.sum(dim=(1, 2)) + 1e-6 # [B]
+        loss = (numer / denom).mean()
         logs = {"loss_x0": loss.detach()}
         return loss, logs
 
@@ -103,7 +109,7 @@ class DiffusionFut(nn.Module):
         input_embedded = self.input_embedding(x_t) + self.pos_embedding(x_t) # [B*K,T,D]
         pred_delta = self.dit(input_embedded, t_emb, context_tokens) # [B*K,T,D]
         pred_x0 = x_t + pred_delta # 预测在anchor下需要的修正量，得到轨迹 # [B*K,T,D]
-        loss, loss_logs = self.computeLoss(pred_x0, target_x0, valid_mask, bsz, self.fut_k)
+        loss, loss_logs = self.computeLoss(pred_x0, target_x0, anchor_x0, valid_mask, bsz, self.fut_k)
         return loss, loss_logs
 
     @torch.no_grad()
