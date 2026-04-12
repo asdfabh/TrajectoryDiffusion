@@ -1,3 +1,6 @@
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -59,15 +62,21 @@ class DiffusionFut(nn.Module):
         else:
             raise ValueError(f"Unsupported dataset '{self.dataset_name}' for fut normalization. Supported: highd, ngsim")
 
+        anchor_path = Path(__file__).resolve().parent.parent / "dataset" / "anchor" / f"{self.dataset_name}_k{self.fut_k}.pt"
+        plan_anchor = torch.load(anchor_path, map_location="cpu")
+        self.plan_anchor = nn.Parameter(plan_anchor.float(), requires_grad=False)
+
     # best of K赢者通吃
+    # pred_x0 [B*K,T,D]; target_x0 [B,T,D]; valid_mask [B,T]
     def computeLoss(self, pred_x0, target_x0, valid_mask, bsz, k):
-        loss_map = F.smooth_l1_loss(pred_x0, target_x0, reduction="none")
-        valid = valid_mask.unsqueeze(-1)
-        numer = (loss_map * valid).sum(dim=(1, 2))
-        denom = valid.sum(dim=(1, 2)) + 1e-6
+        pred_x0 = pred_x0.view(bsz, k, self.T, self.output_dim) # [B,K,T,D]
+        target_x0 = target_x0.unsqueeze(1).expand(-1, k, -1, -1) # [B,K,T,D]
+        valid = valid_mask.unsqueeze(1).unsqueeze(-1).expand(-1, k, -1, self.output_dim) # [B,K,T,D]
+        loss_map = F.smooth_l1_loss(pred_x0, target_x0, reduction="none") # [B,K,T,D]
+        numer = (loss_map * valid).sum(dim=(2, 3)) # [B,K]
+        denom = valid.sum(dim=(2, 3)) + 1e-6 # [B,K]
         loss_per_traj = numer / denom
-        loss_per_traj = loss_per_traj.view(bsz, k)
-        best_loss, _ = torch.min(loss_per_traj, dim=1)
+        best_loss, _ = torch.min(loss_per_traj, dim=1) # [B]
         loss = best_loss.mean()
         logs = {"loss_x0": loss.detach()}
         return loss, logs
@@ -77,28 +86,23 @@ class DiffusionFut(nn.Module):
         bsz, t_len, _ = future.shape
         valid_mask = (op_mask[..., 0] > 0.5).float().to(device)  # [B, T]
         target_x0 = self.norm(future)  # [B, T, D]
-        # 对每条 GT 复制 K 份，K 个分支共享同一个扩散步 t，但各自采样独立噪声。
-        # 先以 [B, K, T, D] 直接加噪，再在进入 DiT 前折叠 K 维，保持现有主干接口不变。
-        target_x0 = target_x0.unsqueeze(1).repeat(1, self.fut_k, 1, 1)  # [B, K, T, D]
-        valid_mask = valid_mask.unsqueeze(1).repeat(1, self.fut_k, 1)  # [B, K, T]
-        noise = torch.randn_like(target_x0)  # [B, K, T, D]
-        timesteps = torch.randint(0, self.num_train_timesteps, (bsz, 1), device=device).long()  # [B, 1]
-        # add noise会将t进行压缩，然后进行广播，这里的实现是正确的
-        x_t = self.diffusion_scheduler.add_noise(target_x0, noise, timesteps)  # [B, K, T, D]
 
-        # 初步先将K折叠进入B维度，进行时间交互，后续考虑折叠T*D维度，进行模态交互
-        timesteps = timesteps.expand(-1, self.fut_k).reshape(bsz * self.fut_k)  # [B*K]
-        x_t = x_t.reshape(bsz * self.fut_k, t_len, self.output_dim)
-        target_x0 = target_x0.reshape(bsz * self.fut_k, t_len, self.output_dim)
-        valid_mask = valid_mask.reshape(bsz * self.fut_k, t_len)
+        # 对anchor进行加噪，保持[B,K,T,D]维度
+        anchor_x0 = self.plan_anchor.to(device=device).unsqueeze(0).expand(bsz, -1, -1, -1) # [B,K,T,D]
+        anchor_x0 = self.norm(anchor_x0)
+        noise = torch.randn_like(anchor_x0) # [B,K,T,D]
+        timesteps = torch.randint(0, 50, (bsz,), device=device).long() # [B]
+        x_t = self.diffusion_scheduler.add_noise(anchor_x0, noise, timesteps).float() # [B,K,T,D]
+        # 维度转化为[B*K,T,D]
+        timesteps = timesteps.unsqueeze(1).expand(-1, self.fut_k).reshape(bsz * self.fut_k)  # [B*K]
+        x_t = x_t.reshape(bsz * self.fut_k, t_len, self.output_dim) # [B*K,T,D]
+        context_tokens = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask) # [B,T,D]
+        context_tokens = context_tokens.repeat_interleave(self.fut_k, dim=0)  # [B*K, T, D]
 
-        context_tokens = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
-        context_tokens = context_tokens.repeat_interleave(self.fut_k, dim=0) # [B*K, T, D]
-
-        t_emb = self.timestep_embedder(timesteps)
-        input_embedded = self.input_embedding(x_t) + self.pos_embedding(x_t)
-        pred_x0 = self.dit(input_embedded, t_emb, context_tokens)
-
+        t_emb = self.timestep_embedder(timesteps) # [B*K]
+        input_embedded = self.input_embedding(x_t) + self.pos_embedding(x_t) # [B*K,T,D]
+        pred_delta = self.dit(input_embedded, t_emb, context_tokens) # [B*K,T,D]
+        pred_x0 = x_t + pred_delta # 预测在anchor下需要的修正量，得到轨迹 # [B*K,T,D]
         loss, loss_logs = self.computeLoss(pred_x0, target_x0, valid_mask, bsz, self.fut_k)
         return loss, loss_logs
 
@@ -110,18 +114,27 @@ class DiffusionFut(nn.Module):
         context_tokens = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
         context_tokens = context_tokens.repeat_interleave(k, dim=0)
 
-        infer_scheduler = DDIMScheduler.from_config(self.diffusion_scheduler.config)
-        infer_scheduler.set_timesteps(self.num_inference_steps)
+        diffusion_scheduler = DDIMScheduler.from_config(self.diffusion_scheduler.config)
+        diffusion_scheduler.set_timesteps(self.num_train_timesteps, device=device)
+        step_ratio = 30 / self.num_inference_steps
+        roll_timesteps = (np.arange(0, self.num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
+        roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
+        trunc_timesteps = torch.full((bsz,), 20, device=device, dtype=torch.long)
+        anchor_x0 = self.plan_anchor[:k].to(device=device).unsqueeze(0).expand(bsz, -1, -1, -1)
+        anchor_x0 = self.norm(anchor_x0)
+        noise = torch.randn_like(anchor_x0)
+        x_t = diffusion_scheduler.add_noise(anchor_x0, noise, trunc_timesteps).float()
+        x_t = x_t.reshape(bsz * k, t_len, self.output_dim)
 
-        x_t = torch.randn((bsz * k, t_len, self.input_dim), device=device)
         pred_x0 = None
-        for t in infer_scheduler.timesteps:
+        for t in roll_timesteps:
             t_scalar = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
             timesteps = torch.full((x_t.size(0),), t_scalar, device=x_t.device, dtype=torch.long)
             t_emb = self.timestep_embedder(timesteps)
             input_embedded = self.input_embedding(x_t) + self.pos_embedding(x_t)
-            pred_x0 = self.dit(input_embedded, t_emb, context_tokens)
-            x_t = infer_scheduler.step(pred_x0, t, x_t).prev_sample
+            pred_delta = self.dit(input_embedded, t_emb, context_tokens)
+            pred_x0 = x_t + pred_delta
+            x_t = diffusion_scheduler.step(pred_x0, t, x_t).prev_sample
 
         pred_x0 = pred_x0.view(bsz, k, t_len, self.output_dim)
         pred_phys = self.denorm(pred_x0)
