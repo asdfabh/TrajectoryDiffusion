@@ -60,19 +60,15 @@ class DiffusionFut(nn.Module):
             raise ValueError(f"Unsupported dataset '{self.dataset_name}' for fut normalization. Supported: highd, ngsim")
 
     # best of K赢者通吃
-    def computeLoss(self, pred_x0, target_x0, valid_mask, timesteps, bsz, k):
-        loss_map = F.smooth_l1_loss(pred_x0, target_x0, reduction="none") # [B*K,T,D]
-        valid = valid_mask.unsqueeze(-1) # [B*K,T,1]
-        numer = (loss_map * valid).sum(dim=(1, 2)) # [B*K]
-        denom = valid.sum(dim=(1, 2)) + 1e-6 # [B*K]
-        loss_per_traj = numer / denom # [B*K]
-        loss_per_traj = loss_per_traj.view(bsz, k) # [B,K]
-        best_loss, _ = torch.min(loss_per_traj, dim=1) # [B]
-        alpha_cumprod = self.diffusion_scheduler.alphas_cumprod.to(device=pred_x0.device, dtype=pred_x0.dtype)
-        # 每个样本的 K 个分支共享同一个扩散步 t，所以 [B*K] 还原为 [B,K] 后取任意一列都等价。
-        timesteps = timesteps.view(bsz, k)[:, 0] # [B]
-        timestep_weights = torch.rsqrt((1.0 - alpha_cumprod[timesteps]).clamp(min=1e-6)) # [B] rsqrt = 1 / sqrt
-        loss = (best_loss * timestep_weights).mean()
+    def computeLoss(self, pred_x0, target_x0, valid_mask, bsz, k):
+        loss_map = F.smooth_l1_loss(pred_x0, target_x0, reduction="none")
+        valid = valid_mask.unsqueeze(-1)
+        numer = (loss_map * valid).sum(dim=(1, 2))
+        denom = valid.sum(dim=(1, 2)) + 1e-6
+        loss_per_traj = numer / denom
+        loss_per_traj = loss_per_traj.view(bsz, k)
+        best_loss, _ = torch.min(loss_per_traj, dim=1)
+        loss = best_loss.mean()
         logs = {"loss_x0": loss.detach()}
         return loss, logs
 
@@ -103,7 +99,7 @@ class DiffusionFut(nn.Module):
         input_embedded = self.input_embedding(x_t) + self.pos_embedding(x_t)
         pred_x0 = self.dit(input_embedded, t_emb, context_tokens)
 
-        loss, loss_logs = self.computeLoss(pred_x0, target_x0, valid_mask, timesteps, bsz, self.fut_k)
+        loss, loss_logs = self.computeLoss(pred_x0, target_x0, valid_mask, bsz, self.fut_k)
         return loss, loss_logs
 
     @torch.no_grad()
