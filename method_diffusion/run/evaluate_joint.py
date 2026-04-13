@@ -121,7 +121,7 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, mask
         hist_metrics.update(pred_hist, hist, hist_mask)
 
         if k_samples > 1:
-            all_preds, _ = model_fut.forwardEvalMulti(
+            all_preds = model_fut.forwardEvalMulti(
                 pred_hist,
                 hist_nbrs,
                 mask,
@@ -132,7 +132,7 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, mask
             )
             pred_fut, _, _ = select_minade_prediction(all_preds, fut, op_mask)
         else:
-            all_preds, _ = model_fut.forwardEvalMulti(
+            pred_fut = model_fut.forwardEvalMulti(
                 pred_hist,
                 hist_nbrs,
                 mask,
@@ -140,8 +140,7 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, mask
                 fut,
                 device,
                 K=1,
-            )
-            pred_fut = all_preds.squeeze(1)
+            ).squeeze(1)
         fut_metrics.update(pred_fut, fut, op_mask)
 
         hist_summary = hist_metrics.summary()

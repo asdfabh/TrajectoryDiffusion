@@ -256,7 +256,7 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, rank
             detach_hist_for_fut=True,
         )
         if int(fut_model.fut_k) > 1:
-            all_preds, _ = fut_model.forwardEvalMulti(
+            all_preds = fut_model.forwardEvalMulti(
                 hist_for_fut,
                 hist_nbrs,
                 mask,
@@ -267,7 +267,7 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, rank
             )
             pred_fut, _, _ = select_minade_prediction(all_preds, fut, op_mask)
         else:
-            all_preds, _ = fut_model.forwardEvalMulti(
+            pred_fut = fut_model.forwardEvalMulti(
                 hist_for_fut,
                 hist_nbrs,
                 mask,
@@ -275,8 +275,7 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, rank
                 fut,
                 device,
                 K=1,
-            )
-            pred_fut = all_preds.squeeze(1)
+            ).squeeze(1)
         eval_ade, eval_fde = compute_batch_ade_fde(pred_fut, fut, op_mask)
         eval_ade = float(eval_ade.item()) * METER_PER_FOOT
         eval_fde = float(eval_fde.item()) * METER_PER_FOOT

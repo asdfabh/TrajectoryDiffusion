@@ -3,21 +3,6 @@ import matplotlib.patches as patches
 import numpy as np
 import torch
 
-from method_diffusion.utils.fut_utils import normalize_traj_valid_mask, select_minade_prediction
-
-
-MODE_COLOR_PALETTE = [
-    "#E41A1C",
-    "#377EB8",
-    "#4DAF4A",
-    "#FF7F00",
-    "#984EA3",
-    "#A65628",
-    "#F781BF",
-    "#17BECF",
-    "#BCBD22",
-]
-
 
 def _to_numpy(data):
     if data is None:
@@ -74,33 +59,6 @@ def _format_prob_list(prob_values):
         return "[]"
     prob_arr = np.asarray(prob_arr).reshape(-1)
     return "[" + ", ".join(f"{float(v):.2f}" for v in prob_arr) + "]"
-
-
-def _get_mode_color(mode_idx):
-    return MODE_COLOR_PALETTE[int(mode_idx) % len(MODE_COLOR_PALETTE)]
-
-
-def _select_mode_by_index(pred_all, mode_idx):
-    if pred_all is None or mode_idx is None:
-        return None
-    if isinstance(pred_all, torch.Tensor):
-        if not isinstance(mode_idx, torch.Tensor):
-            mode_idx = torch.as_tensor(mode_idx, device=pred_all.device, dtype=torch.long)
-        mode_idx = mode_idx.view(-1)
-        bsz, _, t_len, feat_dim = pred_all.shape
-        gather_idx = mode_idx.view(bsz, 1, 1, 1).expand(bsz, 1, t_len, feat_dim)
-        return pred_all.gather(1, gather_idx).squeeze(1)
-
-    pred_arr = np.asarray(pred_all)
-    idx_arr = np.asarray(mode_idx).reshape(-1).astype(np.int64)
-    selected = []
-    for b_idx, k_idx in enumerate(idx_arr):
-        if b_idx >= pred_arr.shape[0]:
-            break
-        selected.append(pred_arr[b_idx, k_idx])
-    if not selected:
-        return None
-    return np.stack(selected, axis=0)
 
 
 def plot_traj_with_mask(hist_original, hist_masked, hist_pred, fig_num1=3, fig_num2=3, input_unit="ft"):
@@ -182,8 +140,7 @@ def maybe_visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_t
 def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, future=None, pred=None,
                                  pred_all=None, pred_best_idx=None,
                                  future_mask=None, pred_instant=None, intent_probs=None,
-                                 batch_idx=0, metrics=None, input_unit="ft", title=None,
-                                 highlight_label="GT Anchor"):
+                                 batch_idx=0, metrics=None, input_unit="ft"):
     """绘制 future 预测结果，支持单模态与多模态最佳轨迹高亮。"""
 
     def safe_get_batch(data, b_idx, batch_ndim=3):
@@ -349,64 +306,29 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
     if gt_fut is not None:
         ax.plot(gt_fut[:, 1], gt_fut[:, 0], 'g-o', label='GT Future', markersize=4, linewidth=2, alpha=0.8)
     if pred_modes is not None:
+        non_best_labeled = False
         for k in range(pred_modes.shape[0]):
             traj = normalize_traj2d(pred_modes[k])
             if traj is None:
                 continue
             is_best = (best_k is not None and k == best_k)
-            color = _get_mode_color(k)
-            label = f"Mode {k + 1} ({highlight_label})" if is_best else f"Mode {k + 1}"
+            label = None
+            if is_best:
+                label = 'Pred Best'
+            elif not non_best_labeled:
+                label = 'Pred Modes'
+                non_best_labeled = True
             ax.plot(
                 traj[:, 1], traj[:, 0],
                 linestyle='-',
-                marker='o',
-                markersize=4 if is_best else 3,
-                markeredgewidth=1.0,
-                linewidth=2.4 if is_best else 1.8,
-                alpha=0.98 if is_best else 0.88,
-                color=color,
+                marker='o' if is_best else '+',
+                markersize=4 if is_best else 6,
+                markeredgewidth=1.2 if not is_best else 1.0,
+                linewidth=1.4 if not is_best else 2.0,
+                alpha=0.65 if not is_best else 0.95,
+                color='#FF0000' if is_best else '#5DADE2',
                 label=label,
                 zorder=3 if is_best else 2
-            )
-            end_x = float(traj[-1, 1])
-            end_y = float(traj[-1, 0])
-            ax.scatter(
-                [end_x],
-                [end_y],
-                s=42 if is_best else 32,
-                color=color,
-                edgecolors='black' if is_best else 'white',
-                linewidths=1.0,
-                zorder=4,
-            )
-            if is_best:
-                ax.scatter(
-                    [end_x],
-                    [end_y],
-                    s=120,
-                    marker='*',
-                    color=color,
-                    edgecolors='black',
-                    linewidths=1.0,
-                    zorder=5,
-                )
-            ax.text(
-                end_x + 0.25,
-                end_y + 0.25,
-                f"{k + 1} {highlight_label}" if is_best else str(k + 1),
-                color=color,
-                fontsize=10 if is_best else 9,
-                fontweight='bold',
-                ha='left',
-                va='bottom',
-                bbox=dict(
-                    boxstyle='round,pad=0.18',
-                    facecolor='white',
-                    edgecolor=color,
-                    alpha=0.95 if is_best else 0.9,
-                    linewidth=1.4 if is_best else 1.0,
-                ),
-                zorder=6 if is_best else 5,
             )
     elif pred_best is not None:
         ax.plot(pred_best[:, 1], pred_best[:, 0], 'r-o', label='Pred', markersize=4, linewidth=2, alpha=0.9)
@@ -438,7 +360,7 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
         )
 
     unit = input_unit or "ft"
-    title = str(title) if title is not None else "Trajectory Visualization"
+    title = "Trajectory Visualization"
     if metrics:
         metric_parts = []
         for metric_name, metric_val in metrics.items():
@@ -459,8 +381,7 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
 
 def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pred, valid_mask,
                                       pred_all=None, pred_best_idx=None, pred_instant=None, intent_probs=None,
-                                      meter_per_foot=0.3048, batch_idx=0, title=None,
-                                      highlight_label="GT Anchor"):
+                                      meter_per_foot=0.3048, batch_idx=0):
     """绘制 future 预测可视化。"""
     diff = pred[batch_idx, :, :2] - future[batch_idx, :, :2]
     dist = torch.norm(diff, dim=-1)
@@ -505,40 +426,4 @@ def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pr
         batch_idx=batch_idx,
         metrics=metrics,
         input_unit="ft",
-        title=title,
-        highlight_label=highlight_label,
     )
-
-
-def maybe_visualize_future_diffusion_process(hist, hist_nbrs, temporal_mask, future, anchor,
-                                             noisy_anchor, pred_all, valid_mask,
-                                             meter_per_foot=0.3048, batch_idx=0):
-    """依次绘制 Anchor、Noise Anchor、Pred，并固定高亮 GT Anchor。"""
-    valid_mask = normalize_traj_valid_mask(valid_mask, future)
-    _, gt_anchor_idx, _ = select_minade_prediction(anchor, future, valid_mask)
-
-    stages = [
-        ("Anchor", anchor),
-        ("Noise Anchor", noisy_anchor),
-        ("Pred", pred_all),
-    ]
-
-    for stage_title, stage_pred_all in stages:
-        if stage_pred_all is None:
-            continue
-
-        stage_focus = _select_mode_by_index(stage_pred_all, gt_anchor_idx)
-        maybe_visualize_future_prediction(
-            hist=hist,
-            hist_nbrs=hist_nbrs,
-            temporal_mask=temporal_mask,
-            future=future,
-            pred=stage_focus,
-            valid_mask=valid_mask,
-            pred_all=stage_pred_all,
-            pred_best_idx=gt_anchor_idx,
-            meter_per_foot=meter_per_foot,
-            batch_idx=batch_idx,
-            title=stage_title,
-            highlight_label="GT Anchor",
-        )

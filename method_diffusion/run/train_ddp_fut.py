@@ -155,11 +155,10 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
         if int(fut_model.fut_k) > 1:
-            all_preds, _ = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=fut_model.fut_k)
+            all_preds = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=fut_model.fut_k)
             pred_fut, _, _ = select_minade_prediction(all_preds, fut, op_mask)
         else:
-            all_preds, _ = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
-            pred_fut = all_preds.squeeze(1)
+            pred_fut = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=1).squeeze(1)
         eval_ade, eval_fde = compute_batch_ade_fde(pred_fut, fut, op_mask)
         eval_ade = float(eval_ade.item()) * METER_PER_FOOT
         eval_fde = float(eval_fde.item()) * METER_PER_FOOT
