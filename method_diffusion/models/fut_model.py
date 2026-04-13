@@ -126,11 +126,12 @@ class DiffusionFut(nn.Module):
         roll_timesteps = (np.arange(0, self.num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
         roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
         trunc_timesteps = torch.full((bsz,), 20, device=device, dtype=torch.long)
-        anchor_x0 = self.plan_anchor[:k].to(device=device).unsqueeze(0).expand(bsz, -1, -1, -1)
-        anchor_x0 = self.norm(anchor_x0)
+        anchor_x0_phys = self.plan_anchor[:k].to(device=device).unsqueeze(0).expand(bsz, -1, -1, -1)
+        anchor_x0 = self.norm(anchor_x0_phys)
         noise = torch.randn_like(anchor_x0)
-        x_t = diffusion_scheduler.add_noise(anchor_x0, noise, trunc_timesteps).float()
-        x_t = x_t.reshape(bsz * k, t_len, self.output_dim)
+        x_t_init = diffusion_scheduler.add_noise(anchor_x0, noise, trunc_timesteps).float()
+        noisy_anchor_phys = self.denorm(x_t_init)
+        x_t = x_t_init.reshape(bsz * k, t_len, self.output_dim)
 
         pred_x0 = None
         for t in roll_timesteps:
@@ -146,7 +147,12 @@ class DiffusionFut(nn.Module):
         pred_phys = self.denorm(pred_x0)
         all_preds = future.unsqueeze(1).repeat(1, k, 1, 1).clone()
         all_preds[..., :2] = pred_phys[..., :2]
-        return all_preds
+        vis_data = {
+            "anchor": anchor_x0_phys.detach(),
+            "noisy_anchor": noisy_anchor_phys.detach(),
+            "pred_all": all_preds.detach(),
+        }
+        return all_preds, vis_data
 
     # 统一前向入口，默认复用训练路径。
     def forward(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
