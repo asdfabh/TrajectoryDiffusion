@@ -1,6 +1,5 @@
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -8,6 +7,7 @@ from diffusers.schedulers import DDIMScheduler
 
 from method_diffusion.models import dit_fut as dit
 from method_diffusion.models.hist_encoder import HistEncoder
+from method_diffusion.utils.fut_utils import build_eval_timestep_pairs, ddim_step
 from method_diffusion.utils.position_encoding import SequentialPositionalEncoding
 
 
@@ -30,9 +30,17 @@ class DiffusionFut(nn.Module):
         self.T = int(args.T_f)
         self.fut_k = max(1, int(args.fut_k))
 
-        # 扩散与推理参数。
+        # Anchor条件下扩散与推理参数。
         self.num_train_timesteps = int(args.num_train_timesteps_fut)
         self.num_inference_steps = int(args.num_inference_steps)
+
+        self.train_timestep_max = 50
+        self.inference_trunc_timestep = 30
+        self.eval_current_timesteps, self.eval_next_timesteps = build_eval_timestep_pairs(
+            self.train_timestep_max,
+            self.num_inference_steps,
+            self.inference_trunc_timestep,
+        )
 
         # 输入编码模块：future 噪声序列和 history context。
         self.input_embedding = nn.Linear(self.input_dim, self.hidden_dim)
@@ -97,7 +105,7 @@ class DiffusionFut(nn.Module):
         anchor_x0 = self.plan_anchor.to(device=device).unsqueeze(0).expand(bsz, -1, -1, -1) # [B,K,T,D]
         anchor_x0 = self.norm(anchor_x0)
         noise = torch.randn_like(anchor_x0) # [B,K,T,D]
-        timesteps = torch.randint(0, 50, (bsz,), device=device).long() # [B]
+        timesteps = torch.randint(0, self.train_timestep_max, (bsz,), device=device).long() # [B]
         x_t = self.diffusion_scheduler.add_noise(anchor_x0, noise, timesteps).float() # [B,K,T,D]
         # 维度转化为[B*K,T,D]
         timesteps = timesteps.unsqueeze(1).expand(-1, self.fut_k).reshape(bsz * self.fut_k)  # [B*K]
@@ -121,11 +129,7 @@ class DiffusionFut(nn.Module):
         context_tokens = context_tokens.repeat_interleave(k, dim=0)
 
         diffusion_scheduler = DDIMScheduler.from_config(self.diffusion_scheduler.config)
-        diffusion_scheduler.set_timesteps(self.num_train_timesteps, device=device)
-        step_ratio = 30 / self.num_inference_steps
-        roll_timesteps = (np.arange(0, self.num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
-        roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
-        trunc_timesteps = torch.full((bsz,), 20, device=device, dtype=torch.long)
+        trunc_timesteps = torch.full((bsz,), self.eval_current_timesteps[0], device=device, dtype=torch.long)
         anchor_x0_phys = self.plan_anchor[:k].to(device=device).unsqueeze(0).expand(bsz, -1, -1, -1)
         anchor_x0 = self.norm(anchor_x0_phys)
         noise = torch.randn_like(anchor_x0)
@@ -133,18 +137,15 @@ class DiffusionFut(nn.Module):
         noisy_anchor_phys = self.denorm(x_t_init)
         x_t = x_t_init.reshape(bsz * k, t_len, self.output_dim)
 
-        pred_x0 = None
-        for t in roll_timesteps:
-            t_scalar = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
-            timesteps = torch.full((x_t.size(0),), t_scalar, device=x_t.device, dtype=torch.long)
+        for current_timestep, next_timestep in zip(self.eval_current_timesteps, self.eval_next_timesteps):
+            timesteps = torch.full((x_t.size(0),), int(current_timestep), device=x_t.device, dtype=torch.long)
             t_emb = self.timestep_embedder(timesteps)
             input_embedded = self.input_embedding(x_t) + self.pos_embedding(x_t)
             pred_delta = self.dit(input_embedded, t_emb, context_tokens)
             pred_x0 = x_t + pred_delta
-            x_t = diffusion_scheduler.step(pred_x0, t, x_t).prev_sample
+            x_t = ddim_step(diffusion_scheduler, pred_x0, x_t, int(current_timestep), int(next_timestep))
 
-        pred_x0 = pred_x0.view(bsz, k, t_len, self.output_dim)
-        pred_phys = self.denorm(pred_x0)
+        pred_phys = self.denorm(pred_x0.view(bsz, k, t_len, self.output_dim))
         all_preds = future.unsqueeze(1).repeat(1, k, 1, 1).clone()
         all_preds[..., :2] = pred_phys[..., :2]
         vis_data = {

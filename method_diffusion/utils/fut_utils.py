@@ -75,6 +75,37 @@ def select_minade_prediction(all_preds, target, valid_mask=None):
     return best_pred, best_idx, ade_k
 
 
+def build_eval_timestep_pairs(train_timestep_max, num_inference_steps, inference_trunc_timestep):
+    """构造显式 DDIM 推理步，例如 30->24->18->12->6->0。"""
+    if inference_trunc_timestep % num_inference_steps != 0:
+        raise ValueError("Inference trunc timestep must be divisible by num_inference_steps.")
+
+    step_stride = inference_trunc_timestep // num_inference_steps
+    current_timesteps = []
+    next_timesteps = []
+    current_t = int(inference_trunc_timestep)
+
+    for _ in range(int(num_inference_steps)):
+        next_t = max(current_t - int(step_stride), 0)
+        current_timesteps.append(int(current_t))
+        next_timesteps.append(int(next_t))
+        current_t = next_t
+
+    if current_timesteps[0] >= train_timestep_max or next_timesteps[-1] != 0:
+        raise ValueError("Invalid fut inference timestep schedule.")
+    return current_timesteps, next_timesteps
+
+
+def ddim_step(scheduler, pred_x0, sample, current_timestep, next_timestep):
+    """在同一条 alpha_bar 曲线上执行显式 t_cur -> t_next 的 DDIM 确定性更新。"""
+    alpha_prod_t = scheduler.alphas_cumprod[current_timestep].to(device=sample.device, dtype=sample.dtype)
+    alpha_prod_next = scheduler.alphas_cumprod[next_timestep].to(device=sample.device, dtype=sample.dtype)
+    beta_prod_t = (1 - alpha_prod_t).clamp(min=1e-6)
+    beta_prod_next = (1 - alpha_prod_next).clamp(min=0.0)
+    pred_epsilon = (sample - alpha_prod_t.sqrt() * pred_x0) / beta_prod_t.sqrt()
+    return alpha_prod_next.sqrt() * pred_x0 + beta_prod_next.sqrt() * pred_epsilon
+
+
 class TrajectoryMetrics:
     """
     累计逐时刻 RMSE / FDE，以及逐时刻前缀 ADE。
