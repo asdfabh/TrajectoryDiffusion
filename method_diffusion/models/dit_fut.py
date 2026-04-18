@@ -37,70 +37,55 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
 
+# 只使用一次时间调制；对 self-attn 前做 LayerNorm 并调制；cross-attn 不单独归一化；在 attention stack 输出后、进入 MLP 前做第二次 LayerNorm。
 class DiTBlock(nn.Module):
-
     def __init__(self, dim=128, heads=4, dropout=0.1, mlp_ratio=4.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
         self.norm2 = nn.LayerNorm(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp1 = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(dim, 6 * dim, bias=True)
+            nn.Linear(dim, 3 * dim, bias=True)
         )
-        self.norm3 = nn.LayerNorm(dim)
-        self.cross_attn = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
-        self.norm4 = nn.LayerNorm(dim)
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-        self.mlp2 = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.cross_attn = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
+
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
 
     def forward(self, x, t_cond, cross, attn_mask=None):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(t_cond).chunk(6, dim=1)
+        shift_msa, scale_msa, gate_msa = self.adaLN_modulation(t_cond).chunk(3, dim=1)
 
         modulated_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulated_x, modulated_x, modulated_x, key_padding_mask=attn_mask)[0]
+        x = x + self.cross_attn(x, cross, cross)[0]
 
-        modulated_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = x + gate_mlp.unsqueeze(1) * self.mlp1(modulated_x)
-
-        x = x + self.cross_attn(self.norm3(x), cross, cross)[0]
-        x = x + self.mlp2(self.norm4(x))
-
+        x = x + self.mlp(self.norm2(x))
         return x
 
-
+# FinalLayer 删除时间调制，layernorm等操作，仅做线性变换，输出
 class FinalLayer(nn.Module):
-    def __init__(self, hidden_size, T=16, output_dim=2):
+    def __init__(self, hidden_size, output_dim=2):
         super().__init__()
-        self.T = T
         self.output_dim = output_dim
-        self.norm_final = nn.LayerNorm(hidden_size)
-
         self.proj = nn.Sequential(
-            nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_size * 4, bias=True),
             nn.GELU(approximate="tanh"),
-            nn.LayerNorm(hidden_size * 4),
-            nn.Linear(hidden_size * 4, output_dim, bias=True)
+            nn.Linear(hidden_size * 4, self.output_dim, bias=True)
         )
 
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
-        )
-
-    def forward(self, x, t_cond):
-        shift, scale = self.adaLN_modulation(t_cond).chunk(2, dim=1)
-        x = modulate(self.norm_final(x), shift, scale)
+    def forward(self, x):
         x = self.proj(x)
         return x
 
 
 class DiT(nn.Module):
-    def __init__(self, dit_block, final_layer, depth, model_type="x_start"):
+    def __init__(self, dit_block, final_layer, depth):
         super().__init__()
         self.blocks = nn.ModuleList([copy.deepcopy(dit_block) for _ in range(depth)])
         self.final_layer = final_layer
@@ -108,6 +93,6 @@ class DiT(nn.Module):
     def forward(self, x, t_cond, cross):
         for block in self.blocks:
             x = block(x, t_cond, cross)
-        x = self.final_layer(x, t_cond)
+        x = self.final_layer(x)
 
         return x

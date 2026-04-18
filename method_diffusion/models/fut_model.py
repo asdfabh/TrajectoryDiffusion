@@ -57,7 +57,7 @@ class DiffusionFut(nn.Module):
         )
 
         dit_block = dit.DiTBlock(self.hidden_dim, self.heads, self.dropout, self.mlp_ratio)
-        final_layer = dit.FinalLayer(self.hidden_dim, self.T, self.output_dim)
+        final_layer = dit.FinalLayer(self.hidden_dim, self.output_dim)
         self.dit = dit.DiT(dit_block=dit_block, final_layer=final_layer, depth=self.depth)
 
         # 仅对 Ego future 做归一化。
@@ -88,7 +88,7 @@ class DiffusionFut(nn.Module):
         gather_index = mode_idx.view(bsz, 1, 1, 1).expand(-1, 1, self.T, self.output_dim)
         best_pred = torch.gather(pred_x0, 1, gather_index).squeeze(1) # [B,T,D]
         valid = valid_mask.unsqueeze(-1).expand(-1, -1, self.output_dim) # [B,T,D]
-        loss_map = F.l1_loss(best_pred, target_x0, reduction="none") # [B,T,D]
+        loss_map = F.smooth_l1_loss(best_pred, target_x0, reduction="none") # [B,T,D]
         numer = (loss_map * valid).sum(dim=(1, 2)) # [B]
         denom = valid.sum(dim=(1, 2)) + 1e-6 # [B]
         loss = (numer / denom).mean()
