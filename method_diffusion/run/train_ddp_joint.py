@@ -28,7 +28,7 @@ from method_diffusion.run.train_joint import (
     load_hist_checkpoint,
     write_csv_log,
 )
-from method_diffusion.utils.fut_utils import compute_batch_ade_fde, select_minade_prediction
+from method_diffusion.utils.fut_utils import compute_batch_metric, select_closest_prediction
 
 
 def setup_ddp():
@@ -256,28 +256,12 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, rank
             detach_hist_for_fut=True,
         )
         if int(fut_model.fut_k) > 1:
-            all_preds, _ = fut_model.forwardEvalMulti(
-                hist_for_fut,
-                hist_nbrs,
-                mask,
-                temporal_mask,
-                fut,
-                device,
-                K=fut_model.fut_k,
-            )
-            pred_fut, _, _ = select_minade_prediction(all_preds, fut, op_mask)
+            all_preds = fut_model.forwardEvalMulti(hist_for_fut, hist_nbrs, mask, temporal_mask, fut, device, K=fut_model.fut_k)
+            pred_fut, _, _ = select_closest_prediction(all_preds, fut, op_mask)
         else:
-            all_preds, _ = fut_model.forwardEvalMulti(
-                hist_for_fut,
-                hist_nbrs,
-                mask,
-                temporal_mask,
-                fut,
-                device,
-                K=1,
-            )
+            all_preds = fut_model.forwardEvalMulti(hist_for_fut, hist_nbrs, mask, temporal_mask, fut, device, K=1)
             pred_fut = all_preds.squeeze(1)
-        eval_ade, eval_fde = compute_batch_ade_fde(pred_fut, fut, op_mask)
+        _, eval_ade, eval_fde = compute_batch_metric(pred_fut, fut, op_mask)
         eval_ade = float(eval_ade.item()) * METER_PER_FOOT
         eval_fde = float(eval_fde.item()) * METER_PER_FOOT
 

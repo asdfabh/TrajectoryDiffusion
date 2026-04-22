@@ -19,7 +19,6 @@ from method_diffusion.run.train_fut import (
     FUT_CHECKPOINT_DIR,
     LOSS_STAT_KEYS,
     METER_PER_FOOT,
-    compute_selection_score,
     init_csv_log,
     load_checkpoint,
     print_eval_summary,
@@ -27,7 +26,7 @@ from method_diffusion.run.train_fut import (
     write_csv_log,
     write_tensorboard_log,
 )
-from method_diffusion.utils.fut_utils import compute_batch_ade_fde, select_minade_prediction
+from method_diffusion.utils.fut_utils import compute_batch_metric, select_closest_prediction
 
 
 def setup_ddp():
@@ -136,13 +135,14 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
     fut_model = model.module if hasattr(model, "module") else model
     model.eval()
 
+    total_rmse = 0.0
     total_ade = 0.0
     total_fde = 0.0
     num_batches = 0
 
     if len(dataloader) == 0:
         model.train()
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
     pbar = tqdm(
         dataloader,
@@ -155,15 +155,17 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
         if int(fut_model.fut_k) > 1:
-            all_preds, _ = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=fut_model.fut_k)
-            pred_fut, _, _ = select_minade_prediction(all_preds, fut, op_mask)
+            all_preds = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=fut_model.fut_k)
+            pred_fut, _, _ = select_closest_prediction(all_preds, fut, op_mask)
         else:
-            all_preds, _ = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
+            all_preds = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
             pred_fut = all_preds.squeeze(1)
-        eval_ade, eval_fde = compute_batch_ade_fde(pred_fut, fut, op_mask)
+        eval_rmse, eval_ade, eval_fde = compute_batch_metric(pred_fut, fut, op_mask)
+        eval_rmse = float(eval_rmse.item()) * METER_PER_FOOT
         eval_ade = float(eval_ade.item()) * METER_PER_FOOT
         eval_fde = float(eval_fde.item()) * METER_PER_FOOT
 
+        total_rmse += eval_rmse
         total_ade += eval_ade
         total_fde += eval_fde
         num_batches += 1
@@ -171,21 +173,26 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
         if is_main_process(rank):
             pbar.set_postfix(
                 {
+                    "avg_rmse_m": f"{(total_rmse / num_batches):.4f}",
                     "avg_ade_m": f"{(total_ade / num_batches):.4f}",
                     "avg_fde_m": f"{(total_fde / num_batches):.4f}",
                 }
             )
 
     stats = torch.tensor(
-        [total_ade, total_fde, float(num_batches)],
+        [total_rmse, total_ade, total_fde, float(num_batches)],
         device=device,
         dtype=torch.float64,
     )
     stats = reduce_tensor(stats)
     model.train()
 
-    denom = max(int(stats[2].item()), 1)
-    return float(stats[0].item()) / denom, float(stats[1].item()) / denom
+    denom = max(int(stats[3].item()), 1)
+    return (
+        float(stats[0].item()) / denom,
+        float(stats[1].item()) / denom,
+        float(stats[2].item()) / denom,
+    )
 
 
 def main():
@@ -261,7 +268,7 @@ def main():
     model = DiffusionFut(args).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
-    start_epoch, best_score = load_checkpoint_for_rank(args.resume_fut, checkpoint_dir, model, optimizer, scheduler, device, rank)
+    start_epoch, best_rmse = load_checkpoint_for_rank(args.resume_fut, checkpoint_dir, model, optimizer, scheduler, device, rank)
 
     if dist.is_initialized():
         if device.type == "cuda":
@@ -273,19 +280,19 @@ def main():
         train_sampler.set_epoch(epoch)
 
         train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim, rank)
-        eval_ade, eval_fde = evaluate(model, val_loader, device, epoch + 1, args.feature_dim, rank)
-        selection_score = compute_selection_score(eval_ade, eval_fde)
+        eval_rmse, eval_ade, eval_fde = evaluate(model, val_loader, device, epoch + 1, args.feature_dim, rank)
+        selection_score = float(eval_rmse)
         current_lr = optimizer.param_groups[0]["lr"]
 
         if is_main_process(rank):
-            write_csv_log(log_csv_path, epoch + 1, train_stats, eval_ade, eval_fde, selection_score, current_lr)
-            write_tensorboard_log(writer, epoch + 1, train_stats, eval_ade, eval_fde, selection_score, current_lr)
-            print_eval_summary(epoch + 1, args.num_epochs, train_stats, eval_ade, eval_fde, selection_score)
+            write_csv_log(log_csv_path, epoch + 1, train_stats, eval_rmse, eval_ade, eval_fde, current_lr)
+            write_tensorboard_log(writer, epoch + 1, train_stats, eval_rmse, eval_ade, eval_fde, current_lr)
+            print_eval_summary(epoch + 1, args.num_epochs, train_stats, eval_rmse, eval_ade, eval_fde)
 
         scheduler.step()
-        is_best = selection_score < best_score
+        is_best = selection_score < best_rmse
         if is_best:
-            best_score = selection_score
+            best_rmse = selection_score
 
         if is_main_process(rank):
             model_state = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
@@ -295,10 +302,12 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "loss": train_stats["loss"],
+                "eval_rmse_m": eval_rmse,
                 "eval_ade_m": eval_ade,
                 "eval_fde_m": eval_fde,
                 "selection_score": selection_score,
-                "best_score": best_score,
+                "best_score": best_rmse,
+                "best_rmse_m": best_rmse,
             }
 
             if (epoch + 1) % args.save_interval == 0:

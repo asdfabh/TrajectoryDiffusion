@@ -24,7 +24,7 @@ from method_diffusion.run.evaluate_fut import (
 )
 from method_diffusion.run.train_fut import prepare_input_data
 from method_diffusion.run.train_joint import JOINT_FUT_CHECKPOINT_DIR, JOINT_HIST_CHECKPOINT_DIR
-from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_minade_prediction
+from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_closest_prediction
 from method_diffusion.utils.mask_util import mixed_mask
 
 
@@ -121,26 +121,10 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, mask
         hist_metrics.update(pred_hist, hist, hist_mask)
 
         if k_samples > 1:
-            all_preds, _ = model_fut.forwardEvalMulti(
-                pred_hist,
-                hist_nbrs,
-                mask,
-                temporal_mask,
-                fut,
-                device,
-                K=k_samples,
-            )
-            pred_fut, _, _ = select_minade_prediction(all_preds, fut, op_mask)
+            all_preds = model_fut.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, fut, device, K=k_samples)
+            pred_fut, _, _ = select_closest_prediction(all_preds, fut, op_mask)
         else:
-            all_preds, _ = model_fut.forwardEvalMulti(
-                pred_hist,
-                hist_nbrs,
-                mask,
-                temporal_mask,
-                fut,
-                device,
-                K=1,
-            )
+            all_preds = model_fut.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
             pred_fut = all_preds.squeeze(1)
         fut_metrics.update(pred_fut, fut, op_mask)
 

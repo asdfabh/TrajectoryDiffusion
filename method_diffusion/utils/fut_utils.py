@@ -42,14 +42,16 @@ def normalize_traj_valid_mask(valid_mask, pred):
     return (valid_mask > 0.5).to(pred.device).float()
 
 
-def compute_batch_ade_fde(pred, target, valid_mask=None):
-    """计算单个 batch 的 ADE / FDE。"""
+def compute_batch_metric(pred, target, valid_mask=None):
+    """计算单个 batch 的 RMSE / ADE / FDE。"""
     pred_xy = pred[..., :2]
     target_xy = target[..., :2]
     valid_mask = normalize_traj_valid_mask(valid_mask, pred_xy)
 
     diff = pred_xy - target_xy
+    dist_sq = torch.sum(diff ** 2, dim=-1)
     dist = torch.norm(diff, dim=-1)
+    rmse = torch.sqrt((dist_sq * valid_mask).sum() / (valid_mask.sum() + 1e-6))
     ade = (dist * valid_mask).sum() / (valid_mask.sum() + 1e-6)
 
     valid_counts = valid_mask.sum(dim=1).long()
@@ -57,22 +59,23 @@ def compute_batch_ade_fde(pred, target, valid_mask=None):
     last_idx = torch.clamp(valid_counts - 1, min=0)
     final_dist = dist.gather(1, last_idx.unsqueeze(1)).squeeze(1)
     fde = (final_dist * has_valid.float()).sum() / (has_valid.float().sum() + 1e-6)
-    return ade, fde
+    return rmse, ade, fde
 
 
-def select_minade_prediction(all_preds, target, valid_mask=None):
-    """从多模态预测中选择 minADE 对应轨迹。"""
+def select_closest_prediction(all_preds, target, valid_mask=None):
+    """从多模态预测中选择整段 future RMSE 最小的轨迹。"""
     target_xy = target[..., :2].unsqueeze(1)
     valid_mask = normalize_traj_valid_mask(valid_mask, all_preds[:, 0]).unsqueeze(1)
 
-    diff = torch.norm(all_preds[..., :2] - target_xy, dim=-1)
-    ade_k = (diff * valid_mask).sum(dim=2) / (valid_mask.sum(dim=2) + 1e-6)
-    best_idx = torch.argmin(ade_k, dim=1)
+    diff = all_preds[..., :2] - target_xy
+    dist_sq = torch.sum(diff ** 2, dim=-1)
+    mse_k = (dist_sq * valid_mask).sum(dim=2) / (valid_mask.sum(dim=2) + 1e-6)
+    best_idx = torch.argmin(mse_k, dim=1)
 
     bsz, _, t_len, feat_dim = all_preds.shape
     gather_idx = best_idx.view(bsz, 1, 1, 1).expand(bsz, 1, t_len, feat_dim)
     best_pred = all_preds.gather(1, gather_idx).squeeze(1)
-    return best_pred, best_idx, ade_k
+    return best_pred, best_idx, torch.sqrt(mse_k)
 
 
 def build_eval_timestep_pairs(train_timestep_max, num_inference_steps, inference_trunc_timestep):

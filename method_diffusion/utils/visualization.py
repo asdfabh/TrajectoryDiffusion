@@ -3,9 +3,6 @@ import matplotlib.patches as patches
 import numpy as np
 import torch
 
-from method_diffusion.utils.fut_utils import normalize_traj_valid_mask, select_minade_prediction
-
-
 MODE_COLOR_PALETTE = [
     "#E41A1C",
     "#377EB8",
@@ -60,47 +57,14 @@ def _compute_vis_metrics(pred_traj, target_traj, valid_mask):
     if dist_valid.size == 0:
         return None
 
-    coord_sq = diff[valid] ** 2
     return {
         "ade": float(dist_valid.mean()),
         "fde": float(dist_valid[-1]),
-        "rmse": float(np.sqrt(coord_sq.mean())),
     }
-
-
-def _format_prob_list(prob_values):
-    prob_arr = _to_numpy(prob_values)
-    if prob_arr is None:
-        return "[]"
-    prob_arr = np.asarray(prob_arr).reshape(-1)
-    return "[" + ", ".join(f"{float(v):.2f}" for v in prob_arr) + "]"
 
 
 def _get_mode_color(mode_idx):
     return MODE_COLOR_PALETTE[int(mode_idx) % len(MODE_COLOR_PALETTE)]
-
-
-def _select_mode_by_index(pred_all, mode_idx):
-    if pred_all is None or mode_idx is None:
-        return None
-    if isinstance(pred_all, torch.Tensor):
-        if not isinstance(mode_idx, torch.Tensor):
-            mode_idx = torch.as_tensor(mode_idx, device=pred_all.device, dtype=torch.long)
-        mode_idx = mode_idx.view(-1)
-        bsz, _, t_len, feat_dim = pred_all.shape
-        gather_idx = mode_idx.view(bsz, 1, 1, 1).expand(bsz, 1, t_len, feat_dim)
-        return pred_all.gather(1, gather_idx).squeeze(1)
-
-    pred_arr = np.asarray(pred_all)
-    idx_arr = np.asarray(mode_idx).reshape(-1).astype(np.int64)
-    selected = []
-    for b_idx, k_idx in enumerate(idx_arr):
-        if b_idx >= pred_arr.shape[0]:
-            break
-        selected.append(pred_arr[b_idx, k_idx])
-    if not selected:
-        return None
-    return np.stack(selected, axis=0)
 
 
 def plot_traj_with_mask(hist_original, hist_masked, hist_pred, fig_num1=3, fig_num2=3, input_unit="ft"):
@@ -179,12 +143,11 @@ def maybe_visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_t
     )
 
 
-def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, future=None, pred=None,
-                                 pred_all=None, pred_best_idx=None,
-                                 future_mask=None, pred_instant=None, intent_probs=None,
+def _visualize_future_prediction(hist=None, hist_nbrs=None, temporal_mask=None, future=None, pred=None,
+                                 pred_all=None, pred_best_idx=None, future_mask=None,
                                  batch_idx=0, metrics=None, input_unit="ft",
-                                 title=None, highlight_label="GT Anchor"):
-    """绘制 future 预测结果，支持多模态颜色、编号与 GT Anchor 高亮。"""
+                                 title=None, highlight_label="Best"):
+    """绘制 fut model 最终预测结果。"""
 
     def safe_get_batch(data, b_idx, batch_ndim=3):
         arr = _to_numpy(data)
@@ -253,7 +216,7 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
             return None
         return max(0, min(num_modes - 1, idx_val))
 
-    def select_best_by_ade(pred_modes, gt_traj, fut_mask_arr):
+    def select_best_by_rmse(pred_modes, gt_traj, fut_mask_arr):
         if pred_modes is None or pred_modes.ndim != 3 or pred_modes.shape[0] == 0:
             return None
         if gt_traj is None or gt_traj.ndim != 2 or gt_traj.shape[-1] < 2:
@@ -269,7 +232,7 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
                 valid = np.ones(gt_traj.shape[0], dtype=bool)
 
         best_k = 0
-        best_ade = float("inf")
+        best_rmse = float("inf")
         for k in range(pred_modes.shape[0]):
             traj = pred_modes[k]
             if traj.ndim != 2 or traj.shape[-1] < 2:
@@ -281,9 +244,9 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
             if not np.any(vm):
                 continue
             diff = traj[:t_len, :2] - gt_traj[:t_len, :2]
-            ade = float(np.linalg.norm(diff, axis=-1)[vm].mean())
-            if ade < best_ade:
-                best_ade = ade
+            rmse = float(np.sqrt(np.sum(diff[vm] ** 2, axis=-1).mean()))
+            if rmse < best_rmse:
+                best_rmse = rmse
                 best_k = k
         return best_k
 
@@ -293,9 +256,6 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
     pred_single = normalize_traj2d(safe_get_batch(pred, idx, batch_ndim=3))
     fut_mask_arr = safe_get_batch(future_mask, idx, batch_ndim=3)
     pred_modes = safe_get_batch(pred_all, idx, batch_ndim=4)
-    pred_instant_vis = normalize_traj2d(safe_get_batch(pred_instant, idx, batch_ndim=3))
-    intent_lat = safe_get_batch(None if intent_probs is None else intent_probs.get("lat"), idx, batch_ndim=2)
-    intent_lon = safe_get_batch(None if intent_probs is None else intent_probs.get("lon"), idx, batch_ndim=2)
 
     if pred_modes is not None:
         pred_modes = np.asarray(pred_modes)
@@ -306,7 +266,7 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
 
     best_k = resolve_best_idx(pred_best_idx, idx, 0 if pred_modes is None else pred_modes.shape[0])
     if best_k is None and pred_modes is not None:
-        best_k = select_best_by_ade(pred_modes, gt_fut, fut_mask_arr)
+        best_k = select_best_by_rmse(pred_modes, gt_fut, fut_mask_arr)
 
     pred_best = pred_single
     if pred_best is None and pred_modes is not None and pred_modes.shape[0] > 0:
@@ -393,32 +353,6 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
             )
     elif pred_best is not None:
         ax.plot(pred_best[:, 1], pred_best[:, 0], 'r-o', label='Pred', markersize=4, linewidth=2, alpha=0.9)
-    if pred_instant_vis is not None:
-        ax.plot(
-            pred_instant_vis[:, 1], pred_instant_vis[:, 0],
-            linestyle='--',
-            marker='s',
-            markersize=4,
-            linewidth=2.0,
-            alpha=0.95,
-            color='#F39C12',
-            label='Pred Instant',
-            zorder=4,
-        )
-
-    if intent_lat is not None or intent_lon is not None:
-        ax.text(
-            0.02,
-            0.98,
-            f"lat={_format_prob_list(intent_lat)}\nlon={_format_prob_list(intent_lon)}",
-            transform=ax.transAxes,
-            ha='left',
-            va='top',
-            fontsize=10,
-            family='monospace',
-            bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='#555555'),
-            zorder=5,
-        )
 
     unit = input_unit or "ft"
     title = "Trajectory Visualization" if title is None else str(title)
@@ -441,40 +375,23 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
 
 
 def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pred, valid_mask,
-                                      pred_all=None, pred_best_idx=None, pred_instant=None, intent_probs=None,
+                                      pred_all=None, pred_best_idx=None,
                                       meter_per_foot=0.3048, batch_idx=0, title=None,
-                                      highlight_label="GT Anchor"):
-    """绘制 future 预测可视化。"""
-    diff = pred[batch_idx, :, :2] - future[batch_idx, :, :2]
-    dist = torch.norm(diff, dim=-1)
-    vis_mask = valid_mask[batch_idx]
-    vis_ade = (dist * vis_mask).sum() / (vis_mask.sum() + 1e-6)
-    valid_count = int(vis_mask.sum().item())
-    vis_fde = dist[valid_count - 1] if valid_count > 0 else dist.new_tensor(0.0)
-    metrics = {
-        "ADE(vis traj)": {"ft": vis_ade.item(), "m": vis_ade.item() * meter_per_foot},
-        "FDE(vis traj)": {"ft": vis_fde.item(), "m": vis_fde.item() * meter_per_foot},
-    }
-    instant_metrics = _compute_vis_metrics(
-        pred_traj=None if pred_instant is None else pred_instant[batch_idx],
+                                      highlight_label="Best"):
+    """绘制 fut model 最终预测可视化。"""
+    vis_metrics = _compute_vis_metrics(
+        pred_traj=pred[batch_idx],
         target_traj=future[batch_idx],
         valid_mask=valid_mask[batch_idx],
     )
-    if instant_metrics is not None:
-        metrics["ADE(inst traj)"] = {
-            "ft": instant_metrics["ade"],
-            "m": instant_metrics["ade"] * meter_per_foot,
-        }
-        metrics["FDE(inst traj)"] = {
-            "ft": instant_metrics["fde"],
-            "m": instant_metrics["fde"] * meter_per_foot,
-        }
-        metrics["RMSE(inst traj)"] = {
-            "ft": instant_metrics["rmse"],
-            "m": instant_metrics["rmse"] * meter_per_foot,
-        }
-
-    visualize_batch_trajectories(
+    metrics = {
+        "ADE": {"ft": 0.0, "m": 0.0},
+        "FDE": {"ft": 0.0, "m": 0.0},
+    }
+    if vis_metrics is not None:
+        metrics["ADE"] = {"ft": vis_metrics["ade"], "m": vis_metrics["ade"] * meter_per_foot}
+        metrics["FDE"] = {"ft": vis_metrics["fde"], "m": vis_metrics["fde"] * meter_per_foot}
+    _visualize_future_prediction(
         hist=hist,
         hist_nbrs=hist_nbrs,
         temporal_mask=temporal_mask,
@@ -483,65 +400,9 @@ def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pr
         pred_all=pred_all,
         pred_best_idx=pred_best_idx,
         future_mask=valid_mask,
-        pred_instant=pred_instant,
-        intent_probs=intent_probs,
         batch_idx=batch_idx,
         metrics=metrics,
         input_unit="ft",
         title=title,
         highlight_label=highlight_label,
-    )
-
-
-def maybe_visualize_future_diffusion_process(hist, hist_nbrs, temporal_mask, future, anchor,
-                                             noisy_anchor, pred_all, valid_mask,
-                                             meter_per_foot=0.3048, batch_idx=0):
-    """按 Anchor -> Noise Anchor -> Pred 顺序绘制 diffusion 过程。"""
-    valid_mask = normalize_traj_valid_mask(valid_mask, future)
-    _, gt_anchor_idx, _ = select_minade_prediction(anchor, future, valid_mask)
-    gt_anchor_pred = _select_mode_by_index(anchor, gt_anchor_idx)
-    noisy_gt_pred = _select_mode_by_index(noisy_anchor, gt_anchor_idx)
-    pred_gt = _select_mode_by_index(pred_all, gt_anchor_idx)
-
-    maybe_visualize_future_prediction(
-        hist=hist,
-        hist_nbrs=hist_nbrs,
-        temporal_mask=temporal_mask,
-        future=future,
-        pred=gt_anchor_pred,
-        valid_mask=valid_mask,
-        pred_all=anchor,
-        pred_best_idx=gt_anchor_idx,
-        meter_per_foot=meter_per_foot,
-        batch_idx=batch_idx,
-        title="Anchor",
-        highlight_label="GT Anchor",
-    )
-    maybe_visualize_future_prediction(
-        hist=hist,
-        hist_nbrs=hist_nbrs,
-        temporal_mask=temporal_mask,
-        future=future,
-        pred=noisy_gt_pred,
-        valid_mask=valid_mask,
-        pred_all=noisy_anchor,
-        pred_best_idx=gt_anchor_idx,
-        meter_per_foot=meter_per_foot,
-        batch_idx=batch_idx,
-        title="Noise Anchor",
-        highlight_label="GT Anchor",
-    )
-    maybe_visualize_future_prediction(
-        hist=hist,
-        hist_nbrs=hist_nbrs,
-        temporal_mask=temporal_mask,
-        future=future,
-        pred=pred_gt,
-        valid_mask=valid_mask,
-        pred_all=pred_all,
-        pred_best_idx=gt_anchor_idx,
-        meter_per_foot=meter_per_foot,
-        batch_idx=batch_idx,
-        title="Pred",
-        highlight_label="GT Anchor",
     )

@@ -74,7 +74,7 @@ class DiffusionFut(nn.Module):
         plan_anchor = torch.load(anchor_path, map_location="cpu")
         self.plan_anchor = nn.Parameter(plan_anchor.float(), requires_grad=False)
 
-    # 先按GT最近anchor分配mode，再只对该mode回传回归损失。
+    # 先按 GT 最近 anchor（逐时刻 L2 平均距离）分配 mode，再只对该 mode 回传回归损失。
     # pred_x0 [B*K,T,D]; target_x0 [B,T,D]; anchor_x0 [B,K,T,D]; valid_mask [B,T]
     def computeLoss(self, pred_x0, target_x0, anchor_x0, valid_mask, bsz, k):
         pred_x0 = pred_x0.view(bsz, k, self.T, self.output_dim) # [B,K,T,D]
@@ -88,7 +88,7 @@ class DiffusionFut(nn.Module):
         gather_index = mode_idx.view(bsz, 1, 1, 1).expand(-1, 1, self.T, self.output_dim)
         best_pred = torch.gather(pred_x0, 1, gather_index).squeeze(1) # [B,T,D]
         valid = valid_mask.unsqueeze(-1).expand(-1, -1, self.output_dim) # [B,T,D]
-        loss_map = F.smooth_l1_loss(best_pred, target_x0, reduction="none") # [B,T,D]
+        loss_map = F.l1_loss(best_pred, target_x0, reduction="none") # [B,T,D]
         numer = (loss_map * valid).sum(dim=(1, 2)) # [B]
         denom = valid.sum(dim=(1, 2)) + 1e-6 # [B]
         loss = (numer / denom).mean()
@@ -134,7 +134,6 @@ class DiffusionFut(nn.Module):
         anchor_x0 = self.norm(anchor_x0_phys)
         noise = torch.randn_like(anchor_x0)
         x_t_init = diffusion_scheduler.add_noise(anchor_x0, noise, trunc_timesteps).float()
-        noisy_anchor_phys = self.denorm(x_t_init)
         x_t = x_t_init.reshape(bsz * k, t_len, self.output_dim)
 
         for current_timestep, next_timestep in zip(self.eval_current_timesteps, self.eval_next_timesteps):
@@ -148,12 +147,7 @@ class DiffusionFut(nn.Module):
         pred_phys = self.denorm(pred_x0.view(bsz, k, t_len, self.output_dim))
         all_preds = future.unsqueeze(1).repeat(1, k, 1, 1).clone()
         all_preds[..., :2] = pred_phys[..., :2]
-        vis_data = {
-            "anchor": anchor_x0_phys.detach(),
-            "noisy_anchor": noisy_anchor_phys.detach(),
-            "pred_all": all_preds.detach(),
-        }
-        return all_preds, vis_data
+        return all_preds
 
     # 统一前向入口，默认复用训练路径。
     def forward(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):

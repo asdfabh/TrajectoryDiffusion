@@ -13,8 +13,8 @@ from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.run.train_fut import prepare_input_data
-from method_diffusion.utils.fut_utils import TrajectoryMetrics, normalize_traj_valid_mask, select_minade_prediction
-from method_diffusion.utils.visualization import maybe_visualize_future_diffusion_process, maybe_visualize_future_prediction
+from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_closest_prediction
+from method_diffusion.utils.visualization import maybe_visualize_future_prediction
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
@@ -100,41 +100,32 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis):
     model.eval()
     metrics = TrajectoryMetrics(model.T)
     k_samples = max(1, int(fut_k))
-    eval_name = f"Fut minADE@{k_samples}" if k_samples > 1 else "Fut single-mode"
+    eval_name = f"Fut ClosestGT-RMSE@{k_samples}" if k_samples > 1 else "Fut single-mode"
 
     pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc=eval_name, ncols=120)
     for batch_idx, batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
 
         if k_samples > 1:
-            all_preds, vis_data = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=k_samples)
-            pred_fut, best_idx, _ = select_minade_prediction(all_preds, fut, op_mask)
+            all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=k_samples)
+            pred_fut, best_idx, _ = select_closest_prediction(all_preds, fut, op_mask)
             if enable_eval_vis:
-                maybe_visualize_future_diffusion_process(
+                # 旧的 diffusion 过程可视化已停用，这里仅保留最终预测结果可视化。
+                maybe_visualize_future_prediction(
                     hist=hist,
                     hist_nbrs=hist_nbrs,
                     temporal_mask=temporal_mask,
                     future=fut,
-                    anchor=vis_data["anchor"],
-                    noisy_anchor=vis_data["noisy_anchor"],
-                    pred_all=vis_data["pred_all"],
-                    valid_mask=op_mask,
+                    pred=pred_fut,
+                    valid_mask=(op_mask[..., 0] > 0.5).float(),
+                    pred_all=all_preds,
+                    pred_best_idx=best_idx,
                     meter_per_foot=METER_PER_FOOT,
-                    batch_idx=0,
+                    title="Future Prediction",
+                    highlight_label="Best",
                 )
-                # maybe_visualize_future_prediction(
-                #     hist=hist,
-                #     hist_nbrs=hist_nbrs,
-                #     temporal_mask=temporal_mask,
-                #     future=fut,
-                #     pred=pred_fut,
-                #     valid_mask=normalize_traj_valid_mask(op_mask, pred_fut),
-                #     pred_all=all_preds,
-                #     pred_best_idx=best_idx,
-                #     meter_per_foot=METER_PER_FOOT,
-                # )
         else:
-            all_preds, vis_data = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
+            all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
             pred_fut = all_preds.squeeze(1)
 
         metrics.update(pred_fut, fut, op_mask)
