@@ -19,7 +19,7 @@ def get_args_parser():
     parser.add_argument("--block_mask_start", default=0, type=int)
     parser.add_argument("--checkpoint_dir", default="./checkpoints", type=str)
     parser.add_argument("--resume_fut", default="none", type=str)
-    parser.add_argument("--resume_hist", default="best", type=str)
+    parser.add_argument("--resume_hist", default="none", type=str)
 
     # Joint train strategy
     parser.add_argument("--joint_freeze_hist", default=1, type=int)
@@ -30,7 +30,7 @@ def get_args_parser():
     # Hist diffusion model
     parser.add_argument("--input_dim", default=128, type=int)
     parser.add_argument("--hidden_dim", default=128, type=int)
-    parser.add_argument("--output_dim", default=4, type=int)
+    parser.add_argument("--output_dim", default=6, type=int)
     parser.add_argument("--hist_length", default=16, type=int)
     parser.add_argument("--pred_length", default=25, type=int)
     parser.add_argument("--heads", default=4, type=int)

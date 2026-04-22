@@ -1,15 +1,14 @@
+import copy
 import math
+
 import torch
 import torch.nn as nn
 from timm.layers import Mlp
-import copy
 
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-def scale(x, scale):
-    return x * (1 + scale.unsqueeze(1))
 
 class TimestepEmbedder(nn.Module):
     def __init__(self, hidden_size, frequency_embedding_size=256):
@@ -33,104 +32,66 @@ class TimestepEmbedder(nn.Module):
         return embedding
 
     def forward(self, t):
-         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-         t_emb =  self.mlp(t_freq)
-         return t_emb
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq)
+        return t_emb
 
 
 class DiTBlock(nn.Module):
-
-    def __init__(self, dim=128, heads=3, dropout=0.1, mlp_ratio=4.0, T=16):
+    def __init__(self, dim=128, heads=4, dropout=0.1, mlp_ratio=4.0):
         super().__init__()
-        self.T = T  # 时间步数
-
         self.norm1 = nn.LayerNorm(dim)
         self.attn1 = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
-
         self.norm2 = nn.LayerNorm(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp1 = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
 
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(dim, 6 * dim, bias=True)
+            nn.Linear(dim, 3 * dim, bias=True),
         )
-        nn.init.xavier_uniform_(self.adaLN_modulation[-1].weight, gain=0.02)
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-        self.norm3 = nn.LayerNorm(dim)
         self.attn2 = nn.MultiheadAttention(dim, heads, dropout, batch_first=True)
 
-        self.norm4 = nn.LayerNorm(dim)
-        self.mlp2 = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
 
-    def forward(self, x, y):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(6, dim=1)
-        modulated_x = modulate(self.norm1(x), shift_msa, scale_msa) # size: (B, T, D)
+    def forward(self, x, t_cond, attn_mask=None):
+        shift_msa, scale_msa, gate_msa = self.adaLN_modulation(t_cond).chunk(3, dim=1)
 
-        modulated_x = self.attn1(modulated_x, modulated_x, modulated_x, key_padding_mask=None)[0]
-        x = x + gate_msa.unsqueeze(1) * modulated_x
-        modulated_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = x + gate_mlp.unsqueeze(1) * self.mlp1(modulated_x)
-
-        x = self.norm3(x)
-        x = x + self.attn2(x, x, x, key_padding_mask=None)[0]
-        x = x + self.mlp2(self.norm4(x))
-
+        modulated_x = modulate(self.norm1(x), shift_msa, scale_msa)
+        x = x + gate_msa.unsqueeze(1) * self.attn1(modulated_x, modulated_x, modulated_x, key_padding_mask=attn_mask,)[0]
+        x = x + self.attn2(x, x, x, key_padding_mask=attn_mask)[0]
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
 class FinalLayer(nn.Module):
-    def __init__(self, hidden_size, T=16, output_dim=2):
+    def __init__(self, hidden_size, output_dim=2):
         super().__init__()
-        self.T = T
         self.output_dim = output_dim
-        self.norm_final = nn.LayerNorm(hidden_size)
-
         self.proj = nn.Sequential(
-            nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_size * 4, bias=True),
             nn.GELU(approximate="tanh"),
-            nn.LayerNorm(hidden_size * 4),
-            nn.Linear(hidden_size * 4, output_dim, bias=True)
+            nn.Linear(hidden_size * 4, output_dim, bias=True),
         )
 
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
-        )
+    def forward(self, x):
+        return self.proj(x)
 
-    def forward(self, x, y):
-
-        shift, scale = self.adaLN_modulation(y).chunk(2, dim=1)
-        x = modulate(self.norm_final(x), shift, scale)
-        x = self.proj(x)
-        return x
 
 class DiT(nn.Module):
-    def __init__(self, dit_block, final_layer, time_embedder, depth, model_type="x_start"):
+    def __init__(self, dit_block, final_layer, depth):
         super().__init__()
-
-        assert model_type in ["score", "x_start"], f"Unknown model type: {model_type}"
-        self._model_type = model_type
-        
         self.blocks = nn.ModuleList([copy.deepcopy(dit_block) for _ in range(depth)])
         self.final_layer = final_layer
-        self.time_embedder = time_embedder
 
-    @property
-    def model_type(self):
-        return self._model_type
-
-    def forward(self, x, t):
-        y = self.time_embedder(t)
+    def forward(self, x, t_cond):
         for block in self.blocks:
-            x = block(x, y)
-        x = self.final_layer(x, y)
-
+            x = block(x, t_cond)
+        x = self.final_layer(x)
         return x
-
 
 
 

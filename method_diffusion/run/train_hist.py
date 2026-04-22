@@ -71,8 +71,10 @@ def init_csv_log(csv_path):
         "train_loss",
         "train_xy_unknown",
         "train_xy_known",
-        "train_va_unknown",
-        "train_va_known",
+        "train_v_unknown",
+        "train_v_known",
+        "train_a_unknown",
+        "train_a_known",
         "val_loss",
         "val_masked_ade_ft",
         "val_masked_ade_m",
@@ -89,8 +91,10 @@ def write_csv_log(csv_path, epoch, train_stats, eval_stats, lr):
         "train_loss": train_stats["loss_total"],
         "train_xy_unknown": train_stats["loss_xy_unknown"],
         "train_xy_known": train_stats["loss_xy_known"],
-        "train_va_unknown": train_stats["loss_va_unknown"],
-        "train_va_known": train_stats["loss_va_known"],
+        "train_v_unknown": train_stats["loss_v_unknown"],
+        "train_v_known": train_stats["loss_v_known"],
+        "train_a_unknown": train_stats["loss_a_unknown"],
+        "train_a_known": train_stats["loss_a_known"],
         "val_loss": eval_stats["loss"],
         "val_masked_ade_ft": eval_stats["masked_ade_ft"],
         "val_masked_ade_m": eval_stats["masked_ade_ft"] * 0.3048,
@@ -163,8 +167,10 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, mask_r
         "loss_total": 0.0,
         "loss_xy_unknown": 0.0,
         "loss_xy_known": 0.0,
-        "loss_va_unknown": 0.0,
-        "loss_va_known": 0.0,
+        "loss_v_unknown": 0.0,
+        "loss_v_known": 0.0,
+        "loss_a_unknown": 0.0,
+        "loss_a_known": 0.0,
     }
     num_batches = 0
 
@@ -181,9 +187,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, mask_r
             random_mask_ratio=random_mask_ratio,
             block_mask_start=block_mask_start,
         )
-        loss, pred, loss_parts = model.forward_train(hist, hist_masked, device, return_components=True)
+        loss, pred, loss_parts = model.forward_train(hist, hist_masked, device)
         masked_ade = compute_masked_xy_ade(pred, hist, hist_masked[..., -1:])
-        # _, _, _, _ = model.forward_train(hist, hist_masked, device)
 
         optimizer.zero_grad()
         loss.backward()
@@ -198,7 +203,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, mask_r
             "loss": f"{loss.item():.6f}",
             "avg_loss": f"{(total_stats['loss_total'] / num_batches):.6f}",
             "xy_u": f"{(total_stats['loss_xy_unknown'] / num_batches):.5f}",
-            "va_u": f"{(total_stats['loss_va_unknown'] / num_batches):.5f}",
+            "v_u": f"{(total_stats['loss_v_unknown'] / num_batches):.5f}",
+            "a_u": f"{(total_stats['loss_a_unknown'] / num_batches):.5f}",
             "mask_ade": f"{masked_ade.item():.4f}",
         })
 
@@ -335,8 +341,10 @@ def main():
         writer.add_scalar("Loss/Train", train_stats["loss_total"], epoch + 1)
         writer.add_scalar("Loss/TrainXYUnknown", train_stats["loss_xy_unknown"], epoch + 1)
         writer.add_scalar("Loss/TrainXYKnown", train_stats["loss_xy_known"], epoch + 1)
-        writer.add_scalar("Loss/TrainVAUnknown", train_stats["loss_va_unknown"], epoch + 1)
-        writer.add_scalar("Loss/TrainVAKnown", train_stats["loss_va_known"], epoch + 1)
+        writer.add_scalar("Loss/TrainVUnknown", train_stats["loss_v_unknown"], epoch + 1)
+        writer.add_scalar("Loss/TrainVKnown", train_stats["loss_v_known"], epoch + 1)
+        writer.add_scalar("Loss/TrainAUnknown", train_stats["loss_a_unknown"], epoch + 1)
+        writer.add_scalar("Loss/TrainAKnown", train_stats["loss_a_known"], epoch + 1)
         writer.add_scalar("Eval/Loss", eval_stats["loss"], epoch + 1)
         writer.add_scalar("Eval/MaskedADE_ft", eval_stats["masked_ade_ft"], epoch + 1)
 
@@ -345,8 +353,10 @@ def main():
             f"train={train_stats['loss_total']:.6f} | "
             f"xy_u={train_stats['loss_xy_unknown']:.6f} | "
             f"xy_k={train_stats['loss_xy_known']:.6f} | "
-            f"va_u={train_stats['loss_va_unknown']:.6f} | "
-            f"va_k={train_stats['loss_va_known']:.6f} | "
+            f"v_u={train_stats['loss_v_unknown']:.6f} | "
+            f"v_k={train_stats['loss_v_known']:.6f} | "
+            f"a_u={train_stats['loss_a_unknown']:.6f} | "
+            f"a_k={train_stats['loss_a_known']:.6f} | "
             f"mask_ratio={mask_ratio:.2f} | "
             f"rand_ratio={random_mask_ratio:.2f} | "
             f"val_loss={eval_stats['loss']:.6f} | "
