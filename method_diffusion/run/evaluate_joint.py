@@ -1,63 +1,34 @@
-import sys
 import os
+import sys
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.config import get_args_parser
-from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.run.evaluate import (
     HIST_CHECKPOINT_DIR,
-    HistReconstructionMetrics,
     load_checkpoint as load_hist_checkpoint,
-    print_metrics as print_hist_metrics,
+    prepare_input_data as prepare_hist_input_data,
 )
 from method_diffusion.run.evaluate_fut import (
+    METER_PER_FOOT,
+    build_test_loader,
     load_checkpoint as load_fut_checkpoint,
-    print_metrics as print_fut_metrics,
+    print_metrics,
 )
 from method_diffusion.run.train_fut import prepare_input_data
 from method_diffusion.run.train_joint import JOINT_FUT_CHECKPOINT_DIR, JOINT_HIST_CHECKPOINT_DIR
 from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_closest_prediction
-from method_diffusion.utils.mask_util import mixed_mask
+from method_diffusion.utils.visualization import visualize_scene_prediction
 
 
 def get_eval_args():
     return get_args_parser().parse_args()
-
-def filter_valid_batch(batch):
-    sample_valid = batch.get("sample_valid", None)
-    if sample_valid is None:
-        return batch
-    sample_valid = sample_valid.bool()
-    if sample_valid.numel() == 0 or bool(sample_valid.all()):
-        return batch
-
-    filtered = {}
-    for key, value in batch.items():
-        if torch.is_tensor(value) and value.dim() > 0 and value.shape[0] == sample_valid.shape[0]:
-            filtered[key] = value[sample_valid]
-        else:
-            filtered[key] = value
-    return filtered
-
-
-def build_hist_mask(hist, mask_ratio, random_mask_ratio, block_mask_start):
-    hist_mask = mixed_mask(
-        hist,
-        p=mask_ratio,
-        random_ratio=random_mask_ratio,
-        block_start=block_mask_start,
-    )
-    hist_mask = hist_mask.to(hist.device)
-    hist_masked = torch.cat([hist_mask * hist, hist_mask], dim=-1)
-    return hist_masked, hist_mask
 
 
 def resolve_hist_checkpoint_dir(resume_hist):
@@ -71,83 +42,71 @@ def resolve_hist_checkpoint_dir(resume_hist):
     return HIST_CHECKPOINT_DIR
 
 
-def build_test_loader(args):
-    dataset_name = str(args.dataset).lower()
-    data_root = Path(args.data_root_highd if dataset_name == "highd" else args.data_root_ngsim)
-    test_path = data_root / "TestSet.mat"
-    if not test_path.exists():
-        test_path = data_root / "ValSet.mat"
-    print(f"[JointEval] Dataset: {dataset_name}")
-    print(f"[JointEval] Test path: {test_path}")
-    test_dataset = NgsimDataset(
-        str(test_path),
-        t_h=30,
-        t_f=50,
-        d_s=2,
-        enc_size=args.encoder_input_dim,
-        feature_dim=args.feature_dim,
-    )
-    return DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=test_dataset.collate_fn,
-        pin_memory=True,
-        persistent_workers=args.num_workers > 0,
-        drop_last=False,
-    )
-
-
 @torch.no_grad()
-def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, mask_ratio, random_mask_ratio, block_mask_start):
+def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enable_eval_vis, mask_ratio, random_mask_ratio, block_mask_start):
     model_hist.eval()
     model_fut.eval()
-    hist_metrics = HistReconstructionMetrics()
-    fut_metrics = TrajectoryMetrics(model_fut.T)
+    metrics = TrajectoryMetrics(model_fut.T)
     k_samples = max(1, int(fut_k))
+    eval_name = f"Joint Fut ClosestGT-RMSE@{k_samples}" if k_samples > 1 else "Joint Fut single-mode"
 
-    pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc="Eval Joint", ncols=140)
+    pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc=eval_name, ncols=140)
     for batch_idx, batch in pbar:
-        batch = filter_valid_batch(batch)
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
             batch,
             feature_dim,
             device=device,
         )
-
-        hist_masked, hist_mask = build_hist_mask(hist, mask_ratio, random_mask_ratio, block_mask_start)
+        _, hist_masked, _ = prepare_hist_input_data(
+            batch,
+            feature_dim,
+            mask_ratio=mask_ratio,
+            random_mask_ratio=random_mask_ratio,
+            block_mask_start=block_mask_start,
+            device=device,
+        )
         _, pred_hist = model_hist.forward_eval(hist, hist_masked, device)
-        hist_metrics.update(pred_hist, hist, hist_mask)
 
         if k_samples > 1:
             all_preds = model_fut.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, fut, device, K=k_samples)
-            pred_fut, _, _ = select_closest_prediction(all_preds, fut, op_mask)
+            pred_fut, best_idx, _ = select_closest_prediction(all_preds, fut, op_mask)
         else:
             all_preds = model_fut.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
             pred_fut = all_preds.squeeze(1)
-        fut_metrics.update(pred_fut, fut, op_mask)
+            best_idx = None
 
-        hist_summary = hist_metrics.summary()
-        fut_summary = fut_metrics.summary()
-        last_idx = min(model_fut.T, len(fut_summary["rmse_per_step_m"])) - 1
+        if enable_eval_vis:
+            visualize_scene_prediction(
+                hist=hist,
+                hist_nbrs=hist_nbrs,
+                temporal_mask=temporal_mask,
+                future=fut,
+                pred=pred_fut,
+                valid_mask=(op_mask[..., 0] > 0.5).float(),
+                pred_all=all_preds,
+                pred_best_idx=best_idx,
+                meter_per_foot=METER_PER_FOOT,
+                title="Joint Hist Reconstruction + Future Prediction",
+                highlight_label="Best",
+                hist_masked=hist_masked,
+                hist_reconstructed=pred_hist,
+            )
+
+        metrics.update(pred_fut, fut, op_mask)
+        summary = metrics.summary()
+        last_idx = min(model_fut.T, len(summary["rmse_per_step_m"])) - 1
         pbar.set_postfix({
-            "hist_ade_m": f"{hist_summary['xy_ade_m']['masked']:.4f}",
-            "hist_rmse_m": f"{hist_summary['xy_rmse_m']['masked']:.4f}",
-            "fut_ade_5s": f"{fut_summary['ade_per_step_m'][last_idx]:.4f}",
-            "fut_fde_5s": f"{fut_summary['fde_per_step_m'][last_idx]:.4f}",
-            "fut_rmse_5s": f"{fut_summary['rmse_per_step_m'][last_idx]:.4f}",
+            "ade_5s": f"{summary['ade_per_step_m'][last_idx]:.4f}",
+            "fde_5s": f"{summary['fde_per_step_m'][last_idx]:.4f}",
+            "rmse_5s": f"{summary['rmse_per_step_m'][last_idx]:.4f}",
         })
 
         if batch_idx % 100 == 0:
-            print_hist_metrics(hist_summary, f"Joint Hist Iteration {batch_idx}", mask_ratio, random_mask_ratio, block_mask_start)
-            print_fut_metrics(fut_summary, f"Joint Fut Iteration {batch_idx}")
+            print_metrics(summary, f"Joint Test Iteration {batch_idx}")
 
-    final_hist = hist_metrics.summary()
-    final_fut = fut_metrics.summary()
-    print_hist_metrics(final_hist, "Joint Hist Reconstruction Result", mask_ratio, random_mask_ratio, block_mask_start)
-    print_fut_metrics(final_fut, "Joint Fut Prediction Result")
-    return final_hist, final_fut
+    final_metrics = metrics.summary()
+    print_metrics(final_metrics, "Joint Final Test Result")
+    return final_metrics
 
 
 def main():
@@ -161,7 +120,7 @@ def main():
     print(f"[JointEval] Fut checkpoint dir: {fut_checkpoint_dir}")
     print(f"[JointEval] fut_k={args.fut_k}, num_inference_steps={args.num_inference_steps}")
 
-    dataloader = build_test_loader(args)
+    test_loader = build_test_loader(args)
     model_hist = DiffusionPast(args).to(device)
     model_fut = DiffusionFut(args).to(device)
     load_hist_checkpoint(model_hist, args.resume_hist, hist_checkpoint_dir, device, model_name="JointHistEval")
@@ -169,10 +128,11 @@ def main():
     evaluate(
         model_hist=model_hist,
         model_fut=model_fut,
-        dataloader=dataloader,
+        dataloader=test_loader,
         device=device,
         feature_dim=args.feature_dim,
         fut_k=args.fut_k,
+        enable_eval_vis=int(args.fut_enable_eval_vis) > 0,
         mask_ratio=max(0.0, min(1.0, float(args.mask_prob))),
         random_mask_ratio=max(0.0, min(1.0, float(args.random_mask_ratio))),
         block_mask_start=int(args.block_mask_start) > 0,

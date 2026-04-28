@@ -67,7 +67,7 @@ def _get_mode_color(mode_idx):
     return MODE_COLOR_PALETTE[int(mode_idx) % len(MODE_COLOR_PALETTE)]
 
 
-def plot_traj_with_mask(hist_original, hist_masked, hist_pred, fig_num1=3, fig_num2=3, input_unit="ft"):
+def plot_hist_reconstruction(hist_original, hist_masked, hist_pred, fig_num1=3, fig_num2=3, input_unit="ft"):
     """绘制 hist 重建结果：原始轨迹、掩码位置、预测轨迹。"""
     num_samples = len(hist_original)
     fig_num1 = num_samples // fig_num2 + (num_samples % fig_num2 > 0)
@@ -120,8 +120,8 @@ def plot_traj_with_mask(hist_original, hist_masked, hist_pred, fig_num1=3, fig_n
     plt.show()
 
 
-def maybe_visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_train_vis=False, enable_eval_vis=False,
-                                        batch_idx=0, input_unit="ft"):
+def visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_train_vis=False, enable_eval_vis=False,
+                                  batch_idx=0, input_unit="ft"):
     """按配置开关控制 hist 重建可视化。"""
     if stage == "train":
         if not enable_train_vis:
@@ -133,7 +133,7 @@ def maybe_visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_t
     hist_masked_vis = hist_masked[batch_idx:batch_idx + 1].detach().cpu().numpy()
     pred_vis = pred[batch_idx:batch_idx + 1, :, :2].detach().cpu().numpy()
 
-    plot_traj_with_mask(
+    plot_hist_reconstruction(
         hist_original=hist_vis,
         hist_masked=hist_masked_vis,
         hist_pred=pred_vis,
@@ -143,10 +143,11 @@ def maybe_visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_t
     )
 
 
-def _visualize_future_prediction(hist=None, hist_nbrs=None, temporal_mask=None, future=None, pred=None,
-                                 pred_all=None, pred_best_idx=None, future_mask=None,
-                                 batch_idx=0, metrics=None, input_unit="ft",
-                                 title=None, highlight_label="Best"):
+def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, future=None, pred=None,
+                                pred_all=None, pred_best_idx=None, future_mask=None,
+                                batch_idx=0, metrics=None, input_unit="ft",
+                                title=None, highlight_label="Best",
+                                hist_masked=None, hist_reconstructed=None):
     """绘制 fut model 最终预测结果。"""
 
     def safe_get_batch(data, b_idx, batch_ndim=3):
@@ -255,6 +256,8 @@ def _visualize_future_prediction(hist=None, hist_nbrs=None, temporal_mask=None, 
     gt_fut = normalize_traj2d(safe_get_batch(future, idx, batch_ndim=3))
     pred_single = normalize_traj2d(safe_get_batch(pred, idx, batch_ndim=3))
     fut_mask_arr = safe_get_batch(future_mask, idx, batch_ndim=3)
+    hist_masked_arr = safe_get_batch(hist_masked, idx, batch_ndim=3)
+    hist_recon = normalize_traj2d(safe_get_batch(hist_reconstructed, idx, batch_ndim=3))
     pred_modes = safe_get_batch(pred_all, idx, batch_ndim=4)
 
     if pred_modes is not None:
@@ -274,7 +277,7 @@ def _visualize_future_prediction(hist=None, hist_nbrs=None, temporal_mask=None, 
 
     nbrs_vis = reconstruct_nbrs_from_mask(hist_nbrs, temporal_mask, idx)
 
-    fig, ax = plt.subplots(figsize=(10, 10))
+    fig, ax = plt.subplots(figsize=(16, 9))
     lane_lines = (-18.0, -6.0, 6.0, 18.0)
 
     for lane_y in lane_lines:
@@ -305,9 +308,62 @@ def _visualize_future_prediction(hist=None, hist_nbrs=None, temporal_mask=None, 
             first_nbr = False
 
     if gt_hist is not None:
-        ax.plot(gt_hist[:, 1], gt_hist[:, 0], 'b-o', label='Hist', markersize=4, linewidth=2, alpha=0.8)
+        ax.plot(
+            gt_hist[:, 1], gt_hist[:, 0],
+            color='#1F77B4',
+            linestyle='-',
+            marker='o',
+            markersize=4,
+            linewidth=2.0,
+            alpha=0.85,
+            label='Original Hist',
+            zorder=8,
+        )
+
+    if hist_masked_arr is not None and gt_hist is not None:
+        hist_mask_arr = np.asarray(hist_masked_arr)
+        if hist_mask_arr.ndim == 2 and hist_mask_arr.shape[-1] >= 1:
+            obs_mask = hist_mask_arr[:, -1] > 0.5
+            masked_idx = ~obs_mask
+            if masked_idx.any():
+                masked_points = gt_hist[:masked_idx.shape[0]][masked_idx]
+                if masked_points.size > 0:
+                    ax.scatter(
+                        masked_points[:, 1],
+                        masked_points[:, 0],
+                        marker='x',
+                        s=64,
+                        linewidths=1.8,
+                        color='#D62728',
+                        label='Masked Hist Points',
+                        zorder=6,
+                    )
+
+    if hist_recon is not None:
+        ax.plot(
+            hist_recon[:, 1], hist_recon[:, 0],
+            color='#2CA02C',
+            linestyle='-',
+            marker='o',
+            markersize=4,
+            linewidth=2.2,
+            alpha=0.9,
+            label='Reconstructed Hist',
+            zorder=5,
+        )
+
     if gt_fut is not None:
-        ax.plot(gt_fut[:, 1], gt_fut[:, 0], 'g-o', label='GT Future', markersize=4, linewidth=2, alpha=0.8)
+        ax.plot(
+            gt_fut[:, 1], gt_fut[:, 0],
+            color='#00A65A',
+            linestyle='-',
+            marker='o',
+            markersize=4,
+            linewidth=2.2,
+            alpha=0.9,
+            label='GT Future',
+            zorder=9,
+        )
     if pred_modes is not None:
         for k in range(pred_modes.shape[0]):
             traj = normalize_traj2d(pred_modes[k])
@@ -329,7 +385,7 @@ def _visualize_future_prediction(hist=None, hist_nbrs=None, temporal_mask=None, 
                 alpha=0.95 if is_best else 0.8,
                 color=mode_color,
                 label=label,
-                zorder=3 if is_best else 2
+                zorder=4 if is_best else 3
             )
             end_y, end_x = traj[-1, 0], traj[-1, 1]
             ax.scatter(
@@ -338,7 +394,7 @@ def _visualize_future_prediction(hist=None, hist_nbrs=None, temporal_mask=None, 
                 s=36 if is_best else 18,
                 color=mode_color,
                 marker='*' if is_best else 'o',
-                zorder=5 if is_best else 4,
+                zorder=4 if is_best else 3,
             )
             end_text = f"{mode_num} {highlight_label}" if is_best else f"{mode_num}"
             ax.text(
@@ -349,10 +405,20 @@ def _visualize_future_prediction(hist=None, hist_nbrs=None, temporal_mask=None, 
                 fontsize=9,
                 weight='bold' if is_best else 'normal',
                 bbox=dict(boxstyle='round,pad=0.15', facecolor='white', alpha=0.7, edgecolor=mode_color),
-                zorder=6,
+                zorder=4,
             )
     elif pred_best is not None:
-        ax.plot(pred_best[:, 1], pred_best[:, 0], 'r-o', label='Pred', markersize=4, linewidth=2, alpha=0.9)
+        ax.plot(
+            pred_best[:, 1], pred_best[:, 0],
+            color='#E41A1C',
+            linestyle='-',
+            marker='o',
+            markersize=4,
+            linewidth=2.0,
+            alpha=0.9,
+            label='Pred',
+            zorder=4,
+        )
 
     unit = input_unit or "ft"
     title = "Trajectory Visualization" if title is None else str(title)
@@ -374,11 +440,12 @@ def _visualize_future_prediction(hist=None, hist_nbrs=None, temporal_mask=None, 
     plt.show()
 
 
-def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pred, valid_mask,
-                                      pred_all=None, pred_best_idx=None,
-                                      meter_per_foot=0.3048, batch_idx=0, title=None,
-                                      highlight_label="Best"):
-    """绘制 fut model 最终预测可视化。"""
+def visualize_scene_prediction(hist, hist_nbrs, temporal_mask, future, pred, valid_mask,
+                               pred_all=None, pred_best_idx=None,
+                               meter_per_foot=0.3048, batch_idx=0, title=None,
+                               highlight_label="Best", hist_masked=None,
+                               hist_reconstructed=None):
+    """统一场景可视化：hist、mask、重建、周车、future 与预测结果。"""
     vis_metrics = _compute_vis_metrics(
         pred_traj=pred[batch_idx],
         target_traj=future[batch_idx],
@@ -391,7 +458,7 @@ def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pr
     if vis_metrics is not None:
         metrics["ADE"] = {"ft": vis_metrics["ade"], "m": vis_metrics["ade"] * meter_per_foot}
         metrics["FDE"] = {"ft": vis_metrics["fde"], "m": vis_metrics["fde"] * meter_per_foot}
-    _visualize_future_prediction(
+    _visualize_scene_prediction(
         hist=hist,
         hist_nbrs=hist_nbrs,
         temporal_mask=temporal_mask,
@@ -405,4 +472,6 @@ def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pr
         input_unit="ft",
         title=title,
         highlight_label=highlight_label,
+        hist_masked=hist_masked,
+        hist_reconstructed=hist_reconstructed,
     )

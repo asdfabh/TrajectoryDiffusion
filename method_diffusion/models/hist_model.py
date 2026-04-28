@@ -4,7 +4,7 @@ from diffusers.schedulers import DDIMScheduler
 import torch
 import torch.nn.functional as F
 from method_diffusion.utils.position_encoding import SequentialPositionalEncoding
-from method_diffusion.utils.visualization import maybe_visualize_hist_reconstruction
+from method_diffusion.utils.visualization import visualize_hist_reconstruction
 
 
 class DiffusionPast(nn.Module):
@@ -192,7 +192,7 @@ class DiffusionPast(nn.Module):
         loss, loss_parts = self.compute_motion_loss(pred_x0, x_start, hist_mask)
 
         pred = self.denorm(pred_x0)
-        maybe_visualize_hist_reconstruction(
+        visualize_hist_reconstruction(
             hist=hist,
             hist_masked=hist_masked,
             pred=pred,
@@ -247,7 +247,7 @@ class DiffusionPast(nn.Module):
             final_pred[..., 4:5] = torch.clamp(torch.round(final_pred[..., 4:5]), self.lane_min, self.lane_max)
             final_pred[..., 5:6] = torch.clamp(torch.round(final_pred[..., 5:6]), self.class_min, self.class_max)
         loss = torch.nn.functional.mse_loss(final_pred, hist)
-        maybe_visualize_hist_reconstruction(
+        visualize_hist_reconstruction(
             hist=hist,
             hist_masked=hist_masked,
             pred=final_pred,

@@ -14,7 +14,7 @@ from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.run.train_fut import prepare_input_data
 from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_closest_prediction
-from method_diffusion.utils.visualization import maybe_visualize_future_prediction
+from method_diffusion.utils.visualization import visualize_scene_prediction
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
@@ -111,7 +111,7 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis):
             pred_fut, best_idx, _ = select_closest_prediction(all_preds, fut, op_mask)
             if enable_eval_vis:
                 # 旧的 diffusion 过程可视化已停用，这里仅保留最终预测结果可视化。
-                maybe_visualize_future_prediction(
+                visualize_scene_prediction(
                     hist=hist,
                     hist_nbrs=hist_nbrs,
                     temporal_mask=temporal_mask,
@@ -121,6 +121,7 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis):
                     pred_all=all_preds,
                     pred_best_idx=best_idx,
                     meter_per_foot=METER_PER_FOOT,
+                    batch_idx=0,
                     title="Future Prediction",
                     highlight_label="Best",
                 )
