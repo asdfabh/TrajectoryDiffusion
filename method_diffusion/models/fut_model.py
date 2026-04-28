@@ -74,53 +74,6 @@ class DiffusionFut(nn.Module):
         plan_anchor = torch.load(anchor_path, map_location="cpu")
         self.plan_anchor = nn.Parameter(plan_anchor.float(), requires_grad=False)
 
-    """
-    # 先按 GT 最近 anchor（逐时刻 L2 平均距离）分配 mode，再只对该 mode 回传回归损失。
-    # pred_x0 [B*K,T,D]; target_x0 [B,T,D]; anchor_x0 [B,K,T,D]; valid_mask [B,T]
-    def computeLoss(self, pred_x0, target_x0, anchor_x0, valid_mask, bsz, k):
-        pred_x0 = pred_x0.view(bsz, k, self.T, self.output_dim) # [B,K,T,D]
-        valid_time = valid_mask.unsqueeze(1) # [B,1,T]
-
-        dist = torch.linalg.norm(target_x0.unsqueeze(1) - anchor_x0, dim=-1) # [B,K,T]
-        numer = (dist * valid_time).sum(dim=-1) # [B,K]
-        denom = valid_time.sum(dim=-1) + 1e-6 # [B,1]
-        mode_idx = torch.argmin(numer / denom, dim=-1) # [B]
-
-        gather_index = mode_idx.view(bsz, 1, 1, 1).expand(-1, 1, self.T, self.output_dim)
-        best_pred = torch.gather(pred_x0, 1, gather_index).squeeze(1) # [B,T,D]
-        valid = valid_mask.unsqueeze(-1).expand(-1, -1, self.output_dim) # [B,T,D]
-        loss_map = F.l1_loss(best_pred, target_x0, reduction="none") # [B,T,D]
-        numer = (loss_map * valid).sum(dim=(1, 2)) # [B]
-        denom = valid.sum(dim=(1, 2)) + 1e-6 # [B]
-        loss = (numer / denom).mean()
-        logs = {"loss_x0": loss.detach()}
-        return loss, logs
-
-    # 多模态训练
-    def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
-        bsz, t_len, _ = future.shape
-        valid_mask = (op_mask[..., 0] > 0.5).float().to(device)  # [B, T]
-        target_x0 = self.norm(future)  # [B, T, D]
-
-        # 对anchor进行加噪，保持[B,K,T,D]维度
-        anchor_x0 = self.plan_anchor.to(device=device).unsqueeze(0).expand(bsz, -1, -1, -1) # [B,K,T,D]
-        anchor_x0 = self.norm(anchor_x0)
-        noise = torch.randn_like(anchor_x0) # [B,K,T,D]
-        timesteps = torch.randint(0, self.train_timestep_max, (bsz,), device=device).long() # [B]
-        x_t = self.diffusion_scheduler.add_noise(anchor_x0, noise, timesteps).float() # [B,K,T,D]
-        # 维度转化为[B*K,T,D]
-        timesteps = timesteps.unsqueeze(1).expand(-1, self.fut_k).reshape(bsz * self.fut_k)  # [B*K]
-        x_t = x_t.reshape(bsz * self.fut_k, t_len, self.output_dim) # [B*K,T,D]
-        context_tokens = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask) # [B,T,D]
-        context_tokens = context_tokens.repeat_interleave(self.fut_k, dim=0)  # [B*K, T, D]
-
-        t_emb = self.timestep_embedder(timesteps) # [B*K]
-        input_embedded = self.input_embedding(x_t) + self.pos_embedding(x_t) # [B*K,T,D]
-        pred_delta = self.dit(input_embedded, t_emb, context_tokens) # [B*K,T,D]
-        pred_x0 = x_t + pred_delta # 预测在anchor下需要的修正量，得到轨迹 # [B*K,T,D]
-        loss, loss_logs = self.computeLoss(pred_x0, target_x0, anchor_x0, valid_mask, bsz, self.fut_k)
-        return loss, loss_logs
-    """
 
     # 单 anchor 训练，提高训练速度：先按 GT 选择最近 anchor，再只对该 anchor 做加噪、去噪和损失计算
     def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
