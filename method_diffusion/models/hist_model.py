@@ -275,7 +275,7 @@ class DiffusionPast(nn.Module):
             x_norm[..., 5:6] = (x[..., 5:6] - self.class_center) / self.class_scale
         else:
             raise ValueError(f"Unsupported hist feature dim {x_norm.size(-1)}. Expected 4 or 6.")
-        x_norm = torch.clamp(x_norm, -5.0, 5.0)
+        x_norm = torch.clamp(x_norm, -10.0, 10.0)
         return x_norm
 
     def denorm(self, x):

@@ -98,15 +98,6 @@ def plot_hist_reconstruction(hist_original, hist_masked, hist_pred, fig_num1=3, 
         for y in [18, 6, -6, -18]:
             ax.axhline(y=y, color='gray', linestyle='--', linewidth=1, zorder=1)
 
-        x_lim = ax.get_xlim()
-        x_range = x_lim[1] - x_lim[0]
-        scale = x_range / 1400 if abs(x_range) > 1e-6 else 1.0
-        rect = patches.Rectangle(
-            (-40 * scale, -1.5), 10 * scale, 2 * scale,
-            linewidth=2, edgecolor='red', facecolor='red', zorder=5
-        )
-        ax.add_patch(rect)
-
         ax.set_xlabel(f'Lateral Position ({input_unit})')
         ax.set_ylabel(f'Longitudinal Position ({input_unit})')
         ax.set_title(f'Sample {i + 1}')
@@ -277,6 +268,8 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
 
     nbrs_vis = reconstruct_nbrs_from_mask(hist_nbrs, temporal_mask, idx)
 
+    # 绘图窗口尺寸：默认16：9，展示16：4
+    # fig, ax = plt.subplots(figsize=(16, 4))
     fig, ax = plt.subplots(figsize=(16, 9))
     lane_lines = (-18.0, -6.0, 6.0, 18.0)
 
@@ -302,7 +295,7 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
             traj_valid = traj[valid]
             ax.plot(
                 traj_valid[:, 1], traj_valid[:, 0],
-                color='#D8B365', alpha=0.55, linewidth=1.1, linestyle='-',
+                color='#B8860B', alpha=0.7, linewidth=1.1, linestyle='-',
                 label='Neighbors' if first_nbr else None, zorder=1
             )
             first_nbr = False
@@ -370,6 +363,8 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
             if traj is None:
                 continue
             is_best = (best_k is not None and k == best_k)
+            # 轨迹颜色，默认anchor多颜色，展示用浅蓝色表示其他结果
+            # mode_color = '#E41A1C' if is_best else '#9ECAE1'
             mode_color = _get_mode_color(k)
             mode_num = k + 1
             label = f"Mode {mode_num}"
@@ -379,8 +374,8 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
                 traj[:, 1], traj[:, 0],
                 linestyle='-',
                 marker='o',
-                markersize=4,
-                markeredgewidth=1.0,
+                markersize=3.0 if is_best else 2.0,
+                markeredgewidth=0.8 if is_best else 0.6,
                 linewidth=2.6 if is_best else 1.6,
                 alpha=0.95 if is_best else 0.8,
                 color=mode_color,
@@ -391,7 +386,7 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
             ax.scatter(
                 [end_x],
                 [end_y],
-                s=36 if is_best else 18,
+                s=24 if is_best else 10,
                 color=mode_color,
                 marker='*' if is_best else 'o',
                 zorder=4 if is_best else 3,
@@ -413,7 +408,7 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
             color='#E41A1C',
             linestyle='-',
             marker='o',
-            markersize=4,
+            markersize=3.0,
             linewidth=2.0,
             alpha=0.9,
             label='Pred',
@@ -433,7 +428,7 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
     ax.set_xlabel(f"Lateral Position ({unit})")
     ax.set_ylabel(f"Longitudinal Position ({unit})")
     ax.legend(loc='best')
-    ax.grid(True, alpha=0.3)
+    ax.grid(False)
     ax.set_aspect('auto')
     ax.set_ylim(-18, 18)
     plt.tight_layout()
