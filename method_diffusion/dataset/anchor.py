@@ -5,6 +5,8 @@ import numpy as np
 import torch
 from sklearn.cluster import KMeans
 from tqdm import tqdm
+
+from method_diffusion.dataset.future_features import build_anchor_xy_theta_v
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 
 
@@ -50,13 +52,14 @@ def visualize_anchors(anchor, vis_path):
         anchor = anchor.detach().cpu().numpy()
 
     anchor = np.asarray(anchor, dtype=np.float32)
+    anchor_xy = anchor[..., :2]
 
     fig, ax = plt.subplots(figsize=(10, 10))
-    for i, traj in enumerate(anchor):
+    for i, traj in enumerate(anchor_xy):
         ax.plot(traj[:, 1], traj[:, 0], label=f"Anchor {i}", linewidth=2, marker="o", markersize=3)
         ax.plot(traj[0, 1], traj[0, 0], "ks", markersize=5)
 
-    ax.set_title(f"Generated {anchor.shape[0]} Anchors")
+    ax.set_title(f"Generated {anchor_xy.shape[0]} Anchors")
     ax.set_xlabel("Y (ft)")
     ax.set_ylabel("X (ft)")
     ax.grid(True)
@@ -71,7 +74,7 @@ def visualize_anchors(anchor, vis_path):
 
 def generate_anchors(args):
     dataset = build_anchor_dataset(args)
-    all_futures = []
+    all_futures_xy = []
 
     print("Collecting trajectories...")
     for i in tqdm(range(len(dataset))):
@@ -80,9 +83,9 @@ def generate_anchors(args):
         t = dataset.D[i, 2]
         fut = dataset.getFuture(veh_id, t, ds_id)
         if len(fut) == args.pred_length:
-            all_futures.append(fut.reshape(-1))
+            all_futures_xy.append(fut[:, :2].reshape(-1))
 
-    all_futures = np.stack(all_futures).astype(np.float64)
+    all_futures_xy = np.stack(all_futures_xy).astype(np.float64)
 
     print(f"Running KMeans with k={args.anchor_k}...")
     kmeans = KMeans(
@@ -90,9 +93,10 @@ def generate_anchors(args):
         random_state=args.anchor_kmeans_random_state,
         n_init=args.anchor_kmeans_n_init,
     )
-    kmeans.fit(all_futures)
+    kmeans.fit(all_futures_xy)
 
-    anchor = torch.from_numpy(kmeans.cluster_centers_).float().reshape(args.anchor_k, args.pred_length, 2)
+    anchor_xy = kmeans.cluster_centers_.reshape(args.anchor_k, args.pred_length, 2).astype(np.float32, copy=False)
+    anchor = torch.from_numpy(build_anchor_xy_theta_v(anchor_xy, d_s=2)).float()
     anchor_path, _ = get_save_paths(args)
     torch.save(anchor, anchor_path)
     print(f"Anchors saved to {anchor_path}")
@@ -119,8 +123,8 @@ def evaluate_anchors(args, anchor):
         if len(fut) != args.pred_length:
             continue
 
-        fut = fut.astype(np.float32)
-        diff = anchor - fut[None, :, :]
+        fut_xy = fut[:, :2].astype(np.float32, copy=False)
+        diff = anchor[..., :2] - fut_xy[None, :, :]
         dist_sq = np.sum(diff * diff, axis=-1)
         dist = np.sqrt(dist_sq)
         ade_all = dist.mean(axis=1)

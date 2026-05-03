@@ -28,7 +28,7 @@ from method_diffusion.run.train_joint import (
     load_hist_checkpoint,
     write_csv_log,
 )
-from method_diffusion.utils.fut_utils import compute_batch_metric, select_closest_prediction
+from method_diffusion.utils.fut_utils import compute_batch_kinematic_metrics, compute_batch_metric, select_closest_prediction
 
 
 def setup_ddp():
@@ -169,6 +169,8 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, rank
     total_rmse = 0.0
     total_ade = 0.0
     total_fde = 0.0
+    total_theta_deg = 0.0
+    total_v_mps = 0.0
     num_batches = 0
 
     if len(dataloader) == 0:
@@ -176,7 +178,7 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, rank
             model_fut.train()
         if was_hist_training:
             model_hist.train()
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0
 
     pbar = tqdm(
         dataloader,
@@ -207,13 +209,18 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, rank
             all_preds = fut_model.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
             pred_fut = all_preds.squeeze(1)
         eval_rmse, eval_ade, eval_fde = compute_batch_metric(pred_fut, fut, op_mask)
+        eval_theta_deg, eval_v_mps = compute_batch_kinematic_metrics(pred_fut, fut, op_mask, meter_per_unit=METER_PER_FOOT)
         eval_rmse = float(eval_rmse.item()) * METER_PER_FOOT
         eval_ade = float(eval_ade.item()) * METER_PER_FOOT
         eval_fde = float(eval_fde.item()) * METER_PER_FOOT
+        eval_theta_deg = float(eval_theta_deg.item())
+        eval_v_mps = float(eval_v_mps.item())
 
         total_rmse += eval_rmse
         total_ade += eval_ade
         total_fde += eval_fde
+        total_theta_deg += eval_theta_deg
+        total_v_mps += eval_v_mps
         num_batches += 1
 
         if is_main_process(rank):
@@ -221,10 +228,12 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, rank
                 "avg_rmse_m": f"{(total_rmse / num_batches):.4f}",
                 "avg_ade_m": f"{(total_ade / num_batches):.4f}",
                 "avg_fde_m": f"{(total_fde / num_batches):.4f}",
+                "avg_theta_deg": f"{(total_theta_deg / num_batches):.4f}",
+                "avg_v_mps": f"{(total_v_mps / num_batches):.4f}",
             })
 
     stats = torch.tensor(
-        [total_rmse, total_ade, total_fde, float(num_batches)],
+        [total_rmse, total_ade, total_fde, total_theta_deg, total_v_mps, float(num_batches)],
         device=device,
         dtype=torch.float64,
     )
@@ -233,11 +242,13 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, rank
         model_fut.train()
     if was_hist_training:
         model_hist.train()
-    denom = max(int(stats[3].item()), 1)
+    denom = max(int(stats[5].item()), 1)
     return (
         float(stats[0].item()) / denom,
         float(stats[1].item()) / denom,
         float(stats[2].item()) / denom,
+        float(stats[3].item()) / denom,
+        float(stats[4].item()) / denom,
     )
 
 
@@ -336,7 +347,7 @@ def main():
             random_mask_ratio=random_mask_ratio,
             block_mask_start=block_mask_start,
         )
-        eval_rmse, eval_ade, eval_fde = evaluate(
+        eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps = evaluate(
             model_fut=model_fut,
             model_hist=model_hist,
             dataloader=val_loader,
@@ -351,18 +362,22 @@ def main():
 
         if is_main_process(rank):
             current_lr_fut = float(optimizer.param_groups[0]["lr"])
-            write_csv_log(log_csv_path, epoch + 1, train_stats, eval_rmse, eval_ade, eval_fde, current_lr_fut)
+            write_csv_log(log_csv_path, epoch + 1, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps, current_lr_fut)
             writer.add_scalar("Loss/Train", train_stats["loss"], epoch + 1)
             writer.add_scalar("Eval/RMSE_m", eval_rmse, epoch + 1)
             writer.add_scalar("Eval/ADE_m", eval_ade, epoch + 1)
             writer.add_scalar("Eval/FDE_m", eval_fde, epoch + 1)
+            writer.add_scalar("Eval/Theta_deg", eval_theta_deg, epoch + 1)
+            writer.add_scalar("Eval/V_mps", eval_v_mps, epoch + 1)
             writer.add_scalar("LR", current_lr_fut, epoch + 1)
             print(
                 f"Epoch {epoch + 1}/{args.num_epochs} | "
                 f"train={train_stats['loss']:.6f} | "
                 f"rmse_m={eval_rmse:.4f} | "
                 f"ade_m={eval_ade:.4f} | "
-                f"fde_m={eval_fde:.4f}"
+                f"fde_m={eval_fde:.4f} | "
+                f"theta_deg={eval_theta_deg:.4f} | "
+                f"v_mps={eval_v_mps:.4f}"
             )
 
         scheduler.step()
@@ -381,6 +396,8 @@ def main():
                 "eval_rmse_m": eval_rmse,
                 "eval_ade_m": eval_ade,
                 "eval_fde_m": eval_fde,
+                "eval_theta_deg": eval_theta_deg,
+                "eval_v_mps": eval_v_mps,
                 "selection_score": selection_score,
                 "best_score": best_rmse,
                 "best_rmse_m": best_rmse,

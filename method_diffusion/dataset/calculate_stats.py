@@ -7,11 +7,13 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
+from method_diffusion.dataset.future_features import build_future_xy_theta_v
+
 
 class NgsimFutureDataset(Dataset):
     """
     仅构造 Ego future 轨迹。
-    输出为相对当前时刻参考点的 future xy。
+    输出为相对当前时刻参考点的 future [x, y, theta, v]。
     """
 
     def __init__(self, mat_file, t_f=50, d_s=2):
@@ -52,14 +54,10 @@ class NgsimFutureDataset(Dataset):
         if frame_idx.size == 0:
             return None
         frame_idx = int(frame_idx.item())
-
-        ref_pos = track[frame_idx, 1:3]
-        start_idx = frame_idx + self.d_s
-        end_idx = min(len(track), frame_idx + self.t_f + 1)
-        fut = track[start_idx:end_idx:self.d_s, 1:3] - ref_pos
+        fut = build_future_xy_theta_v(track, frame_idx, self.t_f, self.d_s)
         if len(fut) == 0:
             return None
-        return fut.astype(np.float32, copy=False)
+        return fut
 
     def __getitem__(self, idx):
         ds_id = int(self.D[idx, 0])
@@ -68,12 +66,12 @@ class NgsimFutureDataset(Dataset):
 
         fut = self._extract_future(ds_id, veh_id, t)
         if fut is None:
-            return np.empty((0, 2), dtype=np.float32)
+            return np.empty((0, 4), dtype=np.float32)
         return fut
 
     def collate_fn(self, samples):
         batch_size = len(samples)
-        fut_batch = torch.zeros(batch_size, self.maxlen, 2, dtype=torch.float32)
+        fut_batch = torch.zeros(batch_size, self.maxlen, 4, dtype=torch.float32)
         fut_mask_batch = torch.zeros(batch_size, self.maxlen, dtype=torch.bool)
 
         for sample_id, fut in enumerate(samples):
@@ -119,8 +117,8 @@ def main():
         fut_values.append(valid_fut.cpu().numpy())
 
     if len(fut_values) == 0:
-        fut_mean = np.zeros(2, dtype=np.float64)
-        fut_std = np.zeros(2, dtype=np.float64)
+        fut_mean = np.zeros(4, dtype=np.float64)
+        fut_std = np.zeros(4, dtype=np.float64)
     else:
         fut_values = np.concatenate(fut_values, axis=0).astype(np.float64, copy=False)
         fut_mean = np.mean(fut_values, axis=0)

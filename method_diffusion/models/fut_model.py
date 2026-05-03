@@ -7,7 +7,7 @@ from diffusers.schedulers import DDIMScheduler
 
 from method_diffusion.models import dit_fut as dit
 from method_diffusion.models.hist_encoder import HistEncoder
-from method_diffusion.utils.fut_utils import build_eval_timestep_pairs, ddim_step
+from method_diffusion.utils.fut_utils import build_eval_timestep_pairs, ddim_step, wrap_angle
 from method_diffusion.utils.position_encoding import SequentialPositionalEncoding
 
 
@@ -60,13 +60,13 @@ class DiffusionFut(nn.Module):
         final_layer = dit.FinalLayer(self.hidden_dim, self.output_dim)
         self.dit = dit.DiT(dit_block=dit_block, final_layer=final_layer, depth=self.depth)
 
-        # 仅对 Ego future 做归一化。
+        # 仅对 Ego future 做归一化，当前 future 定义为 [x, y, theta, v]。
         if self.dataset_name == "ngsim":
-            self.register_buffer("xy_mean", torch.tensor([-0.0606, 65.2935], dtype=torch.float32), persistent=False)
-            self.register_buffer("xy_std", torch.tensor([1.3011, 56.2487], dtype=torch.float32), persistent=False)
+            self.register_buffer("fut_mean", torch.tensor([-0.06063419, 65.293495, 1.5347151, 25.216747], dtype=torch.float32), persistent=False)
+            self.register_buffer("fut_std", torch.tensor([1.3011292, 56.24867, 0.26432952, 14.760194], dtype=torch.float32), persistent=False)
         elif self.dataset_name == "highd":
-            self.register_buffer("xy_mean", torch.tensor([0.0654, 221.1319], dtype=torch.float32), persistent=False)
-            self.register_buffer("xy_std", torch.tensor([1.3484, 142.1689], dtype=torch.float32), persistent=False)
+            self.register_buffer("fut_mean", torch.tensor([0.06540795, 221.13193, 1.5697229, 85.08167], dtype=torch.float32), persistent=False)
+            self.register_buffer("fut_std", torch.tensor([1.3484404, 142.16895, 0.048561804, 24.186338], dtype=torch.float32), persistent=False)
         else:
             raise ValueError(f"Unsupported dataset '{self.dataset_name}' for fut normalization. Supported: highd, ngsim")
 
@@ -74,40 +74,91 @@ class DiffusionFut(nn.Module):
         plan_anchor = torch.load(anchor_path, map_location="cpu")
         self.plan_anchor = nn.Parameter(plan_anchor.float(), requires_grad=False)
 
+    def computeKinematicLoss(self, pred_x0, valid_mask, fut_dt):
+        pred_phys = self.denorm(pred_x0)
+        x = pred_phys[..., 0]
+        y = pred_phys[..., 1]
+        theta = pred_phys[..., 2]
+        v = pred_phys[..., 3]
 
-    # 单 anchor 训练，提高训练速度：先按 GT 选择最近 anchor，再只对该 anchor 做加噪、去噪和损失计算
+        x_kin_next = x[:, :-1] + v[:, :-1] * torch.cos(theta[:, :-1]) * fut_dt
+        y_kin_next = y[:, :-1] + v[:, :-1] * torch.sin(theta[:, :-1]) * fut_dt
+        rx = x[:, 1:] - x_kin_next
+        ry = y[:, 1:] - y_kin_next
+
+        valid_pair = valid_mask[:, :-1] * valid_mask[:, 1:]
+        valid_pair_sum = valid_pair.sum()
+        if valid_pair_sum.item() <= 0:
+            zero = pred_x0.new_zeros(())
+            return zero, zero
+
+        loss_map = torch.abs(rx) + torch.abs(ry)
+        loss_kin = (loss_map * valid_pair).sum() / (valid_pair_sum + 1e-6)
+        kin_res = torch.sqrt(rx.square() + ry.square() + 1e-12)
+        kin_res_mean = (kin_res * valid_pair).sum() / (valid_pair_sum + 1e-6)
+        return loss_kin, kin_res_mean
+
+    def computeLoss(self, pred_x0, target_x0, valid_mask):
+        lambda_xy = 1.0
+        lambda_theta = 0.3
+        lambda_v = 0.3
+        lambda_kin = 0.05
+        fut_dt = 0.2
+
+        valid_sum = valid_mask.sum(dim=1) + 1e-6
+        valid_xy = valid_mask.unsqueeze(-1)
+        valid_xy_sum = valid_xy.expand(-1, -1, 2).sum(dim=(1, 2)) + 1e-6
+
+        xy_error = torch.abs(pred_x0[..., :2] - target_x0[..., :2])
+        loss_xy = ((xy_error * valid_xy).sum(dim=(1, 2)) / valid_xy_sum).mean()
+
+        theta_std = self.fut_std[2].to(device=pred_x0.device, dtype=pred_x0.dtype).clamp(min=1e-6)
+        theta_diff = (pred_x0[..., 2] - target_x0[..., 2]) * theta_std
+        theta_error = torch.abs(wrap_angle(theta_diff) / theta_std)
+        loss_theta = ((theta_error * valid_mask).sum(dim=1) / valid_sum).mean()
+
+        v_error = torch.abs(pred_x0[..., 3] - target_x0[..., 3])
+        loss_v = ((v_error * valid_mask).sum(dim=1) / valid_sum).mean()
+
+        loss_kin, kin_res_mean = self.computeKinematicLoss(pred_x0, valid_mask, fut_dt)
+        loss_total = lambda_xy * loss_xy + lambda_theta * loss_theta + lambda_v * loss_v + lambda_kin * loss_kin
+        logs = {
+            "loss": loss_total.detach(),
+            "loss_total": loss_total.detach(),
+            "loss_xy": loss_xy.detach(),
+            "loss_theta": loss_theta.detach(),
+            "loss_v": loss_v.detach(),
+            "loss_kin": loss_kin.detach(),
+            "kin_res_mean": kin_res_mean.detach(),
+        }
+        return loss_total, logs
+
+    # 单 anchor 训练：先按 GT 在 xy 空间选择最近 anchor，再只对该 anchor 做加噪、去噪和损失回传。
     def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
         bsz, t_len, _ = future.shape
         valid_mask = (op_mask[..., 0] > 0.5).float().to(device) # [B,T]
         target_x0 = self.norm(future) # [B,T,D]
 
-        anchor_all = self.plan_anchor.to(device=device).unsqueeze(0).expand(bsz, -1, -1, -1) # [B,K,T,D]
-        anchor_all = self.norm(anchor_all)
-
+        anchor_x0_all = self.plan_anchor.to(device=device).unsqueeze(0).expand(bsz, -1, -1, -1) # [B,K,T,D]
+        anchor_x0_all = self.norm(anchor_x0_all)
         valid_time = valid_mask.unsqueeze(1) # [B,1,T]
-        anchor_dist = torch.linalg.norm(target_x0.unsqueeze(1) - anchor_all, dim=-1) # [B,K,T]
-        anchor_score = (anchor_dist * valid_time).sum(dim=-1) / (valid_time.sum(dim=-1) + 1e-6) # [B,K]
-        mode_idx = torch.argmin(anchor_score, dim=-1) # [B]
-
+        dist = torch.linalg.norm(target_x0.unsqueeze(1)[..., :2] - anchor_x0_all[..., :2], dim=-1) # [B,K,T]
+        numer = (dist * valid_time).sum(dim=-1) # [B,K]
+        denom = valid_time.sum(dim=-1) + 1e-6 # [B,1]
+        mode_idx = torch.argmin(numer / denom, dim=-1) # [B]
         gather_index = mode_idx.view(bsz, 1, 1, 1).expand(-1, 1, t_len, self.output_dim)
-        anchor_x0 = torch.gather(anchor_all, 1, gather_index).squeeze(1) # [B,T,D]
+        anchor_x0 = torch.gather(anchor_x0_all, 1, gather_index).squeeze(1) # [B,T,D]
 
         noise = torch.randn_like(anchor_x0) # [B,T,D]
         timesteps = torch.randint(0, self.train_timestep_max, (bsz,), device=device).long() # [B]
         x_t = self.diffusion_scheduler.add_noise(anchor_x0, noise, timesteps).float() # [B,T,D]
-
         context_tokens = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask) # [B,T,D]
+
         t_emb = self.timestep_embedder(timesteps) # [B,D]
         input_embedded = self.input_embedding(x_t) + self.pos_embedding(x_t) # [B,T,D]
         pred_delta = self.dit(input_embedded, t_emb, context_tokens) # [B,T,D]
         pred_x0 = x_t + pred_delta # [B,T,D]
-
-        valid = valid_mask.unsqueeze(-1).expand(-1, -1, self.output_dim) # [B,T,D]
-        loss_map = F.l1_loss(pred_x0, target_x0, reduction="none") # [B,T,D]
-        numer = (loss_map * valid).sum(dim=(1, 2)) # [B]
-        denom = valid.sum(dim=(1, 2)) + 1e-6 # [B]
-        loss = (numer / denom).mean()
-        loss_logs = {"loss_x0": loss.detach()}
+        loss, loss_logs = self.computeLoss(pred_x0, target_x0, valid_mask)
         return loss, loss_logs
 
 
@@ -137,25 +188,25 @@ class DiffusionFut(nn.Module):
 
         pred_phys = self.denorm(pred_x0.view(bsz, k, t_len, self.output_dim))
         all_preds = future.unsqueeze(1).repeat(1, k, 1, 1).clone()
-        all_preds[..., :2] = pred_phys[..., :2]
+        all_preds[..., :self.output_dim] = pred_phys
         return all_preds
 
     # 统一前向入口，默认复用训练路径。
     def forward(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
         return self.forwardTrain(hist, hist_nbrs, mask, temporal_mask, future, op_mask, device)
 
-    # 归一化与反归一化，仅处理 future xy。
+    # 归一化与反归一化，处理 future [x, y, theta, v]。
     def norm(self, x):
         x_norm = x.clone()
-        mean = self.xy_mean.to(device=x.device, dtype=x.dtype)
-        std = self.xy_std.to(device=x.device, dtype=x.dtype).clamp(min=1e-6)
-        x_norm[..., 0:2] = (x[..., 0:2] - mean) / std
-        x_norm[..., 0:2] = torch.clamp(x_norm[..., 0:2], -5.0, 5.0)
+        mean = self.fut_mean.to(device=x.device, dtype=x.dtype)
+        std = self.fut_std.to(device=x.device, dtype=x.dtype).clamp(min=1e-6)
+        x_norm[..., :self.output_dim] = (x[..., :self.output_dim] - mean[:self.output_dim]) / std[:self.output_dim]
+        x_norm[..., :self.output_dim] = torch.clamp(x_norm[..., :self.output_dim], -5.0, 5.0)
         return x_norm
 
     def denorm(self, x):
         x_denorm = x.clone()
-        mean = self.xy_mean.to(device=x.device, dtype=x.dtype)
-        std = self.xy_std.to(device=x.device, dtype=x.dtype).clamp(min=1e-6)
-        x_denorm[..., 0:2] = x[..., 0:2] * std + mean
+        mean = self.fut_mean.to(device=x.device, dtype=x.dtype)
+        std = self.fut_std.to(device=x.device, dtype=x.dtype).clamp(min=1e-6)
+        x_denorm[..., :self.output_dim] = x[..., :self.output_dim] * std[:self.output_dim] + mean[:self.output_dim]
         return x_denorm

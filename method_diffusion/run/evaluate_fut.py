@@ -58,14 +58,19 @@ def print_metrics(metrics, title):
         print("=" * 75)
         return
 
-    print(f"{'Horizon':<8} | {'RMSE (m)':<12} | {'ADE (m)':<12} | {'FDE (m)':<12}")
+    print(
+        f"{'Horizon':<8} | {'RMSE (m)':<12} | {'ADE (m)':<12} | "
+        f"{'FDE (m)':<12} | {'Theta (deg)':<12} | {'V (m/s)':<12}"
+    )
     print("-" * 75)
     for label, idx in valid_pairs:
         print(
             f"{label:<8} | "
             f"{metrics['rmse_per_step_m'][idx].item():<12.6f} | "
             f"{metrics['ade_per_step_m'][idx].item():<12.6f} | "
-            f"{metrics['fde_per_step_m'][idx].item():<12.6f}"
+            f"{metrics['fde_per_step_m'][idx].item():<12.6f} | "
+            f"{metrics['theta_mae_per_step_deg'][idx].item():<12.6f} | "
+            f"{metrics['v_mae_per_step_mps'][idx].item():<12.6f}"
         )
     print("=" * 75)
 
@@ -136,6 +141,8 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis):
             "ade_5s": f"{summary['ade_per_step_m'][last_idx]:.4f}",
             "fde_5s": f"{summary['fde_per_step_m'][last_idx]:.4f}",
             "rmse_5s": f"{summary['rmse_per_step_m'][last_idx]:.4f}",
+            "theta_5s": f"{summary['theta_mae_per_step_deg'][last_idx]:.4f}",
+            "v_5s": f"{summary['v_mae_per_step_mps'][last_idx]:.4f}",
         })
 
         if batch_idx % 100 == 0:

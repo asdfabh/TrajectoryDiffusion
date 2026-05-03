@@ -99,6 +99,8 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enab
             "ade_5s": f"{summary['ade_per_step_m'][last_idx]:.4f}",
             "fde_5s": f"{summary['fde_per_step_m'][last_idx]:.4f}",
             "rmse_5s": f"{summary['rmse_per_step_m'][last_idx]:.4f}",
+            "theta_5s": f"{summary['theta_mae_per_step_deg'][last_idx]:.4f}",
+            "v_5s": f"{summary['v_mae_per_step_mps'][last_idx]:.4f}",
         })
 
         if batch_idx % 100 == 0:

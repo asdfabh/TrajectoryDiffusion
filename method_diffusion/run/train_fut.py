@@ -14,12 +14,12 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
-from method_diffusion.utils.fut_utils import compute_batch_metric, select_closest_prediction
+from method_diffusion.utils.fut_utils import compute_batch_kinematic_metrics, compute_batch_metric, select_closest_prediction
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
 METER_PER_FOOT = 0.3048
-LOSS_STAT_KEYS = ["loss"]
+LOSS_STAT_KEYS = ["loss", "loss_total", "loss_xy", "loss_theta", "loss_v", "loss_kin", "kin_res_mean"]
 
 # 解析 resume 标识并返回对应的 checkpoint 路径。
 def resolve_resume_checkpoint(resume_arg, checkpoint_dir):
@@ -58,13 +58,21 @@ def load_checkpoint(resume_arg, checkpoint_dir, model, optimizer, scheduler, dev
     return start_epoch, best_rmse
 
 # 将单个 epoch 的训练和验证结果追加写入 CSV。
-def write_csv_log(csv_path, epoch, train_stats, eval_rmse, eval_ade, eval_fde, lr):
+def write_csv_log(csv_path, epoch, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps, lr):
     row = {
         "epoch": epoch,
         "train_loss": train_stats["loss"],
+        "train_loss_total": train_stats["loss_total"],
+        "train_loss_xy": train_stats["loss_xy"],
+        "train_loss_theta": train_stats["loss_theta"],
+        "train_loss_v": train_stats["loss_v"],
+        "train_loss_kin": train_stats["loss_kin"],
+        "train_kin_res_mean": train_stats["kin_res_mean"],
         "val_rmse_m": eval_rmse,
         "val_ade_m": eval_ade,
         "val_fde_m": eval_fde,
+        "val_theta_deg": eval_theta_deg,
+        "val_v_mps": eval_v_mps,
         "lr": lr,
     }
     with csv_path.open("a", newline="", encoding="utf-8") as f:
@@ -76,9 +84,17 @@ def init_csv_log(csv_path):
     fieldnames = [
         "epoch",
         "train_loss",
+        "train_loss_total",
+        "train_loss_xy",
+        "train_loss_theta",
+        "train_loss_v",
+        "train_loss_kin",
+        "train_kin_res_mean",
         "val_rmse_m",
         "val_ade_m",
         "val_fde_m",
+        "val_theta_deg",
+        "val_v_mps",
         "lr",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
@@ -87,22 +103,38 @@ def init_csv_log(csv_path):
 
 
 # 将训练和验证指标统一写入 TensorBoard。
-def write_tensorboard_log(writer, epoch, train_stats, eval_rmse, eval_ade, eval_fde, lr):
+def write_tensorboard_log(writer, epoch, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps, lr):
     writer.add_scalar("Loss/Train", train_stats["loss"], epoch)
+    writer.add_scalar("Loss/TrainTotal", train_stats["loss_total"], epoch)
+    writer.add_scalar("Loss/TrainXY", train_stats["loss_xy"], epoch)
+    writer.add_scalar("Loss/TrainTheta", train_stats["loss_theta"], epoch)
+    writer.add_scalar("Loss/TrainV", train_stats["loss_v"], epoch)
+    writer.add_scalar("Loss/TrainKinematic", train_stats["loss_kin"], epoch)
+    writer.add_scalar("Loss/KinematicResidualMean", train_stats["kin_res_mean"], epoch)
     writer.add_scalar("Eval/RMSE_m", eval_rmse, epoch)
     writer.add_scalar("Eval/ADE_m", eval_ade, epoch)
     writer.add_scalar("Eval/FDE_m", eval_fde, epoch)
+    writer.add_scalar("Eval/Theta_deg", eval_theta_deg, epoch)
+    writer.add_scalar("Eval/V_mps", eval_v_mps, epoch)
     writer.add_scalar("LR", lr, epoch)
 
 
 # 打印每个 epoch 的训练与验证摘要。
-def print_eval_summary(epoch, total_epochs, train_stats, eval_rmse, eval_ade, eval_fde):
+def print_eval_summary(epoch, total_epochs, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps):
     print(
         f"Epoch {epoch}/{total_epochs} | "
         f"train={train_stats['loss']:.6f} | "
+        f"total={train_stats['loss_total']:.6f} | "
+        f"xy={train_stats['loss_xy']:.6f} | "
+        f"theta={train_stats['loss_theta']:.6f} | "
+        f"v={train_stats['loss_v']:.6f} | "
+        f"kin={train_stats['loss_kin']:.6f} | "
+        f"kin_res={train_stats['kin_res_mean']:.6f} | "
         f"rmse_m={eval_rmse:.4f} | "
         f"ade_m={eval_ade:.4f} | "
-        f"fde_m={eval_fde:.4f}"
+        f"fde_m={eval_fde:.4f} | "
+        f"theta_deg={eval_theta_deg:.4f} | "
+        f"v_mps={eval_v_mps:.4f}"
     )
 
 # 整理 batch 数据并按特征维度拼接模型输入。
@@ -142,27 +174,28 @@ def prepare_input_data(batch, feature_dim, device="cuda"):
 # 执行单个训练 epoch 并汇总平均损失。
 def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
     model.train()
-    total_loss = 0.0
+    totals = {key: 0.0 for key in LOSS_STAT_KEYS}
     num_batches = 0
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Train", dynamic_ncols=True)
 
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        loss, _ = model.forwardTrain(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+        loss, loss_logs = model.forwardTrain(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        total_loss += float(loss.item())
+        for key in LOSS_STAT_KEYS:
+            totals[key] += float(loss_logs[key].item())
         num_batches += 1
         pbar.set_postfix({
             "loss": f"{loss.item():.6f}",
-            "avg_loss": f"{(total_loss / num_batches):.6f}",
+            "avg_loss": f"{(totals['loss'] / num_batches):.6f}",
         })
 
     denom = max(num_batches, 1)
-    return {"loss": total_loss / denom}
+    return {key: totals[key] / denom for key in LOSS_STAT_KEYS}
 
 @torch.no_grad()
 # 使用完整验证集评估模型并返回平均指标。
@@ -171,11 +204,13 @@ def evaluate(model, dataloader, device, epoch, feature_dim):
     total_rmse = 0.0
     total_ade = 0.0
     total_fde = 0.0
+    total_theta_deg = 0.0
+    total_v_mps = 0.0
     num_batches = 0
 
     if len(dataloader) == 0:
         model.train()
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0
 
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Val", dynamic_ncols=True)
     for batch in pbar:
@@ -187,26 +222,39 @@ def evaluate(model, dataloader, device, epoch, feature_dim):
             all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
             pred_fut = all_preds.squeeze(1)
         eval_rmse, eval_ade, eval_fde = compute_batch_metric(pred_fut, fut, op_mask)
+        eval_theta_deg, eval_v_mps = compute_batch_kinematic_metrics(pred_fut, fut, op_mask, meter_per_unit=METER_PER_FOOT)
         eval_rmse = float(eval_rmse.item()) * METER_PER_FOOT
         eval_ade = float(eval_ade.item()) * METER_PER_FOOT
         eval_fde = float(eval_fde.item()) * METER_PER_FOOT
+        eval_theta_deg = float(eval_theta_deg.item())
+        eval_v_mps = float(eval_v_mps.item())
 
         total_rmse += eval_rmse
         total_ade += eval_ade
         total_fde += eval_fde
+        total_theta_deg += eval_theta_deg
+        total_v_mps += eval_v_mps
         num_batches += 1
         pbar.set_postfix({
             "avg_rmse_m": f"{(total_rmse / num_batches):.4f}",
             "avg_ade_m": f"{(total_ade / num_batches):.4f}",
             "avg_fde_m": f"{(total_fde / num_batches):.4f}",
+            "avg_theta_deg": f"{(total_theta_deg / num_batches):.4f}",
+            "avg_v_mps": f"{(total_v_mps / num_batches):.4f}",
         })
 
     model.train()
     if num_batches == 0:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0
 
     denom = float(num_batches)
-    return total_rmse / denom, total_ade / denom, total_fde / denom
+    return (
+        total_rmse / denom,
+        total_ade / denom,
+        total_fde / denom,
+        total_theta_deg / denom,
+        total_v_mps / denom,
+    )
 
 
 # 初始化训练组件并执行 fut 训练主流程。
@@ -261,12 +309,12 @@ def main():
 
     for epoch in range(start_epoch, args.num_epochs):
         train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim)
-        eval_rmse, eval_ade, eval_fde = evaluate(model, val_loader, device, epoch + 1, args.feature_dim)
+        eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps = evaluate(model, val_loader, device, epoch + 1, args.feature_dim)
         selection_score = float(eval_rmse)
         current_lr = optimizer.param_groups[0]["lr"]
-        write_csv_log(log_csv_path, epoch + 1, train_stats, eval_rmse, eval_ade, eval_fde, current_lr)
-        write_tensorboard_log(writer, epoch + 1, train_stats, eval_rmse, eval_ade, eval_fde, current_lr)
-        print_eval_summary(epoch + 1, args.num_epochs, train_stats, eval_rmse, eval_ade, eval_fde)
+        write_csv_log(log_csv_path, epoch + 1, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps, current_lr)
+        write_tensorboard_log(writer, epoch + 1, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps, current_lr)
+        print_eval_summary(epoch + 1, args.num_epochs, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps)
 
         scheduler.step()
         is_best = selection_score < best_rmse
@@ -282,6 +330,8 @@ def main():
             "eval_rmse_m": eval_rmse,
             "eval_ade_m": eval_ade,
             "eval_fde_m": eval_fde,
+            "eval_theta_deg": eval_theta_deg,
+            "eval_v_mps": eval_v_mps,
             "selection_score": selection_score,
             "best_score": best_rmse,
             "best_rmse_m": best_rmse,

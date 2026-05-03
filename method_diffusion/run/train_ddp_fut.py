@@ -26,7 +26,7 @@ from method_diffusion.run.train_fut import (
     write_csv_log,
     write_tensorboard_log,
 )
-from method_diffusion.utils.fut_utils import compute_batch_metric, select_closest_prediction
+from method_diffusion.utils.fut_utils import compute_batch_kinematic_metrics, compute_batch_metric, select_closest_prediction
 
 
 def setup_ddp():
@@ -96,14 +96,15 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
 
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        loss, _ = model(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+        loss, loss_logs = model(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
 
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        totals["loss"] += float(loss.item())
+        for key in LOSS_STAT_KEYS:
+            totals[key] += float(loss_logs[key].item())
         num_batches += 1
 
         if is_main_process(rank):
@@ -138,11 +139,13 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
     total_rmse = 0.0
     total_ade = 0.0
     total_fde = 0.0
+    total_theta_deg = 0.0
+    total_v_mps = 0.0
     num_batches = 0
 
     if len(dataloader) == 0:
         model.train()
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0
 
     pbar = tqdm(
         dataloader,
@@ -161,13 +164,18 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
             all_preds = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
             pred_fut = all_preds.squeeze(1)
         eval_rmse, eval_ade, eval_fde = compute_batch_metric(pred_fut, fut, op_mask)
+        eval_theta_deg, eval_v_mps = compute_batch_kinematic_metrics(pred_fut, fut, op_mask, meter_per_unit=METER_PER_FOOT)
         eval_rmse = float(eval_rmse.item()) * METER_PER_FOOT
         eval_ade = float(eval_ade.item()) * METER_PER_FOOT
         eval_fde = float(eval_fde.item()) * METER_PER_FOOT
+        eval_theta_deg = float(eval_theta_deg.item())
+        eval_v_mps = float(eval_v_mps.item())
 
         total_rmse += eval_rmse
         total_ade += eval_ade
         total_fde += eval_fde
+        total_theta_deg += eval_theta_deg
+        total_v_mps += eval_v_mps
         num_batches += 1
 
         if is_main_process(rank):
@@ -176,22 +184,26 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
                     "avg_rmse_m": f"{(total_rmse / num_batches):.4f}",
                     "avg_ade_m": f"{(total_ade / num_batches):.4f}",
                     "avg_fde_m": f"{(total_fde / num_batches):.4f}",
+                    "avg_theta_deg": f"{(total_theta_deg / num_batches):.4f}",
+                    "avg_v_mps": f"{(total_v_mps / num_batches):.4f}",
                 }
             )
 
     stats = torch.tensor(
-        [total_rmse, total_ade, total_fde, float(num_batches)],
+        [total_rmse, total_ade, total_fde, total_theta_deg, total_v_mps, float(num_batches)],
         device=device,
         dtype=torch.float64,
     )
     stats = reduce_tensor(stats)
     model.train()
 
-    denom = max(int(stats[3].item()), 1)
+    denom = max(int(stats[5].item()), 1)
     return (
         float(stats[0].item()) / denom,
         float(stats[1].item()) / denom,
         float(stats[2].item()) / denom,
+        float(stats[3].item()) / denom,
+        float(stats[4].item()) / denom,
     )
 
 
@@ -280,14 +292,14 @@ def main():
         train_sampler.set_epoch(epoch)
 
         train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim, rank)
-        eval_rmse, eval_ade, eval_fde = evaluate(model, val_loader, device, epoch + 1, args.feature_dim, rank)
+        eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps = evaluate(model, val_loader, device, epoch + 1, args.feature_dim, rank)
         selection_score = float(eval_rmse)
         current_lr = optimizer.param_groups[0]["lr"]
 
         if is_main_process(rank):
-            write_csv_log(log_csv_path, epoch + 1, train_stats, eval_rmse, eval_ade, eval_fde, current_lr)
-            write_tensorboard_log(writer, epoch + 1, train_stats, eval_rmse, eval_ade, eval_fde, current_lr)
-            print_eval_summary(epoch + 1, args.num_epochs, train_stats, eval_rmse, eval_ade, eval_fde)
+            write_csv_log(log_csv_path, epoch + 1, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps, current_lr)
+            write_tensorboard_log(writer, epoch + 1, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps, current_lr)
+            print_eval_summary(epoch + 1, args.num_epochs, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps)
 
         scheduler.step()
         is_best = selection_score < best_rmse
@@ -305,6 +317,8 @@ def main():
                 "eval_rmse_m": eval_rmse,
                 "eval_ade_m": eval_ade,
                 "eval_fde_m": eval_fde,
+                "eval_theta_deg": eval_theta_deg,
+                "eval_v_mps": eval_v_mps,
                 "selection_score": selection_score,
                 "best_score": best_rmse,
                 "best_rmse_m": best_rmse,

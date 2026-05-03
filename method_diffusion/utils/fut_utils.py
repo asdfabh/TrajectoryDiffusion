@@ -33,6 +33,11 @@ def build_hist_mask(hist, mask_ratio=0.4, random_mask_ratio=0.7, block_mask_star
         block_start=block_mask_start,
     )
 
+
+def wrap_angle(angle):
+    """将角度差包裹到 [-pi, pi]。"""
+    return torch.atan2(torch.sin(angle), torch.cos(angle))
+
 def normalize_traj_valid_mask(valid_mask, pred):
     """将不同形状的 future 有效位掩码统一成 `[B, T]` 浮点张量。"""
     if valid_mask is None:
@@ -60,6 +65,26 @@ def compute_batch_metric(pred, target, valid_mask=None):
     final_dist = dist.gather(1, last_idx.unsqueeze(1)).squeeze(1)
     fde = (final_dist * has_valid.float()).sum() / (has_valid.float().sum() + 1e-6)
     return rmse, ade, fde
+
+
+def compute_batch_kinematic_metrics(pred, target, valid_mask=None, meter_per_unit=0.3048):
+    """计算单个 batch 的 theta MAE(度) 与 v MAE(m/s)。"""
+    valid_mask = normalize_traj_valid_mask(valid_mask, pred)
+
+    theta_mae_deg = pred.new_tensor(0.0)
+    v_mae_mps = pred.new_tensor(0.0)
+
+    if pred.size(-1) >= 3 and target.size(-1) >= 3:
+        theta_diff = wrap_angle(pred[..., 2] - target[..., 2]).abs()
+        theta_mae_deg = theta_diff.mul(180.0 / torch.pi)
+        theta_mae_deg = (theta_mae_deg * valid_mask).sum() / (valid_mask.sum() + 1e-6)
+
+    if pred.size(-1) >= 4 and target.size(-1) >= 4:
+        v_diff = (pred[..., 3] - target[..., 3]).abs()
+        v_mae_mps = (v_diff * valid_mask).sum() / (valid_mask.sum() + 1e-6)
+        v_mae_mps = v_mae_mps * float(meter_per_unit)
+
+    return theta_mae_deg, v_mae_mps
 
 
 def select_closest_prediction(all_preds, target, valid_mask=None):
@@ -124,6 +149,8 @@ class TrajectoryMetrics:
         self.meter_per_unit = float(meter_per_unit)
         self.total_coord_se = torch.zeros(self.pred_len, dtype=torch.float64)
         self.total_de = torch.zeros(self.pred_len, dtype=torch.float64)
+        self.total_theta_abs_deg = torch.zeros(self.pred_len, dtype=torch.float64)
+        self.total_v_abs = torch.zeros(self.pred_len, dtype=torch.float64)
         self.total_counts = torch.zeros(self.pred_len, dtype=torch.float64)
 
     @staticmethod
@@ -133,16 +160,22 @@ class TrajectoryMetrics:
 
     def update(self, pred, target, valid_mask=None):
         """累积一个 batch 的逐时刻平方误差、位移误差和有效样本数。"""
-        pred = pred[:, :self.pred_len, :2]
-        target = target[:, :self.pred_len, :2]
+        pred = pred[:, :self.pred_len]
+        target = target[:, :self.pred_len]
         valid_mask = self.normalize_valid_mask(valid_mask, pred)[:, :pred.size(1)]
 
-        diff = pred - target
+        diff = pred[..., :2] - target[..., :2]
         dist_sq = torch.sum(diff ** 2, dim=-1)
         dist = torch.sqrt(dist_sq)
 
         self.total_coord_se += torch.sum(dist_sq * valid_mask, dim=0).double().cpu()
         self.total_de += torch.sum(dist * valid_mask, dim=0).double().cpu()
+        if pred.size(-1) >= 3 and target.size(-1) >= 3:
+            theta_diff_deg = wrap_angle(pred[..., 2] - target[..., 2]).abs() * (180.0 / torch.pi)
+            self.total_theta_abs_deg += torch.sum(theta_diff_deg * valid_mask, dim=0).double().cpu()
+        if pred.size(-1) >= 4 and target.size(-1) >= 4:
+            v_diff = (pred[..., 3] - target[..., 3]).abs()
+            self.total_v_abs += torch.sum(v_diff * valid_mask, dim=0).double().cpu()
         self.total_counts += torch.sum(valid_mask, dim=0).double().cpu()
 
     def summary(self):
@@ -151,6 +184,8 @@ class TrajectoryMetrics:
         rmse_per_step_ft = torch.sqrt(self.total_coord_se / counts)
         fde_per_step_ft = self.total_de / counts
         ade_per_step_ft = torch.cumsum(self.total_de, dim=0) / torch.cumsum(self.total_counts, dim=0).clamp(min=1.0)
+        theta_mae_per_step_deg = self.total_theta_abs_deg / counts
+        v_mae_per_step_ftps = self.total_v_abs / counts
 
         return {
             "rmse_per_step_ft": rmse_per_step_ft,
@@ -159,4 +194,7 @@ class TrajectoryMetrics:
             "fde_per_step_m": fde_per_step_ft * self.meter_per_unit,
             "ade_per_step_ft": ade_per_step_ft,
             "ade_per_step_m": ade_per_step_ft * self.meter_per_unit,
+            "theta_mae_per_step_deg": theta_mae_per_step_deg,
+            "v_mae_per_step_ftps": v_mae_per_step_ftps,
+            "v_mae_per_step_mps": v_mae_per_step_ftps * self.meter_per_unit,
         }
