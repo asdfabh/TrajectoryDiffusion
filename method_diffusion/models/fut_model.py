@@ -75,6 +75,7 @@ class DiffusionFut(nn.Module):
         self.plan_anchor = nn.Parameter(plan_anchor.float(), requires_grad=False)
 
     def computeKinematicLoss(self, pred_x0, valid_mask, fut_dt):
+        loss_fn = F.l1_loss() # F.smooth_l1_loss
         pred_phys = self.denorm(pred_x0)
         x = pred_phys[..., 0]
         y = pred_phys[..., 1]
@@ -92,7 +93,9 @@ class DiffusionFut(nn.Module):
             zero = pred_x0.new_zeros(())
             return zero, zero
 
-        loss_map = torch.abs(rx) + torch.abs(ry)
+        kin_pred = torch.stack([rx, ry], dim=-1)
+        kin_target = torch.zeros_like(kin_pred)
+        loss_map = loss_fn(kin_pred, kin_target, reduction="none").mean(dim=-1)
         loss_kin = (loss_map * valid_pair).sum() / (valid_pair_sum + 1e-6)
         kin_res = torch.sqrt(rx.square() + ry.square() + 1e-12)
         kin_res_mean = (kin_res * valid_pair).sum() / (valid_pair_sum + 1e-6)
@@ -100,25 +103,24 @@ class DiffusionFut(nn.Module):
 
     def computeLoss(self, pred_x0, target_x0, valid_mask):
         lambda_xy = 1.0
-        lambda_theta = 0.3
-        lambda_v = 0.3
-        lambda_kin = 0.05
+        lambda_theta = 0.5
+        lambda_v = 0.5
+        lambda_kin = 0.20
         fut_dt = 0.2
+        loss_fn = F.l1_loss
 
         valid_sum = valid_mask.sum(dim=1) + 1e-6
-        valid_xy = valid_mask.unsqueeze(-1)
-        valid_xy_sum = valid_xy.expand(-1, -1, 2).sum(dim=(1, 2)) + 1e-6
 
-        xy_error = torch.abs(pred_x0[..., :2] - target_x0[..., :2])
-        loss_xy = ((xy_error * valid_xy).sum(dim=(1, 2)) / valid_xy_sum).mean()
+        xy_loss_map = loss_fn(pred_x0[..., :2], target_x0[..., :2], reduction="none").mean(dim=-1)
+        loss_xy = ((xy_loss_map * valid_mask).sum(dim=1) / valid_sum).mean()
 
         theta_std = self.fut_std[2].to(device=pred_x0.device, dtype=pred_x0.dtype).clamp(min=1e-6)
-        theta_diff = (pred_x0[..., 2] - target_x0[..., 2]) * theta_std
-        theta_error = torch.abs(wrap_angle(theta_diff) / theta_std)
-        loss_theta = ((theta_error * valid_mask).sum(dim=1) / valid_sum).mean()
+        theta_diff = wrap_angle((pred_x0[..., 2] - target_x0[..., 2]) * theta_std) / theta_std
+        theta_loss_map = loss_fn(theta_diff, torch.zeros_like(theta_diff), reduction="none")
+        loss_theta = ((theta_loss_map * valid_mask).sum(dim=1) / valid_sum).mean()
 
-        v_error = torch.abs(pred_x0[..., 3] - target_x0[..., 3])
-        loss_v = ((v_error * valid_mask).sum(dim=1) / valid_sum).mean()
+        v_loss_map = loss_fn(pred_x0[..., 3], target_x0[..., 3], reduction="none")
+        loss_v = ((v_loss_map * valid_mask).sum(dim=1) / valid_sum).mean()
 
         loss_kin, kin_res_mean = self.computeKinematicLoss(pred_x0, valid_mask, fut_dt)
         loss_total = lambda_xy * loss_xy + lambda_theta * loss_theta + lambda_v * loss_v + lambda_kin * loss_kin

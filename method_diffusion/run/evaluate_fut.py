@@ -59,18 +59,18 @@ def print_metrics(metrics, title):
         return
 
     print(
-        f"{'Horizon':<8} | {'RMSE (m)':<12} | {'ADE (m)':<12} | "
-        f"{'FDE (m)':<12} | {'Theta (deg)':<12} | {'V (m/s)':<12}"
+        f"{'Horizon':<8} | {'RMSE (m)':<10} | {'ADE (m)':<10} | "
+        f"{'FDE (m)':<10} | {'Theta (deg)':<10} | {'V (m/s)':<10}"
     )
     print("-" * 75)
     for label, idx in valid_pairs:
         print(
             f"{label:<8} | "
-            f"{metrics['rmse_per_step_m'][idx].item():<12.6f} | "
-            f"{metrics['ade_per_step_m'][idx].item():<12.6f} | "
-            f"{metrics['fde_per_step_m'][idx].item():<12.6f} | "
-            f"{metrics['theta_mae_per_step_deg'][idx].item():<12.6f} | "
-            f"{metrics['v_mae_per_step_mps'][idx].item():<12.6f}"
+            f"{metrics['rmse_per_step_m'][idx].item():<10f} | "
+            f"{metrics['ade_per_step_m'][idx].item():<10f} | "
+            f"{metrics['fde_per_step_m'][idx].item():<10f} | "
+            f"{metrics['theta_mae_per_step_deg'][idx].item():<10f} | "
+            f"{metrics['v_mae_per_step_mps'][idx].item():<10f}"
         )
     print("=" * 75)
 
