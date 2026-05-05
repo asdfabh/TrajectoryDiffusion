@@ -1,5 +1,7 @@
 from matplotlib import pyplot as plt
 import matplotlib.patches as patches
+from matplotlib.legend_handler import HandlerTuple
+from matplotlib.lines import Line2D
 import numpy as np
 import torch
 
@@ -65,6 +67,44 @@ def _compute_vis_metrics(pred_traj, target_traj, valid_mask):
 
 def _get_mode_color(mode_idx):
     return MODE_COLOR_PALETTE[int(mode_idx) % len(MODE_COLOR_PALETTE)]
+
+
+def _resolve_vehicle_box_size(ax, y_size=3.0, x_to_y_ratio=5.0 / 2.0):
+    """按当前坐标轴缩放换算车辆框尺寸，保证视觉长宽比稳定。"""
+    x_min, x_max = ax.get_xlim()
+    y_min, y_max = ax.get_ylim()
+    x_span = abs(float(x_max) - float(x_min))
+    y_span = abs(float(y_max) - float(y_min))
+    bbox = ax.get_window_extent()
+    if x_span <= 0.0 or y_span <= 0.0 or bbox.width <= 0.0 or bbox.height <= 0.0:
+        return y_size * x_to_y_ratio, y_size
+
+    x_data_per_pixel = x_span / float(bbox.width)
+    y_data_per_pixel = y_span / float(bbox.height)
+    x_size = y_size * x_to_y_ratio * x_data_per_pixel / y_data_per_pixel
+    return x_size, y_size
+
+
+def _draw_vehicle_box(ax, center_x, center_y, y_size=3.0, x_to_y_ratio=5.0 / 2.0, color="#1F77B4", label=None, zorder=10):
+    width, height = _resolve_vehicle_box_size(ax, y_size=y_size, x_to_y_ratio=x_to_y_ratio)
+    rect = patches.Rectangle(
+        (center_x - width / 2.0, center_y - height / 2.0),
+        width,
+        height,
+        linewidth=1.4,
+        edgecolor=color,
+        facecolor=color,
+        alpha=0.28,
+        label=label,
+        zorder=zorder,
+    )
+    ax.add_patch(rect)
+
+
+def _build_vehicle_legend_handle(color):
+    line_handle = Line2D([0], [0], color=color, linewidth=2.0, linestyle='-')
+    rect_handle = patches.Rectangle((0, 0), 1, 1, edgecolor=color, facecolor=color, alpha=0.28, linewidth=1.4)
+    return (line_handle, rect_handle)
 
 
 def plot_hist_reconstruction(hist_original, hist_masked, hist_pred, fig_num1=3, fig_num2=3, input_unit="ft"):
@@ -269,8 +309,8 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
     nbrs_vis = reconstruct_nbrs_from_mask(hist_nbrs, temporal_mask, idx)
 
     # 绘图窗口尺寸：默认16：9，展示16：4
-    # fig, ax = plt.subplots(figsize=(16, 4))
-    fig, ax = plt.subplots(figsize=(16, 9))
+    fig, ax = plt.subplots(figsize=(16, 4))
+    # fig, ax = plt.subplots(figsize=(16, 9))
     lane_lines = (-18.0, -6.0, 6.0, 18.0)
 
     for lane_y in lane_lines:
@@ -283,8 +323,13 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
             zorder=0,
         )
 
+    nbr_color = '#B8860B'
+    ego_color = '#1F77B4'
+    has_nbrs = False
+    has_ego = False
+    nbr_vehicle_centers = []
+    ego_vehicle_center = None
     if nbrs_vis is not None:
-        first_nbr = True
         for n_idx in range(nbrs_vis.shape[0]):
             traj = np.asarray(nbrs_vis[n_idx])
             if traj.ndim != 2 or traj.shape[0] == 0 or traj.shape[-1] < 2:
@@ -295,23 +340,29 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
             traj_valid = traj[valid]
             ax.plot(
                 traj_valid[:, 1], traj_valid[:, 0],
-                color='#B8860B', alpha=0.7, linewidth=1.1, linestyle='-',
-                label='Neighbors' if first_nbr else None, zorder=1
+                color=nbr_color, alpha=0.7, linewidth=1.1, linestyle='-',
+                zorder=1
             )
-            first_nbr = False
+            last_x = float(traj_valid[-1, 1])
+            last_y = float(traj_valid[-1, 0])
+            nbr_vehicle_centers.append((last_x, last_y))
+            has_nbrs = True
 
     if gt_hist is not None:
         ax.plot(
             gt_hist[:, 1], gt_hist[:, 0],
-            color='#1F77B4',
+            color=ego_color,
             linestyle='-',
             marker='o',
             markersize=4,
             linewidth=2.0,
             alpha=0.85,
-            label='Original Hist',
             zorder=8,
         )
+        ego_x = float(gt_hist[-1, 1])
+        ego_y = float(gt_hist[-1, 0])
+        ego_vehicle_center = (ego_x, ego_y)
+        has_ego = True
 
     if hist_masked_arr is not None and gt_hist is not None:
         hist_mask_arr = np.asarray(hist_masked_arr)
@@ -358,18 +409,15 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
             zorder=9,
         )
     if pred_modes is not None:
+        has_other_anchor_label = False
         for k in range(pred_modes.shape[0]):
             traj = normalize_traj2d(pred_modes[k])
             if traj is None:
                 continue
             is_best = (best_k is not None and k == best_k)
             # 轨迹颜色，默认anchor多颜色，展示用浅蓝色表示其他结果
-            # mode_color = '#E41A1C' if is_best else '#9ECAE1'
-            mode_color = _get_mode_color(k)
-            mode_num = k + 1
-            label = f"Mode {mode_num}"
-            if is_best:
-                label = f"{label} ({highlight_label})"
+            mode_color = '#E41A1C' if is_best else '#9ECAE1'
+            label = 'best anchor' if is_best else (None if has_other_anchor_label else 'other anchor')
             ax.plot(
                 traj[:, 1], traj[:, 0],
                 linestyle='-',
@@ -382,26 +430,8 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
                 label=label,
                 zorder=4 if is_best else 3
             )
-            end_y, end_x = traj[-1, 0], traj[-1, 1]
-            ax.scatter(
-                [end_x],
-                [end_y],
-                s=24 if is_best else 10,
-                color=mode_color,
-                marker='*' if is_best else 'o',
-                zorder=4 if is_best else 3,
-            )
-            end_text = f"{mode_num} {highlight_label}" if is_best else f"{mode_num}"
-            ax.text(
-                end_x + 3.0,
-                end_y + (0.25 if is_best else 0.15),
-                end_text,
-                color=mode_color,
-                fontsize=9,
-                weight='bold' if is_best else 'normal',
-                bbox=dict(boxstyle='round,pad=0.15', facecolor='white', alpha=0.7, edgecolor=mode_color),
-                zorder=4,
-            )
+            if not is_best:
+                has_other_anchor_label = True
     elif pred_best is not None:
         ax.plot(
             pred_best[:, 1], pred_best[:, 0],
@@ -411,7 +441,7 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
             markersize=3.0,
             linewidth=2.0,
             alpha=0.9,
-            label='Pred',
+            label='best anchor',
             zorder=4,
         )
 
@@ -427,11 +457,48 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
     ax.set_title(title)
     ax.set_xlabel(f"Lateral Position ({unit})")
     ax.set_ylabel(f"Longitudinal Position ({unit})")
-    ax.legend(loc='best')
+    handles, labels = ax.get_legend_handles_labels()
+    legend_handles = []
+    legend_labels = []
+    if has_nbrs:
+        legend_handles.append(_build_vehicle_legend_handle(nbr_color))
+        legend_labels.append('nbrs')
+    if has_ego:
+        legend_handles.append(_build_vehicle_legend_handle(ego_color))
+        legend_labels.append('ego')
+    legend_handles.extend(handles)
+    legend_labels.extend(labels)
+    ax.legend(
+        legend_handles,
+        legend_labels,
+        loc='best',
+        handler_map={tuple: HandlerTuple(ndivide=None)},
+    )
     ax.grid(False)
     ax.set_aspect('auto')
     ax.set_ylim(-18, 18)
     plt.tight_layout()
+    fig.canvas.draw()
+    for nbr_x, nbr_y in nbr_vehicle_centers:
+        _draw_vehicle_box(
+            ax,
+            center_x=nbr_x,
+            center_y=nbr_y,
+            y_size=3.0,
+            x_to_y_ratio=5.0 / 2.0,
+            color=nbr_color,
+            zorder=2,
+        )
+    if ego_vehicle_center is not None:
+        _draw_vehicle_box(
+            ax,
+            center_x=ego_vehicle_center[0],
+            center_y=ego_vehicle_center[1],
+            y_size=3.0,
+            x_to_y_ratio=5.0 / 2.0,
+            color=ego_color,
+            zorder=9,
+        )
     plt.show()
 
 

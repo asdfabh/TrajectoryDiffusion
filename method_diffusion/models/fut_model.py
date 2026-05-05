@@ -75,7 +75,7 @@ class DiffusionFut(nn.Module):
         self.plan_anchor = nn.Parameter(plan_anchor.float(), requires_grad=False)
 
     def computeKinematicLoss(self, pred_x0, valid_mask, fut_dt):
-        loss_fn = F.l1_loss() # F.smooth_l1_loss
+        loss_fn = F.l1_loss # F.smooth_l1_loss
         pred_phys = self.denorm(pred_x0)
         x = pred_phys[..., 0]
         y = pred_phys[..., 1]
