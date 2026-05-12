@@ -12,7 +12,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
-from method_diffusion.run.train_fut import prepare_input_data
+from method_diffusion.run.train_fut import get_fut_checkpoint_dir, prepare_input_data
 from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_closest_prediction
 from method_diffusion.utils.visualization import visualize_scene_prediction
 
@@ -156,10 +156,12 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis):
 # 初始化模型、数据与 checkpoint，并执行 fut 测试评估。
 def main():
     args = get_args_parser().parse_args()
-    args.checkpoint_dir = str(FUT_CHECKPOINT_DIR)
+    dataset_name = str(args.dataset).lower()
+    args.checkpoint_dir = str(get_fut_checkpoint_dir(dataset_name))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"[FutEval] Device: {device}")
+    print(f"[FutEval] Dataset: {dataset_name}")
     print(f"[FutEval] Checkpoint dir: {args.checkpoint_dir}")
     print(f"[FutEval] fut_k={args.fut_k}, num_inference_steps={args.num_inference_steps}")
 

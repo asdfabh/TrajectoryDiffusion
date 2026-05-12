@@ -21,6 +21,10 @@ FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
 METER_PER_FOOT = 0.3048
 LOSS_STAT_KEYS = ["loss", "loss_total", "loss_xy", "loss_theta", "loss_v", "loss_kin", "kin_res_mean"]
 
+
+def get_fut_checkpoint_dir(dataset_name):
+    return FUT_CHECKPOINT_DIR / str(dataset_name).strip().lower()
+
 # 解析 resume 标识并返回对应的 checkpoint 路径。
 def resolve_resume_checkpoint(resume_arg, checkpoint_dir):
     if resume_arg in ("none", "", None):
@@ -260,7 +264,9 @@ def evaluate(model, dataloader, device, epoch, feature_dim):
 # 初始化训练组件并执行 fut 训练主流程。
 def main():
     args = get_args_parser().parse_args()
-    checkpoint_dir = FUT_CHECKPOINT_DIR
+    dataset_name = str(args.dataset).lower()
+    checkpoint_dir = get_fut_checkpoint_dir(dataset_name)
+    args.checkpoint_dir = str(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     tensorboard_log_dir = checkpoint_dir / "log"
     tensorboard_log_dir.mkdir(parents=True, exist_ok=True)
@@ -269,12 +275,11 @@ def main():
     writer = SummaryWriter(log_dir=str(tensorboard_log_dir))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    dataset_name = str(args.dataset).lower()
     data_root = Path(args.data_root_highd if dataset_name == "highd" else args.data_root_ngsim)
     train_path = str(data_root / "TrainSet.mat")
     val_path = str(data_root / "ValSet.mat")
     print(f"[FutTrain] Dataset: {dataset_name}")
+    print(f"[FutTrain] Checkpoint dir: {checkpoint_dir}")
     print(f"[FutTrain] Train path: {train_path}")
     print(f"[FutTrain] Val path: {val_path}")
 

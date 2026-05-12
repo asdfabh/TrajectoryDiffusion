@@ -26,6 +26,10 @@ JOINT_FUT_CHECKPOINT_DIR = JOINT_CHECKPOINT_DIR / "fut"
 JOINT_HIST_CHECKPOINT_DIR = JOINT_CHECKPOINT_DIR / "hist"
 METER_PER_FOOT = 0.3048
 
+
+def get_joint_fut_checkpoint_dir(dataset_name):
+    return JOINT_FUT_CHECKPOINT_DIR / str(dataset_name).strip().lower()
+
 def build_hist_masked(hist, mask_ratio, random_mask_ratio, block_mask_start):
     hist_mask = mixed_mask(
         hist,
@@ -293,8 +297,10 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, mask
 
 def main():
     args = get_args_parser().parse_args()
-    args.checkpoint_dir = str(JOINT_FUT_CHECKPOINT_DIR)
-    JOINT_FUT_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    dataset_name = str(args.dataset).lower()
+    checkpoint_dir = get_joint_fut_checkpoint_dir(dataset_name)
+    args.checkpoint_dir = str(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     tensorboard_log_dir = Path(args.checkpoint_dir) / "log"
     tensorboard_log_dir.mkdir(parents=True, exist_ok=True)
     log_csv_path = tensorboard_log_dir / "train_log.csv"
@@ -303,11 +309,11 @@ def main():
     writer = SummaryWriter(log_dir=str(tensorboard_log_dir))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset_name = str(args.dataset).lower()
     data_root = Path(args.data_root_highd if dataset_name == "highd" else args.data_root_ngsim)
     train_path = str(data_root / "TrainSet.mat")
     val_path = str(data_root / "ValSet.mat")
     print(f"[JointTrain] Dataset: {dataset_name}")
+    print(f"[JointTrain] Checkpoint dir: {checkpoint_dir}")
     print(f"[JointTrain] Train path: {train_path}")
     print(f"[JointTrain] Val path: {val_path}")
 

@@ -22,7 +22,7 @@ from method_diffusion.run.evaluate_fut import (
     print_metrics,
 )
 from method_diffusion.run.train_fut import prepare_input_data
-from method_diffusion.run.train_joint import JOINT_FUT_CHECKPOINT_DIR, JOINT_HIST_CHECKPOINT_DIR
+from method_diffusion.run.train_joint import JOINT_HIST_CHECKPOINT_DIR, get_joint_fut_checkpoint_dir
 from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_closest_prediction
 from method_diffusion.utils.visualization import visualize_scene_prediction
 
@@ -114,10 +114,12 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enab
 def main():
     args = get_eval_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dataset_name = str(args.dataset).lower()
     hist_checkpoint_dir = resolve_hist_checkpoint_dir(args.resume_hist)
-    fut_checkpoint_dir = JOINT_FUT_CHECKPOINT_DIR
+    fut_checkpoint_dir = get_joint_fut_checkpoint_dir(dataset_name)
 
     print(f"[JointEval] Device: {device}")
+    print(f"[JointEval] Dataset: {dataset_name}")
     print(f"[JointEval] Hist checkpoint dir: {hist_checkpoint_dir}")
     print(f"[JointEval] Fut checkpoint dir: {fut_checkpoint_dir}")
     print(f"[JointEval] fut_k={args.fut_k}, num_inference_steps={args.num_inference_steps}")

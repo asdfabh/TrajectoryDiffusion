@@ -16,9 +16,9 @@ from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.run.train_fut import (
-    FUT_CHECKPOINT_DIR,
     LOSS_STAT_KEYS,
     METER_PER_FOOT,
+    get_fut_checkpoint_dir,
     init_csv_log,
     load_checkpoint,
     print_eval_summary,
@@ -210,7 +210,9 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
 def main():
     rank, local_rank, world_size, device = setup_ddp()
     args = get_args_parser().parse_args()
-    checkpoint_dir = FUT_CHECKPOINT_DIR
+    dataset_name = str(args.dataset).lower()
+    checkpoint_dir = get_fut_checkpoint_dir(dataset_name)
+    args.checkpoint_dir = str(checkpoint_dir)
 
     writer = None
     log_csv_path = None
@@ -222,12 +224,12 @@ def main():
         init_csv_log(log_csv_path)
         writer = SummaryWriter(log_dir=str(tensorboard_log_dir))
 
-    dataset_name = str(args.dataset).lower()
     data_root = Path(args.data_root_highd if dataset_name == "highd" else args.data_root_ngsim)
     train_path = str(data_root / "TrainSet.mat")
     val_path = str(data_root / "ValSet.mat")
     if is_main_process(rank):
         print(f"[DDP FutTrain] Dataset: {dataset_name}")
+        print(f"[DDP FutTrain] Checkpoint dir: {checkpoint_dir}")
         print(f"[DDP FutTrain] Train path: {train_path}")
         print(f"[DDP FutTrain] Val path: {val_path}")
 

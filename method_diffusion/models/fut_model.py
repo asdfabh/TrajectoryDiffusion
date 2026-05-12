@@ -72,11 +72,10 @@ class DiffusionFut(nn.Module):
 
         anchor_path = Path(__file__).resolve().parent.parent / "dataset" / "anchor" / f"{self.dataset_name}_k{self.fut_k}.pt"
         plan_anchor = torch.load(anchor_path, map_location="cpu")
-        self.plan_anchor = nn.Parameter(plan_anchor.float(), requires_grad=False)
+        self.register_buffer("plan_anchor", plan_anchor.float(), persistent=False)
 
-    def computeKinematicLoss(self, pred_x0, valid_mask, fut_dt):
+    def computeKinematicLoss(self, pred_phys, valid_mask, fut_dt):
         loss_fn = F.l1_loss # F.smooth_l1_loss
-        pred_phys = self.denorm(pred_x0)
         x = pred_phys[..., 0]
         y = pred_phys[..., 1]
         theta = pred_phys[..., 2]
@@ -90,7 +89,7 @@ class DiffusionFut(nn.Module):
         valid_pair = valid_mask[:, :-1] * valid_mask[:, 1:]
         valid_pair_sum = valid_pair.sum()
         if valid_pair_sum.item() <= 0:
-            zero = pred_x0.new_zeros(())
+            zero = pred_phys.new_zeros(())
             return zero, zero
 
         kin_pred = torch.stack([rx, ry], dim=-1)
@@ -101,7 +100,7 @@ class DiffusionFut(nn.Module):
         kin_res_mean = (kin_res * valid_pair).sum() / (valid_pair_sum + 1e-6)
         return loss_kin, kin_res_mean
 
-    def computeLoss(self, pred_x0, target_x0, valid_mask):
+    def computeLoss(self, pred_phys, target_phys, valid_mask):
         lambda_xy = 1.0
         lambda_theta = 0.5
         lambda_v = 0.5
@@ -111,18 +110,17 @@ class DiffusionFut(nn.Module):
 
         valid_sum = valid_mask.sum(dim=1) + 1e-6
 
-        xy_loss_map = loss_fn(pred_x0[..., :2], target_x0[..., :2], reduction="none").mean(dim=-1)
+        xy_loss_map = loss_fn(pred_phys[..., :2], target_phys[..., :2], reduction="none").mean(dim=-1)
         loss_xy = ((xy_loss_map * valid_mask).sum(dim=1) / valid_sum).mean()
 
-        theta_std = self.fut_std[2].to(device=pred_x0.device, dtype=pred_x0.dtype).clamp(min=1e-6)
-        theta_diff = wrap_angle((pred_x0[..., 2] - target_x0[..., 2]) * theta_std) / theta_std
+        theta_diff = wrap_angle(pred_phys[..., 2] - target_phys[..., 2])
         theta_loss_map = loss_fn(theta_diff, torch.zeros_like(theta_diff), reduction="none")
         loss_theta = ((theta_loss_map * valid_mask).sum(dim=1) / valid_sum).mean()
 
-        v_loss_map = loss_fn(pred_x0[..., 3], target_x0[..., 3], reduction="none")
+        v_loss_map = loss_fn(pred_phys[..., 3], target_phys[..., 3], reduction="none")
         loss_v = ((v_loss_map * valid_mask).sum(dim=1) / valid_sum).mean()
 
-        loss_kin, kin_res_mean = self.computeKinematicLoss(pred_x0, valid_mask, fut_dt)
+        loss_kin, kin_res_mean = self.computeKinematicLoss(pred_phys, valid_mask, fut_dt)
         loss_total = lambda_xy * loss_xy + lambda_theta * loss_theta + lambda_v * loss_v + lambda_kin * loss_kin
         logs = {
             "loss": loss_total.detach(),
@@ -139,15 +137,14 @@ class DiffusionFut(nn.Module):
     def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
         bsz, t_len, _ = future.shape
         valid_mask = (op_mask[..., 0] > 0.5).float().to(device) # [B,T]
-        target_x0 = self.norm(future) # [B,T,D]
 
         anchor_x0_all = self.plan_anchor.to(device=device).unsqueeze(0).expand(bsz, -1, -1, -1) # [B,K,T,D]
-        anchor_x0_all = self.norm(anchor_x0_all)
         valid_time = valid_mask.unsqueeze(1) # [B,1,T]
-        dist = torch.linalg.norm(target_x0.unsqueeze(1)[..., :2] - anchor_x0_all[..., :2], dim=-1) # [B,K,T]
+        dist = torch.linalg.norm(future.unsqueeze(1)[..., :2] - anchor_x0_all[..., :2], dim=-1) # [B,K,T]
         numer = (dist * valid_time).sum(dim=-1) # [B,K]
         denom = valid_time.sum(dim=-1) + 1e-6 # [B,1]
         mode_idx = torch.argmin(numer / denom, dim=-1) # [B]
+        anchor_x0_all = self.norm(anchor_x0_all)
         gather_index = mode_idx.view(bsz, 1, 1, 1).expand(-1, 1, t_len, self.output_dim)
         anchor_x0 = torch.gather(anchor_x0_all, 1, gather_index).squeeze(1) # [B,T,D]
 
@@ -160,7 +157,8 @@ class DiffusionFut(nn.Module):
         input_embedded = self.input_embedding(x_t) + self.pos_embedding(x_t) # [B,T,D]
         pred_delta = self.dit(input_embedded, t_emb, context_tokens) # [B,T,D]
         pred_x0 = x_t + pred_delta # [B,T,D]
-        loss, loss_logs = self.computeLoss(pred_x0, target_x0, valid_mask)
+        pred_phys = self.denorm(pred_x0)
+        loss, loss_logs = self.computeLoss(pred_phys, future, valid_mask)
         return loss, loss_logs
 
 
@@ -203,7 +201,7 @@ class DiffusionFut(nn.Module):
         mean = self.fut_mean.to(device=x.device, dtype=x.dtype)
         std = self.fut_std.to(device=x.device, dtype=x.dtype).clamp(min=1e-6)
         x_norm[..., :self.output_dim] = (x[..., :self.output_dim] - mean[:self.output_dim]) / std[:self.output_dim]
-        x_norm[..., :self.output_dim] = torch.clamp(x_norm[..., :self.output_dim], -5.0, 5.0)
+        x_norm[..., :self.output_dim] = torch.clamp(x_norm[..., :self.output_dim], -10.0, 10.0)
         return x_norm
 
     def denorm(self, x):

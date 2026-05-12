@@ -19,10 +19,10 @@ from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.run.train_fut import prepare_input_data
 from method_diffusion.run.train_joint import (
     HIST_CHECKPOINT_DIR,
-    JOINT_FUT_CHECKPOINT_DIR,
     JOINT_HIST_CHECKPOINT_DIR,
     METER_PER_FOOT,
     build_hist_outputs,
+    get_joint_fut_checkpoint_dir,
     init_csv_log,
     load_fut_checkpoint,
     load_hist_checkpoint,
@@ -255,25 +255,27 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, rank
 def main():
     rank, local_rank, world_size, device = setup_ddp()
     args = get_args_parser().parse_args()
-    args.checkpoint_dir = str(JOINT_FUT_CHECKPOINT_DIR)
+    dataset_name = str(args.dataset).lower()
+    checkpoint_dir = get_joint_fut_checkpoint_dir(dataset_name)
+    args.checkpoint_dir = str(checkpoint_dir)
 
     writer = None
     log_csv_path = None
     if is_main_process(rank):
-        JOINT_FUT_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-        tensorboard_log_dir = JOINT_FUT_CHECKPOINT_DIR / "log"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        tensorboard_log_dir = checkpoint_dir / "log"
         tensorboard_log_dir.mkdir(parents=True, exist_ok=True)
         log_csv_path = tensorboard_log_dir / "train_log.csv"
         if not log_csv_path.exists() or args.resume_fut in ("none", "", None):
             init_csv_log(log_csv_path)
         writer = SummaryWriter(log_dir=str(tensorboard_log_dir))
 
-    dataset_name = str(args.dataset).lower()
     data_root = Path(args.data_root_highd if dataset_name == "highd" else args.data_root_ngsim)
     train_path = str(data_root / "TrainSet.mat")
     val_path = str(data_root / "ValSet.mat")
     if is_main_process(rank):
         print(f"[DDP JointTrain] Dataset: {dataset_name}")
+        print(f"[DDP JointTrain] Checkpoint dir: {checkpoint_dir}")
         print(f"[DDP JointTrain] Train path: {train_path}")
         print(f"[DDP JointTrain] Val path: {val_path}")
 
@@ -405,10 +407,10 @@ def main():
             }
 
             if (epoch + 1) % args.save_interval == 0:
-                torch.save(fut_state, JOINT_FUT_CHECKPOINT_DIR / f"epoch_{epoch + 1}.pth")
+                torch.save(fut_state, checkpoint_dir / f"epoch_{epoch + 1}.pth")
 
             if is_best:
-                torch.save(fut_state, JOINT_FUT_CHECKPOINT_DIR / "best.pth")
+                torch.save(fut_state, checkpoint_dir / "best.pth")
 
         if dist.is_initialized():
             dist.barrier()
