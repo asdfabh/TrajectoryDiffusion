@@ -291,13 +291,6 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
     hist_recon = normalize_traj2d(safe_get_batch(hist_reconstructed, idx, batch_ndim=3))
     pred_modes = safe_get_batch(pred_all, idx, batch_ndim=4)
 
-    # Extract per-sample mode probabilities
-    probs_arr = None
-    if mode_probs is not None:
-        mp = _to_numpy(mode_probs)
-        if mp is not None and mp.ndim >= 2 and mp.shape[0] > idx:
-            probs_arr = np.asarray(mp[idx]).reshape(-1)  # [n_modes]
-
     if pred_modes is not None:
         pred_modes = np.asarray(pred_modes)
         if pred_modes.ndim == 2 and pred_modes.shape[-1] >= 2:
@@ -535,7 +528,6 @@ def visualize_scene_prediction(hist, hist_nbrs, temporal_mask, future, pred, val
         pred=pred,
         pred_all=pred_all,
         pred_best_idx=pred_best_idx,
-        mode_probs=mode_probs,
         future_mask=valid_mask,
         batch_idx=batch_idx,
         metrics=metrics,

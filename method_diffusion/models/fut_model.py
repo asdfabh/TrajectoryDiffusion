@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch import nn
 from diffusers.schedulers import DDIMScheduler
 
-from method_diffusion.models.denoiser import TrajectoryDenoiser
+from method_diffusion.models import dit_fut as dit
 from method_diffusion.models.hist_encoder import HistEncoder
 from method_diffusion.utils.fut_utils import build_eval_timestep_pairs, ddim_step, wrap_angle
 from method_diffusion.utils.position_encoding import SequentialPositionalEncoding
@@ -18,9 +18,9 @@ class DiffusionFut(nn.Module):
         self.args = args
         self.dataset_name = str(args.dataset).strip().lower()
 
-        # Model dimensions
+        # 模型结构参数：控制 DiT 主干维度、层数和 future 序列长度。
         self.hidden_dim = int(args.hidden_dim_fut)
-        self.input_dim = int(args.input_dim_fut)    # trajectory channels for diffusion (2: x,y)
+        self.input_dim = int(args.input_dim_fut)
         self.output_dim = int(args.output_dim_fut)
         self.heads = int(args.heads_fut)
         self.depth = int(args.depth_fut)
@@ -52,7 +52,7 @@ class DiffusionFut(nn.Module):
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=self.num_train_timesteps,
             beta_schedule="squaredcos_cap_v2",
-            prediction_type="epsilon",
+            prediction_type="sample",
             clip_sample=False,
         )
 
