@@ -3,6 +3,8 @@ import torch
 from torch.utils.data import Dataset
 import scipy.io as scp
 
+from method_diffusion.dataset.future_features import build_future_xy_theta_v
+
 
 # Dataset class for the dataset
 class NgsimDataset(Dataset):
@@ -192,12 +194,8 @@ class NgsimDataset(Dataset):
     # Helper function to get track future
     def getFuture(self, vehId, t, dsId):
         vehTrack = self.T[dsId - 1][vehId - 1].transpose()
-        refPos = vehTrack[np.where(vehTrack[:, 0] == t)][0, 1:3]
-        stpt = np.argwhere(vehTrack[:, 0] == t).item() + self.d_s
-        enpt = np.minimum(len(vehTrack), np.argwhere(
-            vehTrack[:, 0] == t).item() + self.t_f + 1)
-        fut = vehTrack[stpt:enpt:self.d_s, 1:3] - refPos
-        return fut
+        frame_idx = np.argwhere(vehTrack[:, 0] == t).item()
+        return build_future_xy_theta_v(vehTrack, frame_idx, self.t_f, self.d_s)
 
     # Collate function for dataloader
     def collate_fn(self, samples):
@@ -225,8 +223,8 @@ class NgsimDataset(Dataset):
         # Initialize history, history lengths, future, output mask, lateral maneuver and longitudinal maneuver batches:
         hist_batch = torch.zeros(len(samples), maxlen, 2)  # (len1,batch,2)
         distance_batch = torch.zeros(len(samples), maxlen, 1)
-        fut_batch = torch.zeros(len(samples), self.t_f // self.d_s, 2)  # (len2,batch,2)
-        op_mask_batch = torch.zeros(len(samples), self.t_f // self.d_s, 2)  # (len2,batch,2)
+        fut_batch = torch.zeros(len(samples), self.t_f // self.d_s, 4)  # (len2,batch,4)
+        op_mask_batch = torch.zeros(len(samples), self.t_f // self.d_s, 1)  # (len2,batch,1)
         lat_enc_batch = torch.zeros(len(samples), 3)  # (batch,3)
         lon_enc_batch = torch.zeros(len(samples), 3)  # (batch,3)
         va_batch = torch.zeros(len(samples), maxlen, 2)
@@ -245,9 +243,8 @@ class NgsimDataset(Dataset):
             hist_batch[sampleId, 0:len(hist), 0] = torch.from_numpy(hist[:, 0])
             hist_batch[sampleId, 0:len(hist), 1] = torch.from_numpy(hist[:, 1])
             distance_batch[sampleId, 0:len(hist), :] = torch.from_numpy(refdistance)
-            fut_batch[sampleId, 0:len(fut), 0] = torch.from_numpy(fut[:, 0])
-            fut_batch[sampleId, 0:len(fut), 1] = torch.from_numpy(fut[:, 1])
-            op_mask_batch[sampleId, 0:len(fut), :] = 1
+            fut_batch[sampleId, 0:len(fut), :] = torch.from_numpy(fut[:, :4])
+            op_mask_batch[sampleId, 0:len(fut), 0] = 1
             lat_enc_batch[sampleId, :] = torch.from_numpy(lat_enc)
             lon_enc_batch[sampleId, :] = torch.from_numpy(lon_enc)
             va_batch[sampleId, 0:len(va), 0] = torch.from_numpy(va[:, 0])

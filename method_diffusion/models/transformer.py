@@ -35,13 +35,13 @@ class Transformer(nn.Module):
                 nn.init.xavier_uniform_(p)  # 初始化参数
 
     def forward(self, src, mask, query_embed, pos_embed):
-        # src.shape=[l, bs, c]  l=seq_len, bs=batch_size, c=feature
-        l, bs, c = src.shape  # l=seq_len bs=batch_size, c=feature  src.shape=[l, bs, c]
-        query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)  # query_embed.shape=[t, bs, c]
+        # batch-first: [bs, l, c]
+        bs, l, c = src.shape
+        query_embed = query_embed.unsqueeze(0).repeat(bs, 1, 1)  # [bs, t, c]
         tgt = torch.zeros_like(query_embed)
-        memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)  # memory.shape=[l, bs, c]
+        memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)  # [bs, l, c]
         hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
-                          pos=pos_embed, query_pos=query_embed)  # hs.shape=[t, bs, c]
+                          pos=pos_embed, query_pos=query_embed)
         return hs
 
 
@@ -116,7 +116,7 @@ class TransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         # Implementation of Feedforward model
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
@@ -134,13 +134,13 @@ class TransformerEncoderLayer(nn.Module):
         return tensor if pos is None else tensor + pos  # 位置编码
 
     def forward_post(self,
-                     src,
-                     src_mask: Optional[Tensor] = None,
-                     src_key_padding_mask: Optional[Tensor] = None,
-                     pos: Optional[Tensor] = None):
+                    src,
+                    src_mask: Optional[Tensor] = None,
+                    src_key_padding_mask: Optional[Tensor] = None,
+                    pos: Optional[Tensor] = None):
         q = k = self.with_pos_embed(src, pos)
         src2 = self.self_attn(q, k, value=src, attn_mask=src_mask,
-                              key_padding_mask=src_key_padding_mask)[0]  # self_attn返回值是一个元组，第一个元素是输出，第二个元素是attention矩阵
+                            key_padding_mask=src_key_padding_mask)[0]  # self_attn返回值是一个元组，第一个元素是输出，第二个元素是attention矩阵
         src = src + self.dropout1(src2)
         src = self.norm1(src)  # LayerNorm
         src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))  # Feedforward
@@ -179,8 +179,8 @@ class TransformerDecoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         # Implementation of Feedforward model
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
@@ -297,4 +297,3 @@ class Residual(nn.Module):
 
     def forward(self, input, value):
         return self.norm(input + value)
-

@@ -1,7 +1,21 @@
 from matplotlib import pyplot as plt
 import matplotlib.patches as patches
+from matplotlib.legend_handler import HandlerTuple
+from matplotlib.lines import Line2D
 import numpy as np
 import torch
+
+MODE_COLOR_PALETTE = [
+    "#E41A1C",
+    "#377EB8",
+    "#4DAF4A",
+    "#FF7F00",
+    "#984EA3",
+    "#A65628",
+    "#F781BF",
+    "#17BECF",
+    "#BCBD22",
+]
 
 
 def _to_numpy(data):
@@ -45,23 +59,55 @@ def _compute_vis_metrics(pred_traj, target_traj, valid_mask):
     if dist_valid.size == 0:
         return None
 
-    coord_sq = diff[valid] ** 2
     return {
         "ade": float(dist_valid.mean()),
         "fde": float(dist_valid[-1]),
-        "rmse": float(np.sqrt(coord_sq.mean())),
     }
 
 
-def _format_prob_list(prob_values):
-    prob_arr = _to_numpy(prob_values)
-    if prob_arr is None:
-        return "[]"
-    prob_arr = np.asarray(prob_arr).reshape(-1)
-    return "[" + ", ".join(f"{float(v):.2f}" for v in prob_arr) + "]"
+def _get_mode_color(mode_idx):
+    return MODE_COLOR_PALETTE[int(mode_idx) % len(MODE_COLOR_PALETTE)]
 
 
-def plot_traj_with_mask(hist_original, hist_masked, hist_pred, fig_num1=3, fig_num2=3, input_unit="ft"):
+def _resolve_vehicle_box_size(ax, y_size=3.0, x_to_y_ratio=5.0 / 2.0):
+    """按当前坐标轴缩放换算车辆框尺寸，保证视觉长宽比稳定。"""
+    x_min, x_max = ax.get_xlim()
+    y_min, y_max = ax.get_ylim()
+    x_span = abs(float(x_max) - float(x_min))
+    y_span = abs(float(y_max) - float(y_min))
+    bbox = ax.get_window_extent()
+    if x_span <= 0.0 or y_span <= 0.0 or bbox.width <= 0.0 or bbox.height <= 0.0:
+        return y_size * x_to_y_ratio, y_size
+
+    x_data_per_pixel = x_span / float(bbox.width)
+    y_data_per_pixel = y_span / float(bbox.height)
+    x_size = y_size * x_to_y_ratio * x_data_per_pixel / y_data_per_pixel
+    return x_size, y_size
+
+
+def _draw_vehicle_box(ax, center_x, center_y, y_size=3.0, x_to_y_ratio=5.0 / 2.0, color="#1F77B4", label=None, zorder=10):
+    width, height = _resolve_vehicle_box_size(ax, y_size=y_size, x_to_y_ratio=x_to_y_ratio)
+    rect = patches.Rectangle(
+        (center_x - width / 2.0, center_y - height / 2.0),
+        width,
+        height,
+        linewidth=1.4,
+        edgecolor=color,
+        facecolor=color,
+        alpha=0.28,
+        label=label,
+        zorder=zorder,
+    )
+    ax.add_patch(rect)
+
+
+def _build_vehicle_legend_handle(color):
+    line_handle = Line2D([0], [0], color=color, linewidth=2.0, linestyle='-')
+    rect_handle = patches.Rectangle((0, 0), 1, 1, edgecolor=color, facecolor=color, alpha=0.28, linewidth=1.4)
+    return (line_handle, rect_handle)
+
+
+def plot_hist_reconstruction(hist_original, hist_masked, hist_pred, fig_num1=3, fig_num2=3, input_unit="ft"):
     """绘制 hist 重建结果：原始轨迹、掩码位置、预测轨迹。"""
     num_samples = len(hist_original)
     fig_num1 = num_samples // fig_num2 + (num_samples % fig_num2 > 0)
@@ -92,15 +138,6 @@ def plot_traj_with_mask(hist_original, hist_masked, hist_pred, fig_num1=3, fig_n
         for y in [18, 6, -6, -18]:
             ax.axhline(y=y, color='gray', linestyle='--', linewidth=1, zorder=1)
 
-        x_lim = ax.get_xlim()
-        x_range = x_lim[1] - x_lim[0]
-        scale = x_range / 1400 if abs(x_range) > 1e-6 else 1.0
-        rect = patches.Rectangle(
-            (-40 * scale, -1.5), 10 * scale, 2 * scale,
-            linewidth=2, edgecolor='red', facecolor='red', zorder=5
-        )
-        ax.add_patch(rect)
-
         ax.set_xlabel(f'Lateral Position ({input_unit})')
         ax.set_ylabel(f'Longitudinal Position ({input_unit})')
         ax.set_title(f'Sample {i + 1}')
@@ -114,8 +151,8 @@ def plot_traj_with_mask(hist_original, hist_masked, hist_pred, fig_num1=3, fig_n
     plt.show()
 
 
-def maybe_visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_train_vis=False, enable_eval_vis=False,
-                                        batch_idx=0, input_unit="ft"):
+def visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_train_vis=False, enable_eval_vis=False,
+                                  batch_idx=0, input_unit="ft"):
     """按配置开关控制 hist 重建可视化。"""
     if stage == "train":
         if not enable_train_vis:
@@ -127,7 +164,7 @@ def maybe_visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_t
     hist_masked_vis = hist_masked[batch_idx:batch_idx + 1].detach().cpu().numpy()
     pred_vis = pred[batch_idx:batch_idx + 1, :, :2].detach().cpu().numpy()
 
-    plot_traj_with_mask(
+    plot_hist_reconstruction(
         hist_original=hist_vis,
         hist_masked=hist_masked_vis,
         hist_pred=pred_vis,
@@ -137,11 +174,12 @@ def maybe_visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_t
     )
 
 
-def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, future=None, pred=None,
-                                 pred_all=None, pred_best_idx=None, mode_probs=None,
-                                 future_mask=None, pred_instant=None, intent_probs=None,
-                                 batch_idx=0, metrics=None, input_unit="ft", top_k_modes=3):
-    """绘制 future 预测结果，支持单模态与多模态最佳轨迹高亮。"""
+def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, future=None, pred=None,
+                                pred_all=None, pred_best_idx=None, future_mask=None,
+                                batch_idx=0, metrics=None, input_unit="ft",
+                                title=None, highlight_label="Best",
+                                hist_masked=None, hist_reconstructed=None):
+    """绘制 fut model 最终预测结果。"""
 
     def safe_get_batch(data, b_idx, batch_ndim=3):
         arr = _to_numpy(data)
@@ -210,7 +248,7 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
             return None
         return max(0, min(num_modes - 1, idx_val))
 
-    def select_best_by_ade(pred_modes, gt_traj, fut_mask_arr):
+    def select_best_by_rmse(pred_modes, gt_traj, fut_mask_arr):
         if pred_modes is None or pred_modes.ndim != 3 or pred_modes.shape[0] == 0:
             return None
         if gt_traj is None or gt_traj.ndim != 2 or gt_traj.shape[-1] < 2:
@@ -226,7 +264,7 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
                 valid = np.ones(gt_traj.shape[0], dtype=bool)
 
         best_k = 0
-        best_ade = float("inf")
+        best_rmse = float("inf")
         for k in range(pred_modes.shape[0]):
             traj = pred_modes[k]
             if traj.ndim != 2 or traj.shape[-1] < 2:
@@ -238,9 +276,9 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
             if not np.any(vm):
                 continue
             diff = traj[:t_len, :2] - gt_traj[:t_len, :2]
-            ade = float(np.linalg.norm(diff, axis=-1)[vm].mean())
-            if ade < best_ade:
-                best_ade = ade
+            rmse = float(np.sqrt(np.sum(diff[vm] ** 2, axis=-1).mean()))
+            if rmse < best_rmse:
+                best_rmse = rmse
                 best_k = k
         return best_k
 
@@ -249,10 +287,9 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
     gt_fut = normalize_traj2d(safe_get_batch(future, idx, batch_ndim=3))
     pred_single = normalize_traj2d(safe_get_batch(pred, idx, batch_ndim=3))
     fut_mask_arr = safe_get_batch(future_mask, idx, batch_ndim=3)
+    hist_masked_arr = safe_get_batch(hist_masked, idx, batch_ndim=3)
+    hist_recon = normalize_traj2d(safe_get_batch(hist_reconstructed, idx, batch_ndim=3))
     pred_modes = safe_get_batch(pred_all, idx, batch_ndim=4)
-    pred_instant_vis = normalize_traj2d(safe_get_batch(pred_instant, idx, batch_ndim=3))
-    intent_lat = safe_get_batch(None if intent_probs is None else intent_probs.get("lat"), idx, batch_ndim=2)
-    intent_lon = safe_get_batch(None if intent_probs is None else intent_probs.get("lon"), idx, batch_ndim=2)
 
     # Extract per-sample mode probabilities
     probs_arr = None
@@ -270,7 +307,7 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
 
     best_k = resolve_best_idx(pred_best_idx, idx, 0 if pred_modes is None else pred_modes.shape[0])
     if best_k is None and pred_modes is not None:
-        best_k = select_best_by_ade(pred_modes, gt_fut, fut_mask_arr)
+        best_k = select_best_by_rmse(pred_modes, gt_fut, fut_mask_arr)
 
     pred_best = pred_single
     if pred_best is None and pred_modes is not None and pred_modes.shape[0] > 0:
@@ -278,7 +315,9 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
 
     nbrs_vis = reconstruct_nbrs_from_mask(hist_nbrs, temporal_mask, idx)
 
-    fig, ax = plt.subplots(figsize=(10, 10))
+    # 绘图窗口尺寸：默认16：9，展示16：4
+    fig, ax = plt.subplots(figsize=(16, 4))
+    # fig, ax = plt.subplots(figsize=(16, 9))
     lane_lines = (-18.0, -6.0, 6.0, 18.0)
 
     for lane_y in lane_lines:
@@ -291,8 +330,13 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
             zorder=0,
         )
 
+    nbr_color = '#B8860B'
+    ego_color = '#1F77B4'
+    has_nbrs = False
+    has_ego = False
+    nbr_vehicle_centers = []
+    ego_vehicle_center = None
     if nbrs_vis is not None:
-        first_nbr = True
         for n_idx in range(nbrs_vis.shape[0]):
             traj = np.asarray(nbrs_vis[n_idx])
             if traj.ndim != 2 or traj.shape[0] == 0 or traj.shape[-1] < 2:
@@ -303,94 +347,113 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
             traj_valid = traj[valid]
             ax.plot(
                 traj_valid[:, 1], traj_valid[:, 0],
-                color='#D8B365', alpha=0.55, linewidth=1.1, linestyle='-',
-                label='Neighbors' if first_nbr else None, zorder=1
+                color=nbr_color, alpha=0.7, linewidth=1.1, linestyle='-',
+                zorder=1
             )
-            first_nbr = False
+            last_x = float(traj_valid[-1, 1])
+            last_y = float(traj_valid[-1, 0])
+            nbr_vehicle_centers.append((last_x, last_y))
+            has_nbrs = True
 
     if gt_hist is not None:
-        ax.plot(gt_hist[:, 1], gt_hist[:, 0], 'b-o', label='Hist', markersize=4, linewidth=2, alpha=0.8)
-    if gt_fut is not None:
-        ax.plot(gt_fut[:, 1], gt_fut[:, 0], 'g-o', label='GT Future', markersize=4, linewidth=2, alpha=0.8)
-    if pred_modes is not None:
-        # Show top top_k_modes modes; mode 0 is highest probability (GMM sorted)
-        n_display = min(top_k_modes, pred_modes.shape[0])
-        # Palette: red for best, blues for others
-        other_colors = ['#5DADE2', '#A9CCE3', '#85C1E9', '#2E86C1']
-
-        for k in range(n_display):
-            traj = normalize_traj2d(pred_modes[k])
-            if traj is None:
-                continue
-            is_best = (k == 0)
-            color = '#FF0000' if is_best else other_colors[min(k - 1, len(other_colors) - 1)]
-            lw = 2.2 if is_best else 1.4
-            alpha = 0.95 if is_best else 0.70
-            marker = 'o' if is_best else '+'
-            ms = 4 if is_best else 5
-
-            # Build label with probability if available
-            prob_str = ""
-            if probs_arr is not None and k < len(probs_arr):
-                prob_str = f" p={probs_arr[k]:.2f}"
-            if is_best:
-                label = f"Pred Best{prob_str}"
-            elif k == 1:
-                label = f"Pred Mode 2{prob_str}"
-            else:
-                label = f"Pred Mode {k+1}{prob_str}"
-
-            ax.plot(
-                traj[:, 1], traj[:, 0],
-                linestyle='-', marker=marker, markersize=ms,
-                markeredgewidth=1.2, linewidth=lw, alpha=alpha,
-                color=color, label=label,
-                zorder=4 if is_best else 2 + k,
-            )
-
-            # Annotate probability at trajectory end-point
-            if probs_arr is not None and k < len(probs_arr):
-                ax.annotate(
-                    f"p={probs_arr[k]:.2f}",
-                    xy=(traj[-1, 1], traj[-1, 0]),
-                    xytext=(4, 2),
-                    textcoords="offset points",
-                    fontsize=8,
-                    color=color,
-                    fontweight='bold' if is_best else 'normal',
-                    zorder=6,
-                )
-    elif pred_best is not None:
-        ax.plot(pred_best[:, 1], pred_best[:, 0], 'r-o', label='Pred', markersize=4, linewidth=2, alpha=0.9)
-    if pred_instant_vis is not None:
         ax.plot(
-            pred_instant_vis[:, 1], pred_instant_vis[:, 0],
-            linestyle='--',
-            marker='s',
+            gt_hist[:, 1], gt_hist[:, 0],
+            color=ego_color,
+            linestyle='-',
+            marker='o',
             markersize=4,
             linewidth=2.0,
-            alpha=0.95,
-            color='#F39C12',
-            label='Pred Instant',
-            zorder=4,
+            alpha=0.85,
+            zorder=8,
         )
+        ego_x = float(gt_hist[-1, 1])
+        ego_y = float(gt_hist[-1, 0])
+        ego_vehicle_center = (ego_x, ego_y)
+        has_ego = True
 
-    if intent_lat is not None or intent_lon is not None:
-        ax.text(
-            0.02,
-            0.98,
-            f"lat={_format_prob_list(intent_lat)}\nlon={_format_prob_list(intent_lon)}",
-            transform=ax.transAxes,
-            ha='left',
-            va='top',
-            fontsize=10,
-            family='monospace',
-            bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='#555555'),
+    if hist_masked_arr is not None and gt_hist is not None:
+        hist_mask_arr = np.asarray(hist_masked_arr)
+        if hist_mask_arr.ndim == 2 and hist_mask_arr.shape[-1] >= 1:
+            obs_mask = hist_mask_arr[:, -1] > 0.5
+            masked_idx = ~obs_mask
+            if masked_idx.any():
+                masked_points = gt_hist[:masked_idx.shape[0]][masked_idx]
+                if masked_points.size > 0:
+                    ax.scatter(
+                        masked_points[:, 1],
+                        masked_points[:, 0],
+                        marker='x',
+                        s=64,
+                        linewidths=1.8,
+                        color='#D62728',
+                        label='Masked Hist Points',
+                        zorder=6,
+                    )
+
+    if hist_recon is not None:
+        ax.plot(
+            hist_recon[:, 1], hist_recon[:, 0],
+            color='#2CA02C',
+            linestyle='-',
+            marker='o',
+            markersize=4,
+            linewidth=2.2,
+            alpha=0.9,
+            label='Reconstructed Hist',
             zorder=5,
         )
 
+    if gt_fut is not None:
+        ax.plot(
+            gt_fut[:, 1], gt_fut[:, 0],
+            color='#00A65A',
+            linestyle='-',
+            marker='o',
+            markersize=4,
+            linewidth=2.2,
+            alpha=0.9,
+            label='GT Future',
+            zorder=9,
+        )
+    if pred_modes is not None:
+        has_other_anchor_label = False
+        for k in range(pred_modes.shape[0]):
+            traj = normalize_traj2d(pred_modes[k])
+            if traj is None:
+                continue
+            is_best = (best_k is not None and k == best_k)
+            # 轨迹颜色，默认anchor多颜色，展示用浅蓝色表示其他结果
+            mode_color = '#E41A1C' if is_best else '#9ECAE1'
+            label = 'best anchor' if is_best else (None if has_other_anchor_label else 'other anchor')
+            ax.plot(
+                traj[:, 1], traj[:, 0],
+                linestyle='-',
+                marker='o',
+                markersize=3.0 if is_best else 2.0,
+                markeredgewidth=0.8 if is_best else 0.6,
+                linewidth=2.6 if is_best else 1.6,
+                alpha=0.95 if is_best else 0.8,
+                color=mode_color,
+                label=label,
+                zorder=4 if is_best else 3
+            )
+            if not is_best:
+                has_other_anchor_label = True
+    elif pred_best is not None:
+        ax.plot(
+            pred_best[:, 1], pred_best[:, 0],
+            color='#E41A1C',
+            linestyle='-',
+            marker='o',
+            markersize=3.0,
+            linewidth=2.0,
+            alpha=0.9,
+            label='best anchor',
+            zorder=4,
+        )
+
     unit = input_unit or "ft"
-    title = "Trajectory Visualization"
+    title = "Trajectory Visualization" if title is None else str(title)
     if metrics:
         metric_parts = []
         for metric_name, metric_val in metrics.items():
@@ -401,56 +464,70 @@ def visualize_batch_trajectories(hist=None, hist_nbrs=None, temporal_mask=None, 
     ax.set_title(title)
     ax.set_xlabel(f"Lateral Position ({unit})")
     ax.set_ylabel(f"Longitudinal Position ({unit})")
-    ax.legend(loc='best')
-    ax.grid(True, alpha=0.3)
+    handles, labels = ax.get_legend_handles_labels()
+    legend_handles = []
+    legend_labels = []
+    if has_nbrs:
+        legend_handles.append(_build_vehicle_legend_handle(nbr_color))
+        legend_labels.append('nbrs')
+    if has_ego:
+        legend_handles.append(_build_vehicle_legend_handle(ego_color))
+        legend_labels.append('ego')
+    legend_handles.extend(handles)
+    legend_labels.extend(labels)
+    ax.legend(
+        legend_handles,
+        legend_labels,
+        loc='best',
+        handler_map={tuple: HandlerTuple(ndivide=None)},
+    )
+    ax.grid(False)
     ax.set_aspect('auto')
     ax.set_ylim(-18, 18)
     plt.tight_layout()
+    fig.canvas.draw()
+    for nbr_x, nbr_y in nbr_vehicle_centers:
+        _draw_vehicle_box(
+            ax,
+            center_x=nbr_x,
+            center_y=nbr_y,
+            y_size=3.0,
+            x_to_y_ratio=5.0 / 2.0,
+            color=nbr_color,
+            zorder=2,
+        )
+    if ego_vehicle_center is not None:
+        _draw_vehicle_box(
+            ax,
+            center_x=ego_vehicle_center[0],
+            center_y=ego_vehicle_center[1],
+            y_size=3.0,
+            x_to_y_ratio=5.0 / 2.0,
+            color=ego_color,
+            zorder=9,
+        )
     plt.show()
 
 
-def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pred, valid_mask, stage,
-                                      enable_train_vis=False, enable_eval_vis=False,
-                                      pred_all=None, pred_best_idx=None, mode_probs=None,
-                                      pred_instant=None, intent_probs=None,
-                                      meter_per_foot=0.3048, batch_idx=0):
-    """按配置开关控制 future 预测可视化。"""
-    if stage == "train":
-        if not enable_train_vis:
-            return
-    elif not enable_eval_vis:
-        return
-
-    diff = pred[batch_idx, :, :2] - future[batch_idx, :, :2]
-    dist = torch.norm(diff, dim=-1)
-    vis_mask = valid_mask[batch_idx]
-    vis_ade = (dist * vis_mask).sum() / (vis_mask.sum() + 1e-6)
-    valid_count = int(vis_mask.sum().item())
-    vis_fde = dist[valid_count - 1] if valid_count > 0 else dist.new_tensor(0.0)
-    metrics = {
-        "ADE(vis traj)": {"ft": vis_ade.item(), "m": vis_ade.item() * meter_per_foot},
-        "FDE(vis traj)": {"ft": vis_fde.item(), "m": vis_fde.item() * meter_per_foot},
-    }
-    instant_metrics = _compute_vis_metrics(
-        pred_traj=None if pred_instant is None else pred_instant[batch_idx],
+def visualize_scene_prediction(hist, hist_nbrs, temporal_mask, future, pred, valid_mask,
+                               pred_all=None, pred_best_idx=None,
+                               meter_per_foot=0.3048, batch_idx=0, title=None,
+                               highlight_label="Best", hist_masked=None,
+                               hist_reconstructed=None):
+    """统一场景可视化：hist、mask、重建、周车、future 与预测结果。"""
+    vis_metrics = _compute_vis_metrics(
+        pred_traj=pred[batch_idx],
         target_traj=future[batch_idx],
         valid_mask=valid_mask[batch_idx],
     )
-    if instant_metrics is not None:
-        metrics["ADE(inst traj)"] = {
-            "ft": instant_metrics["ade"],
-            "m": instant_metrics["ade"] * meter_per_foot,
-        }
-        metrics["FDE(inst traj)"] = {
-            "ft": instant_metrics["fde"],
-            "m": instant_metrics["fde"] * meter_per_foot,
-        }
-        metrics["RMSE(inst traj)"] = {
-            "ft": instant_metrics["rmse"],
-            "m": instant_metrics["rmse"] * meter_per_foot,
-        }
-
-    visualize_batch_trajectories(
+    metrics = {
+        "ADE": {"ft": 0.0, "m": 0.0},
+        "FDE": {"ft": 0.0, "m": 0.0},
+    }
+    if vis_metrics is not None:
+        metrics["ADE"] = {"ft": vis_metrics["ade"], "m": vis_metrics["ade"] * meter_per_foot}
+        metrics["FDE"] = {"ft": vis_metrics["fde"], "m": vis_metrics["fde"] * meter_per_foot}
+    _visualize_scene_prediction(
         hist=hist,
         hist_nbrs=hist_nbrs,
         temporal_mask=temporal_mask,
@@ -460,9 +537,11 @@ def maybe_visualize_future_prediction(hist, hist_nbrs, temporal_mask, future, pr
         pred_best_idx=pred_best_idx,
         mode_probs=mode_probs,
         future_mask=valid_mask,
-        pred_instant=pred_instant,
-        intent_probs=intent_probs,
         batch_idx=batch_idx,
         metrics=metrics,
         input_unit="ft",
+        title=title,
+        highlight_label=highlight_label,
+        hist_masked=hist_masked,
+        hist_reconstructed=hist_reconstructed,
     )

@@ -40,8 +40,7 @@ class HistEncoder(nn.Module):
 
         # Initialize encoder and decoder transformer layers.
         encoder_layer = TransformerEncoderLayer(args.encoder_input_dim, args.nheads,
-                                                dim_feedforward=args.dim_feedforward, dropout=0.1,
-                                                activation=args.activation)
+                                                dim_feedforward=args.dim_feedforward, dropout=0.1, activation=args.activation)
         self.encoder = TransformerEncoder(encoder_layer=encoder_layer, num_layers=args.enc_layers)
 
         # Intialize Temporal attention mechanism.
@@ -58,71 +57,107 @@ class HistEncoder(nn.Module):
         # Initialize activation and regularization functions.
         self.leaky_relu = nn.LeakyReLU(0.1)
 
-    def forward(self, src, nbrs, mask, temporal_mask):
-
-        B, T, D_in = src.shape
-        num_heads = int(self.args.attn_nhead)
-        head_dim = int(self.args.attn_out)
-
-        # [B, T, D] -> [T, B, D] [N_total, T, D] -> [T, N_total, D]
-        src_t = src.permute(1, 0, 2).contiguous()
-        nbrs_t = nbrs.permute(1, 0, 2).contiguous()
-
+    def forward(self, hist, nbrs, mask, temporal_mask):
+        src = hist
         # Temporal attention mechanism for temporal dependency.
         temporal_mask = temporal_mask.view(temporal_mask.size(0), temporal_mask.size(1) * temporal_mask.size(2), temporal_mask.size(3))
-        temporal_occ = temporal_mask.any(dim=-1)  # [B, N_grid]
-        temporal_mask = repeat(temporal_mask, 'b c n -> t b c n', t=T) # [T, B, N, D]
-        temporal_grid = torch.zeros_like(temporal_mask, dtype=nbrs_t.dtype, device=nbrs_t.device)
-        temporal_grid = temporal_grid.masked_scatter_(temporal_mask.bool(), nbrs_t)
+        temporal_mask = repeat(temporal_mask, 'b c n -> b t c n', t=self.args.hist_length)
+        temporal_grid = torch.zeros_like(temporal_mask).float()
+        temporal_grid = temporal_grid.masked_scatter_(temporal_mask.bool(), nbrs)
 
-        temporal_query = self.temporal_q(src_t) # [T, B, H * D_attn]
-        # [T * H, B, 1, D_attn] -> [B, T * H, 1, D_attn]
-        temporal_query = torch.cat(torch.split(torch.unsqueeze(temporal_query, dim=2), head_dim, dim=-1), dim=0).permute(1, 0, 2, 3)
-        temporal_key = self.temporal_k(temporal_grid) # [T, B, N, H * D_attn]
-        temporal_key = torch.cat(torch.split(temporal_key, head_dim, dim=-1), dim=0).permute(1, 0, 3, 2) #[B, T * H, D_attn, N_grid
+        temporal_query = self.temporal_q(src)  # (batch_size, seq_len, attn_nhead*attn_out)
+        temporal_query = torch.cat(torch.split(torch.unsqueeze(temporal_query, dim=2), int(self.args.attn_out), dim=-1), dim=1)  # (batch_size, seq_len*attn_nhead, 1, att_out)
+        temporal_key = self.temporal_k(temporal_grid)
+        temporal_key = torch.cat(torch.split(temporal_key, int(self.args.attn_out), dim=-1), dim=1).permute(0, 1, 3, 2)
         temporal_value = self.temporal_v(temporal_grid)
-        temporal_value = torch.cat(torch.split(temporal_value, head_dim, dim=-1), dim=0).permute(1, 0, 2, 3) # [B, T * H, N_grid, D_attn]
-        temporal_attn_mask = repeat(temporal_occ, 'b n -> b (t h) n', t=T, h=num_heads).unsqueeze(2)
-        temporal_attn_weights = torch.matmul(temporal_query, temporal_key) # [B, T*H, 1, N_grid]
-        temporal_attn_weights /= math.sqrt(head_dim)
-        temporal_attn_weights = temporal_attn_weights.masked_fill(~temporal_attn_mask, -1e9)
+        temporal_value = torch.cat(torch.split(temporal_value, int(self.args.attn_out), dim=-1), dim=1)
+        temporal_attn_weights = torch.matmul(temporal_query, temporal_key)
+        temporal_attn_weights /= torch.math.sqrt(self.args.attn_out)
         temporal_attn_weights = F.softmax(temporal_attn_weights, dim=-1)
-        temporal_attn_weights = temporal_attn_weights * temporal_attn_mask.float()
-        temporal_attn_weights = temporal_attn_weights / (temporal_attn_weights.sum(dim=-1, keepdim=True) + 1e-6)
-        temporal_value = torch.matmul(temporal_attn_weights, temporal_value) # [B, T*H, 1, D_attn]
-        temporal_value = torch.cat(torch.split(temporal_value, int(T), dim=1), dim=-1).squeeze(2) # [B, T, H * D_attn]
-        temporal_value = self.temporal_residual(self.input_embedding(src_t).permute(1, 0, 2), temporal_value) # [B, T, H * D_attn]
+        temporal_value = torch.matmul(temporal_attn_weights, temporal_value)
+        temporal_value = torch.cat(torch.split(temporal_value, int(self.args.hist_length), dim=1), dim=-1).squeeze(2)
+        temporal_value = self.temporal_residual(self.input_embedding(src), temporal_value)
 
-        hist_enc = self.encoder(self.leaky_relu(self.input_embedding(src_t)), pos=self.position_encoding(src_t)) #  [T, B, D_enc]
-        hist_enc = hist_enc.permute(1, 0, 2) # [B, T, D_enc]
+        hist_enc = self.encoder(self.leaky_relu(self.input_embedding(src)), pos=self.position_encoding(src))
 
         # Social attention mechanism for interaction capture.
-        nbrs_enc = self.encoder(self.leaky_relu(self.input_embedding(nbrs_t)), pos=self.position_encoding(nbrs_t)) # [T, N_total, D_enc]
+        nbrs_enc = self.encoder(self.leaky_relu(self.input_embedding(nbrs)), pos=self.position_encoding(nbrs))
         mask = mask.view(mask.size(0), mask.size(1) * mask.size(2), mask.size(3))
-        social_occ = mask.any(dim=-1)  # [B, N_grid]
-        mask = repeat(mask, 'b c n -> t b c n', t=T) # [T, B, N_grid, N]
+        mask = repeat(mask, 'b c n -> b t c n', t=self.args.hist_length)
 
-        soc_enc = torch.zeros_like(mask, dtype=nbrs_enc.dtype, device=nbrs_enc.device)
-        soc_enc = soc_enc.masked_scatter_(mask.bool(), nbrs_enc) # [T, B, N_grid, D_enc]
+        soc_enc = torch.zeros_like(mask).float()
+        soc_enc = soc_enc.masked_scatter_(mask.bool(), nbrs_enc)
 
-        query = self.qf(hist_enc) # [B, T, H*d] [1024, 16, 64]
+        query = self.qf(hist_enc)
         _, _, embed_size = query.shape
-        head_dim_social = int(embed_size // num_heads)
-        query = torch.cat(torch.split(torch.unsqueeze(query, dim=2), head_dim_social, dim=-1), dim=1)  # [B, T*H, 1, D_attn]
-        key = torch.cat(torch.split(self.kf(soc_enc), head_dim_social, dim=-1), dim=0).permute(1, 0, 3, 2)  # [B, T*H, D_attn, N_grid]
-        value = torch.cat(torch.split(self.vf(soc_enc), head_dim_social, dim=-1), dim=0).permute(1, 0, 2, 3) # [B, T*H, N_grid, D_attn]
-        social_attn_mask = repeat(social_occ, 'b n -> b (t h) n', t=T, h=num_heads).unsqueeze(2)
-        attn_weights = torch.matmul(query, key) # [B, T*H, 1, N_grid]
-        attn_weights /= math.sqrt(head_dim_social)
-        attn_weights = attn_weights.masked_fill(~social_attn_mask, -1e9)
+        query = torch.cat(torch.split(torch.unsqueeze(query, dim=2), int(embed_size / self.args.attn_nhead), dim=-1), dim=1)  # (batch_size, seq_len*attn_nhead, 1, att_out)
+        key = torch.cat(torch.split(self.kf(soc_enc), int(embed_size / self.args.attn_nhead), dim=-1), dim=1).permute(0, 1, 3, 2)  # (batch_size, seq_len*attn_nhead, att_out, 1)
+        value = torch.cat(torch.split(self.vf(soc_enc), int(embed_size / self.args.attn_nhead), dim=-1), dim=1)
+        attn_weights = torch.matmul(query, key)
+        attn_weights /= torch.math.sqrt(self.args.encoder_input_dim)
         attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = attn_weights * social_attn_mask.float()
-        attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-6)
-        value = torch.matmul(attn_weights, value) # [B, T*H, 1, D_attn]
-        value = torch.cat(torch.split(value, int(T), dim=1), dim=-1).squeeze(2) # [B, T, H * D_attn]
+        value = torch.matmul(attn_weights, value)
+        value = torch.cat(torch.split(value, int(hist.shape[1]), dim=1), dim=-1).squeeze(2)
 
-        temporal_spatial_agg = self.leaky_relu(temporal_value + value) # [B, T, D_enc]
-        enc = torch.cat((temporal_spatial_agg, hist_enc), dim=-1) # [B, T, D_enc]
+        temporal_spatial_agg = self.leaky_relu(temporal_value + value)
+        enc = torch.cat((temporal_spatial_agg, hist_enc), dim=-1)
+        return enc
 
-        return enc, hist_enc # [B, T, D_enc]
-
+    # def forward(self, src, nbrs, mask, temporal_mask):
+    #
+    #     src = src.contiguous()
+    #     nbrs = nbrs.contiguous()
+    #     B, T, _ = src.shape
+    #
+    #     # MaDiff HighwayNet temporal branch: batch-first [B, T, D].
+    #     temporal_mask = temporal_mask.view(B, -1, self.feature_dim).bool()
+    #     temporal_mask = repeat(temporal_mask, 'b c n -> b t c n', t=T)
+    #     temporal_grid = torch.zeros_like(temporal_mask, dtype=nbrs.dtype, device=nbrs.device)
+    #     temporal_grid = temporal_grid.masked_scatter_(temporal_mask, nbrs)
+    #
+    #     temporal_query = self.temporal_q(src)
+    #     temporal_query = torch.cat(
+    #         torch.split(temporal_query.unsqueeze(2), self.attn_out, dim=-1),
+    #         dim=1,
+    #     )
+    #     temporal_key = self.temporal_k(temporal_grid)
+    #     temporal_key = torch.cat(torch.split(temporal_key, self.attn_out, dim=-1), dim=1).permute(0, 1, 3, 2)
+    #     temporal_value = self.temporal_v(temporal_grid)
+    #     temporal_value = torch.cat(torch.split(temporal_value, self.attn_out, dim=-1), dim=1)
+    #     temporal_attn_weights = torch.matmul(temporal_query, temporal_key)
+    #     temporal_attn_weights /= math.sqrt(self.attn_out)
+    #     temporal_attn_weights = F.softmax(temporal_attn_weights, dim=-1)
+    #     temporal_value = torch.matmul(temporal_attn_weights, temporal_value)
+    #     temporal_value = torch.cat(torch.split(temporal_value, T, dim=1), dim=-1).squeeze(2)
+    #     temporal_value = self.temporal_residual(self.input_embedding(src), temporal_value)
+    #
+    #     hist_enc = self.encoder(
+    #         self.leaky_relu(self.input_embedding(src)),
+    #         pos=self.position_encoding(src),
+    #     )
+    #
+    #     # MaDiff HighwayNet social branch: encode compressed neighbors, then scatter back to the grid.
+    #     nbrs_enc = self.encoder(
+    #         self.leaky_relu(self.input_embedding(nbrs)),
+    #         pos=self.position_encoding(nbrs),
+    #     )
+    #     mask = mask.view(B, -1, self.encoder_input_dim).bool()
+    #     mask = repeat(mask, 'b c n -> b t c n', t=T)
+    #     soc_enc = torch.zeros_like(mask, dtype=nbrs_enc.dtype, device=nbrs_enc.device)
+    #     soc_enc = soc_enc.masked_scatter_(mask, nbrs_enc)
+    #
+    #     query = self.qf(hist_enc)
+    #     embed_size = query.size(-1)
+    #     head_dim = int(embed_size // self.attn_nhead)
+    #     query = torch.cat(torch.split(query.unsqueeze(2), head_dim, dim=-1), dim=1)
+    #     key = torch.cat(torch.split(self.kf(soc_enc), head_dim, dim=-1), dim=1).permute(0, 1, 3, 2)
+    #     value = torch.cat(torch.split(self.vf(soc_enc), head_dim, dim=-1), dim=1)
+    #     attn_weights = torch.matmul(query, key)
+    #     attn_weights /= math.sqrt(self.encoder_input_dim)
+    #     attn_weights = F.softmax(attn_weights, dim=-1)
+    #     value = torch.matmul(attn_weights, value)
+    #     value = torch.cat(torch.split(value, T, dim=1), dim=-1).squeeze(2)
+    #
+    #     temporal_spatial_agg = self.leaky_relu(temporal_value + value)
+    #     enc = torch.cat((temporal_spatial_agg, hist_enc), dim=-1)
+    #     return enc

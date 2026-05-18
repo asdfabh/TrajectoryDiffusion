@@ -1,5 +1,4 @@
 import contextlib
-import math
 import os
 import sys
 from pathlib import Path
@@ -19,8 +18,7 @@ from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.run.train_fut import (
     FUT_CHECKPOINT_DIR,
     LOSS_STAT_KEYS,
-    build_zero_loss_stats,
-    compute_selection_score,
+    METER_PER_FOOT,
     init_csv_log,
     load_checkpoint,
     print_eval_summary,
@@ -28,6 +26,7 @@ from method_diffusion.run.train_fut import (
     write_csv_log,
     write_tensorboard_log,
 )
+from method_diffusion.utils.fut_utils import compute_batch_kinematic_metrics, compute_batch_metric, select_closest_prediction
 
 
 def setup_ddp():
@@ -60,13 +59,13 @@ def is_main_process(rank):
     return rank == 0
 
 
-def load_checkpoint_for_rank(args, model, optimizer, scheduler, device, rank):
+def load_checkpoint_for_rank(resume_arg, checkpoint_dir, model, optimizer, scheduler, device, rank):
     if is_main_process(rank):
-        return load_checkpoint(args, model, optimizer, scheduler, device)
+        return load_checkpoint(resume_arg, checkpoint_dir, model, optimizer, scheduler, device)
 
     with open(os.devnull, "w", encoding="utf-8") as devnull:
         with contextlib.redirect_stdout(devnull):
-            return load_checkpoint(args, model, optimizer, scheduler, device)
+            return load_checkpoint(resume_arg, checkpoint_dir, model, optimizer, scheduler, device)
 
 
 def build_distributed_loader(dataset, batch_size, num_workers, sampler, drop_last):
@@ -93,41 +92,19 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
     model.train()
     totals = {key: 0.0 for key in LOSS_STAT_KEYS}
     num_batches = 0
-    pbar = tqdm(
-        dataloader,
-        total=len(dataloader),
-        desc=f"Ep{epoch} Train",
-        ncols=120,
-        disable=not is_main_process(rank),
-    )
+    pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Train", dynamic_ncols=True, disable=not is_main_process(rank))
 
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
-            batch,
-            feature_dim,
-            device=device,
-        )
-        loss, loss_parts = model(
-            hist,
-            hist_nbrs,
-            mask,
-            temporal_mask,
-            fut,
-            op_mask,
-            device,
-            return_components=True,
-        )
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
+        loss, loss_logs = model(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
 
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        totals["loss"] += float(loss.item())
         for key in LOSS_STAT_KEYS:
-            if key == "loss":
-                continue
-            totals[key] += float(loss_parts[key].item())
+            totals[key] += float(loss_logs[key].item())
         num_batches += 1
 
         if is_main_process(rank):
@@ -146,118 +123,100 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
     stats = reduce_tensor(stats)
     denom = max(int(stats[len(LOSS_STAT_KEYS)].item()), 1)
 
-    return {
+    stats_dict = {
         key: float(stats[idx].item()) / denom
         for idx, key in enumerate(LOSS_STAT_KEYS)
     }
+    stats_dict["fut_k"] = int(getattr(model.module if hasattr(model, "module") else model, "fut_k", 0))
+    return stats_dict
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio, rank):
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-
+def evaluate(model, dataloader, device, epoch, feature_dim, rank):
     fut_model = model.module if hasattr(model, "module") else model
-    fut_model.eval()
+    model.eval()
 
-    totals = {key: 0.0 for key in LOSS_STAT_KEYS}
+    total_rmse = 0.0
     total_ade = 0.0
     total_fde = 0.0
+    total_theta_deg = 0.0
+    total_v_mps = 0.0
     num_batches = 0
 
     if len(dataloader) == 0:
-        fut_model.train()
-        return build_zero_loss_stats(), 0.0, 0.0
-
-    total_batches = len(dataloader)
-    if eval_ratio <= 0.0 or eval_ratio >= 1.0:
-        target_batches = total_batches
-    else:
-        target_batches = max(1, int(math.ceil(total_batches * float(eval_ratio))))
+        model.train()
+        return 0.0, 0.0, 0.0, 0.0, 0.0
 
     pbar = tqdm(
         dataloader,
-        total=target_batches,
+        total=len(dataloader),
         desc=f"Ep{epoch} Val",
-        ncols=120,
+        dynamic_ncols=True,
         disable=not is_main_process(rank),
     )
 
     for batch in pbar:
-        if num_batches >= target_batches:
-            break
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
+        if int(fut_model.fut_k) > 1:
+            all_preds = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=fut_model.fut_k)
+            pred_fut, _, _ = select_closest_prediction(all_preds, fut, op_mask)
+        else:
+            all_preds = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
+            pred_fut = all_preds.squeeze(1)
+        eval_rmse, eval_ade, eval_fde = compute_batch_metric(pred_fut, fut, op_mask)
+        eval_theta_deg, eval_v_mps = compute_batch_kinematic_metrics(pred_fut, fut, op_mask, meter_per_unit=METER_PER_FOOT)
+        eval_rmse = float(eval_rmse.item()) * METER_PER_FOOT
+        eval_ade = float(eval_ade.item()) * METER_PER_FOOT
+        eval_fde = float(eval_fde.item()) * METER_PER_FOOT
+        eval_theta_deg = float(eval_theta_deg.item())
+        eval_v_mps = float(eval_v_mps.item())
 
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
-            batch,
-            feature_dim,
-            device=device,
-        )
-        val_loss, val_parts = fut_model.forwardTrain(
-            hist,
-            hist_nbrs,
-            mask,
-            temporal_mask,
-            fut,
-            op_mask,
-            device,
-            return_components=True,
-        )
-        _, eval_ade, eval_fde = fut_model.forwardEval(
-            hist,
-            hist_nbrs,
-            mask,
-            temporal_mask,
-            fut,
-            op_mask,
-            device,
-        )
-
-        totals["loss"] += float(val_loss.item())
-        for key in LOSS_STAT_KEYS:
-            if key == "loss":
-                continue
-            totals[key] += float(val_parts[key].item())
-        total_ade += float(eval_ade.item())
-        total_fde += float(eval_fde.item())
+        total_rmse += eval_rmse
+        total_ade += eval_ade
+        total_fde += eval_fde
+        total_theta_deg += eval_theta_deg
+        total_v_mps += eval_v_mps
         num_batches += 1
 
         if is_main_process(rank):
             pbar.set_postfix(
                 {
-                    "val_loss": f"{(totals['loss'] / num_batches):.6f}",
-                    "avg_ade_ft": f"{(total_ade / num_batches):.4f}",
-                    "avg_fde_ft": f"{(total_fde / num_batches):.4f}",
+                    "avg_rmse_m": f"{(total_rmse / num_batches):.4f}",
+                    "avg_ade_m": f"{(total_ade / num_batches):.4f}",
+                    "avg_fde_m": f"{(total_fde / num_batches):.4f}",
+                    "avg_theta_deg": f"{(total_theta_deg / num_batches):.4f}",
+                    "avg_v_mps": f"{(total_v_mps / num_batches):.4f}",
                 }
             )
 
     stats = torch.tensor(
-        [totals[key] for key in LOSS_STAT_KEYS] + [total_ade, total_fde, float(num_batches)],
+        [total_rmse, total_ade, total_fde, total_theta_deg, total_v_mps, float(num_batches)],
         device=device,
         dtype=torch.float64,
     )
     stats = reduce_tensor(stats)
-    fut_model.train()
+    model.train()
 
-    offset = len(LOSS_STAT_KEYS)
-    denom = max(int(stats[offset + 2].item()), 1)
-    val_stats = {
-        key: float(stats[idx].item()) / denom
-        for idx, key in enumerate(LOSS_STAT_KEYS)
-    }
-    return val_stats, float(stats[offset].item()) / denom, float(stats[offset + 1].item()) / denom
+    denom = max(int(stats[5].item()), 1)
+    return (
+        float(stats[0].item()) / denom,
+        float(stats[1].item()) / denom,
+        float(stats[2].item()) / denom,
+        float(stats[3].item()) / denom,
+        float(stats[4].item()) / denom,
+    )
 
 
 def main():
     rank, local_rank, world_size, device = setup_ddp()
     args = get_args_parser().parse_args()
-    args.checkpoint_dir = str(FUT_CHECKPOINT_DIR)
+    checkpoint_dir = FUT_CHECKPOINT_DIR
 
     writer = None
     log_csv_path = None
     if is_main_process(rank):
-        Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-        tensorboard_log_dir = Path(args.checkpoint_dir) / "log"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        tensorboard_log_dir = checkpoint_dir / "log"
         tensorboard_log_dir.mkdir(parents=True, exist_ok=True)
         log_csv_path = tensorboard_log_dir / "train_log.csv"
         init_csv_log(log_csv_path)
@@ -321,7 +280,7 @@ def main():
     model = DiffusionFut(args).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
-    start_epoch, best_score = load_checkpoint_for_rank(args, model, optimizer, scheduler, device, rank)
+    start_epoch, best_rmse = load_checkpoint_for_rank(args.resume_fut, checkpoint_dir, model, optimizer, scheduler, device, rank)
 
     if dist.is_initialized():
         if device.type == "cuda":
@@ -329,25 +288,23 @@ def main():
         else:
             model = DDP(model, find_unused_parameters=False)
 
-    eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
-
     for epoch in range(start_epoch, args.num_epochs):
         train_sampler.set_epoch(epoch)
 
         train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim, rank)
-        val_stats, eval_ade, eval_fde = evaluate(model, val_loader, device, epoch + 1, args.feature_dim, eval_ratio, rank)
-        selection_score = compute_selection_score(eval_ade, eval_fde)
+        eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps = evaluate(model, val_loader, device, epoch + 1, args.feature_dim, rank)
+        selection_score = float(eval_rmse)
         current_lr = optimizer.param_groups[0]["lr"]
 
         if is_main_process(rank):
-            write_csv_log(log_csv_path, epoch + 1, train_stats, val_stats, eval_ade, eval_fde, selection_score, current_lr)
-            write_tensorboard_log(writer, epoch + 1, train_stats, val_stats, eval_ade, eval_fde, selection_score, current_lr)
-            print_eval_summary(epoch + 1, args.num_epochs, train_stats, val_stats, eval_ade, eval_fde, selection_score)
+            write_csv_log(log_csv_path, epoch + 1, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps, current_lr)
+            write_tensorboard_log(writer, epoch + 1, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps, current_lr)
+            print_eval_summary(epoch + 1, args.num_epochs, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps)
 
         scheduler.step()
-        is_best = selection_score < best_score
+        is_best = selection_score < best_rmse
         if is_best:
-            best_score = selection_score
+            best_rmse = selection_score
 
         if is_main_process(rank):
             model_state = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
@@ -357,16 +314,20 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "loss": train_stats["loss"],
-                "eval_ade": eval_ade,
-                "eval_fde": eval_fde,
+                "eval_rmse_m": eval_rmse,
+                "eval_ade_m": eval_ade,
+                "eval_fde_m": eval_fde,
+                "eval_theta_deg": eval_theta_deg,
+                "eval_v_mps": eval_v_mps,
                 "selection_score": selection_score,
-                "best_score": best_score,
+                "best_score": best_rmse,
+                "best_rmse_m": best_rmse,
             }
 
             if (epoch + 1) % args.save_interval == 0:
-                torch.save(state, Path(args.checkpoint_dir) / f"epoch_{epoch + 1}.pth")
+                torch.save(state, checkpoint_dir / f"epoch_{epoch + 1}.pth")
             if is_best:
-                torch.save(state, Path(args.checkpoint_dir) / "best.pth")
+                torch.save(state, checkpoint_dir / "best.pth")
 
         if dist.is_initialized():
             dist.barrier()

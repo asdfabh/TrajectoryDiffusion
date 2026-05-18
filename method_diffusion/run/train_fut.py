@@ -2,7 +2,6 @@ import sys
 import os
 import re
 import csv
-import math
 from pathlib import Path
 
 import torch
@@ -15,20 +14,12 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.models.fut_model import DiffusionFut
-from method_diffusion.utils.visualization import maybe_visualize_future_prediction
+from method_diffusion.utils.fut_utils import compute_batch_kinematic_metrics, compute_batch_metric, select_closest_prediction
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
-BEST_MODEL_ADE_WEIGHT = 1.0
-BEST_MODEL_FDE_WEIGHT = 0.5
-LOSS_STAT_KEYS = [
-    "loss",
-    "loss_vel",
-]
-
-
-def compute_selection_score(eval_ade, eval_fde):
-    return (BEST_MODEL_ADE_WEIGHT * float(eval_ade)) + (BEST_MODEL_FDE_WEIGHT * float(eval_fde))
+METER_PER_FOOT = 0.3048
+LOSS_STAT_KEYS = ["loss", "loss_total", "loss_xy", "loss_theta", "loss_v", "loss_kin", "kin_res_mean"]
 
 # 解析 resume 标识并返回对应的 checkpoint 路径。
 def resolve_resume_checkpoint(resume_arg, checkpoint_dir):
@@ -41,16 +32,16 @@ def resolve_resume_checkpoint(resume_arg, checkpoint_dir):
     print(f"[FutModel] Unsupported resume_fut='{resume_arg}', expected 'best' or 'epoch_i'.")
     return None
 
-# 按需恢复训练状态并返回起始 epoch 与最佳联合分数。
-def load_checkpoint(args, model, optimizer, scheduler, device):
+# 按需恢复训练状态并返回起始 epoch 与最佳 RMSE。
+def load_checkpoint(resume_arg, checkpoint_dir, model, optimizer, scheduler, device):
     start_epoch = 0
-    best_score = float("inf")
-    ckpt_path = resolve_resume_checkpoint(args.resume_fut, Path(args.checkpoint_dir))
+    best_rmse = float("inf")
+    ckpt_path = resolve_resume_checkpoint(resume_arg, Path(checkpoint_dir))
 
     if ckpt_path is not None:
         if not ckpt_path.exists():
             print(f"[FutModel] Checkpoint not found: {ckpt_path}")
-            return start_epoch, best_score
+            return start_epoch, best_rmse
 
         state = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(state["model_state_dict"], strict=False)
@@ -61,29 +52,27 @@ def load_checkpoint(args, model, optimizer, scheduler, device):
         except Exception:
             pass
         start_epoch = int(state.get("epoch", 0))
-        if "best_score" in state:
-            best_score = float(state["best_score"])
-        elif "eval_ade" in state and "eval_fde" in state:
-            best_score = compute_selection_score(state["eval_ade"], state["eval_fde"])
-        else:
-            best_score = float(state.get("best_ade", state.get("best_loss", best_score)))
+        best_rmse = float(state.get("best_rmse_m", state.get("best_score", best_rmse)))
         print(f"Resumed from {ckpt_path} @ epoch {start_epoch}")
 
-    return start_epoch, best_score
+    return start_epoch, best_rmse
 
 # 将单个 epoch 的训练和验证结果追加写入 CSV。
-def write_csv_log(csv_path, epoch, train_stats, val_stats, eval_ade, eval_fde, selection_score, lr):
+def write_csv_log(csv_path, epoch, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps, lr):
     row = {
         "epoch": epoch,
         "train_loss": train_stats["loss"],
-        "train_vel_loss": train_stats["loss_vel"],
-        "val_loss": val_stats["loss"],
-        "val_vel_loss": val_stats["loss_vel"],
-        "val_ade_ft": eval_ade,
-        "val_fde_ft": eval_fde,
-        "val_ade_m": eval_ade * 0.3048,
-        "val_fde_m": eval_fde * 0.3048,
-        "val_score_ft": selection_score,
+        "train_loss_total": train_stats["loss_total"],
+        "train_loss_xy": train_stats["loss_xy"],
+        "train_loss_theta": train_stats["loss_theta"],
+        "train_loss_v": train_stats["loss_v"],
+        "train_loss_kin": train_stats["loss_kin"],
+        "train_kin_res_mean": train_stats["kin_res_mean"],
+        "val_rmse_m": eval_rmse,
+        "val_ade_m": eval_ade,
+        "val_fde_m": eval_fde,
+        "val_theta_deg": eval_theta_deg,
+        "val_v_mps": eval_v_mps,
         "lr": lr,
     }
     with csv_path.open("a", newline="", encoding="utf-8") as f:
@@ -95,14 +84,17 @@ def init_csv_log(csv_path):
     fieldnames = [
         "epoch",
         "train_loss",
-        "train_vel_loss",
-        "val_loss",
-        "val_vel_loss",
-        "val_ade_ft",
-        "val_fde_ft",
+        "train_loss_total",
+        "train_loss_xy",
+        "train_loss_theta",
+        "train_loss_v",
+        "train_loss_kin",
+        "train_kin_res_mean",
+        "val_rmse_m",
         "val_ade_m",
         "val_fde_m",
-        "val_score_ft",
+        "val_theta_deg",
+        "val_v_mps",
         "lr",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
@@ -110,34 +102,39 @@ def init_csv_log(csv_path):
         writer.writeheader()
 
 
-# 返回统一格式的空损失统计。
-def build_zero_loss_stats():
-    return {key: 0.0 for key in LOSS_STAT_KEYS}
-
-
 # 将训练和验证指标统一写入 TensorBoard。
-def write_tensorboard_log(writer, epoch, train_stats, val_stats, eval_ade, eval_fde, selection_score, lr):
+def write_tensorboard_log(writer, epoch, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps, lr):
     writer.add_scalar("Loss/Train", train_stats["loss"], epoch)
-    writer.add_scalar("Loss/TrainVel", train_stats["loss_vel"], epoch)
-    writer.add_scalar("Loss/Val", val_stats["loss"], epoch)
-    writer.add_scalar("Loss/ValVel", val_stats["loss_vel"], epoch)
-    writer.add_scalar("Eval/ADE_ft", eval_ade, epoch)
-    writer.add_scalar("Eval/FDE_ft", eval_fde, epoch)
-    writer.add_scalar("Eval/SelectionScore_ft", selection_score, epoch)
+    writer.add_scalar("Loss/TrainTotal", train_stats["loss_total"], epoch)
+    writer.add_scalar("Loss/TrainXY", train_stats["loss_xy"], epoch)
+    writer.add_scalar("Loss/TrainTheta", train_stats["loss_theta"], epoch)
+    writer.add_scalar("Loss/TrainV", train_stats["loss_v"], epoch)
+    writer.add_scalar("Loss/TrainKinematic", train_stats["loss_kin"], epoch)
+    writer.add_scalar("Loss/KinematicResidualMean", train_stats["kin_res_mean"], epoch)
+    writer.add_scalar("Eval/RMSE_m", eval_rmse, epoch)
+    writer.add_scalar("Eval/ADE_m", eval_ade, epoch)
+    writer.add_scalar("Eval/FDE_m", eval_fde, epoch)
+    writer.add_scalar("Eval/Theta_deg", eval_theta_deg, epoch)
+    writer.add_scalar("Eval/V_mps", eval_v_mps, epoch)
     writer.add_scalar("LR", lr, epoch)
 
 
 # 打印每个 epoch 的训练与验证摘要。
-def print_eval_summary(epoch, total_epochs, train_stats, val_stats, eval_ade, eval_fde, selection_score):
+def print_eval_summary(epoch, total_epochs, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps):
     print(
         f"Epoch {epoch}/{total_epochs} | "
         f"train={train_stats['loss']:.6f} | "
-        f"train_vel={train_stats['loss_vel']:.6f} | "
-        f"val={val_stats['loss']:.6f} | "
-        f"val_vel={val_stats['loss_vel']:.6f} | "
-        f"ade={eval_ade:.4f}ft | "
-        f"fde={eval_fde:.4f}ft | "
-        f"score={selection_score:.4f}"
+        f"total={train_stats['loss_total']:.6f} | "
+        f"xy={train_stats['loss_xy']:.6f} | "
+        f"theta={train_stats['loss_theta']:.6f} | "
+        f"v={train_stats['loss_v']:.6f} | "
+        f"kin={train_stats['loss_kin']:.6f} | "
+        f"kin_res={train_stats['kin_res_mean']:.6f} | "
+        f"rmse_m={eval_rmse:.4f} | "
+        f"ade_m={eval_ade:.4f} | "
+        f"fde_m={eval_fde:.4f} | "
+        f"theta_deg={eval_theta_deg:.4f} | "
+        f"v_mps={eval_v_mps:.4f}"
     )
 
 # 整理 batch 数据并按特征维度拼接模型输入。
@@ -179,39 +176,18 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
     model.train()
     totals = {key: 0.0 for key in LOSS_STAT_KEYS}
     num_batches = 0
-    pbar = tqdm(
-        dataloader,
-        total=len(dataloader),
-        desc=f"Ep{epoch} Train",
-        dynamic_ncols=True
-    )
+    pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Train", dynamic_ncols=True)
 
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
-            batch,
-            feature_dim,
-            device=device,
-        )
-        loss, loss_parts = model.forwardTrain(
-            hist,
-            hist_nbrs,
-            mask,
-            temporal_mask,
-            fut,
-            op_mask,
-            device,
-            return_components=True,
-        )
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
+        loss, loss_logs = model.forwardTrain(hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        totals["loss"] += float(loss.item())
         for key in LOSS_STAT_KEYS:
-            if key == "loss":
-                continue
-            totals[key] += float(loss_parts[key].item())
+            totals[key] += float(loss_logs[key].item())
         num_batches += 1
         pbar.set_postfix({
             "loss": f"{loss.item():.6f}",
@@ -222,87 +198,71 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
     return {key: totals[key] / denom for key in LOSS_STAT_KEYS}
 
 @torch.no_grad()
-# 按验证集比例评估模型并返回平均指标。
-def evaluate(model, dataloader, device, epoch, feature_dim, eval_ratio):
-    # 固定验证环节的随机数种子，消除采样方差导致的指标波动
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-
+# 使用完整验证集评估模型并返回平均指标。
+def evaluate(model, dataloader, device, epoch, feature_dim):
     model.eval()
-    totals = {key: 0.0 for key in LOSS_STAT_KEYS}
+    total_rmse = 0.0
     total_ade = 0.0
     total_fde = 0.0
+    total_theta_deg = 0.0
+    total_v_mps = 0.0
     num_batches = 0
 
     if len(dataloader) == 0:
         model.train()
-        return build_zero_loss_stats(), 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0
 
-    total_batches = len(dataloader)
-    if eval_ratio <= 0.0 or eval_ratio >= 1.0:
-        target_batches = total_batches
-    else:
-        target_batches = max(1, int(math.ceil(total_batches * float(eval_ratio))))
-
-    pbar = tqdm(dataloader, total=target_batches, desc=f"Ep{epoch} Val", dynamic_ncols=True)
+    pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Val", dynamic_ncols=True)
     for batch in pbar:
-        if num_batches >= target_batches:
-            break
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
-            batch,
-            feature_dim,
-            device=device,
-        )
-        val_loss, val_parts = model.forwardTrain(
-            hist,
-            hist_nbrs,
-            mask,
-            temporal_mask,
-            fut,
-            op_mask,
-            device,
-            return_components=True,
-        )
-        _, eval_ade, eval_fde = model.forwardEval(
-            hist,
-            hist_nbrs,
-            mask,
-            temporal_mask,
-            fut,
-            op_mask,
-            device,
-        )
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
+        if int(model.fut_k) > 1:
+            all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=model.fut_k)
+            pred_fut, _, _ = select_closest_prediction(all_preds, fut, op_mask)
+        else:
+            all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
+            pred_fut = all_preds.squeeze(1)
+        eval_rmse, eval_ade, eval_fde = compute_batch_metric(pred_fut, fut, op_mask)
+        eval_theta_deg, eval_v_mps = compute_batch_kinematic_metrics(pred_fut, fut, op_mask, meter_per_unit=METER_PER_FOOT)
+        eval_rmse = float(eval_rmse.item()) * METER_PER_FOOT
+        eval_ade = float(eval_ade.item()) * METER_PER_FOOT
+        eval_fde = float(eval_fde.item()) * METER_PER_FOOT
+        eval_theta_deg = float(eval_theta_deg.item())
+        eval_v_mps = float(eval_v_mps.item())
 
-        totals["loss"] += float(val_loss.item())
-        for key in LOSS_STAT_KEYS:
-            if key == "loss":
-                continue
-            totals[key] += float(val_parts[key].item())
-        total_ade += float(eval_ade.item())
-        total_fde += float(eval_fde.item())
+        total_rmse += eval_rmse
+        total_ade += eval_ade
+        total_fde += eval_fde
+        total_theta_deg += eval_theta_deg
+        total_v_mps += eval_v_mps
         num_batches += 1
         pbar.set_postfix({
-            "val_loss": f"{(totals['loss'] / num_batches):.6f}",
-            "avg_ade_ft": f"{(total_ade / num_batches):.4f}",
-            "avg_fde_ft": f"{(total_fde / num_batches):.4f}",
+            "avg_rmse_m": f"{(total_rmse / num_batches):.4f}",
+            "avg_ade_m": f"{(total_ade / num_batches):.4f}",
+            "avg_fde_m": f"{(total_fde / num_batches):.4f}",
+            "avg_theta_deg": f"{(total_theta_deg / num_batches):.4f}",
+            "avg_v_mps": f"{(total_v_mps / num_batches):.4f}",
         })
 
     model.train()
     if num_batches == 0:
-        return build_zero_loss_stats(), 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0
 
     denom = float(num_batches)
-    val_stats = {key: totals[key] / denom for key in LOSS_STAT_KEYS}
-    return val_stats, total_ade / denom, total_fde / denom
+    return (
+        total_rmse / denom,
+        total_ade / denom,
+        total_fde / denom,
+        total_theta_deg / denom,
+        total_v_mps / denom,
+    )
 
 
 # 初始化训练组件并执行 fut 训练主流程。
 def main():
     args = get_args_parser().parse_args()
-    args.checkpoint_dir = str(FUT_CHECKPOINT_DIR)
-    Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-    tensorboard_log_dir = Path(args.checkpoint_dir) / "log"
+    checkpoint_dir = FUT_CHECKPOINT_DIR
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    tensorboard_log_dir = checkpoint_dir / "log"
     tensorboard_log_dir.mkdir(parents=True, exist_ok=True)
     log_csv_path = tensorboard_log_dir / "train_log.csv"
     init_csv_log(log_csv_path)
@@ -345,22 +305,21 @@ def main():
     model = DiffusionFut(args).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
-    start_epoch, best_score = load_checkpoint(args, model, optimizer, scheduler, device)
-    eval_ratio = max(0.0, min(1.0, float(args.eval_ratio)))
+    start_epoch, best_rmse = load_checkpoint(args.resume_fut, checkpoint_dir, model, optimizer, scheduler, device)
 
     for epoch in range(start_epoch, args.num_epochs):
         train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim)
-        val_stats, eval_ade, eval_fde = evaluate(model, val_loader, device, epoch + 1, args.feature_dim, eval_ratio)
-        selection_score = compute_selection_score(eval_ade, eval_fde)
+        eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps = evaluate(model, val_loader, device, epoch + 1, args.feature_dim)
+        selection_score = float(eval_rmse)
         current_lr = optimizer.param_groups[0]["lr"]
-        write_csv_log(log_csv_path, epoch + 1, train_stats, val_stats, eval_ade, eval_fde, selection_score, current_lr)
-        write_tensorboard_log(writer, epoch + 1, train_stats, val_stats, eval_ade, eval_fde, selection_score, current_lr)
-        print_eval_summary(epoch + 1, args.num_epochs, train_stats, val_stats, eval_ade, eval_fde, selection_score)
+        write_csv_log(log_csv_path, epoch + 1, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps, current_lr)
+        write_tensorboard_log(writer, epoch + 1, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps, current_lr)
+        print_eval_summary(epoch + 1, args.num_epochs, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps)
 
         scheduler.step()
-        is_best = selection_score < best_score
+        is_best = selection_score < best_rmse
         if is_best:
-            best_score = selection_score
+            best_rmse = selection_score
 
         state = {
             "epoch": epoch + 1,
@@ -368,16 +327,20 @@ def main():
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "loss": train_stats["loss"],
-            "eval_ade": eval_ade,
-            "eval_fde": eval_fde,
+            "eval_rmse_m": eval_rmse,
+            "eval_ade_m": eval_ade,
+            "eval_fde_m": eval_fde,
+            "eval_theta_deg": eval_theta_deg,
+            "eval_v_mps": eval_v_mps,
             "selection_score": selection_score,
-            "best_score": best_score,
+            "best_score": best_rmse,
+            "best_rmse_m": best_rmse,
         }
 
         if (epoch + 1) % args.save_interval == 0:
-            torch.save(state, Path(args.checkpoint_dir) / f"epoch_{epoch + 1}.pth")
+            torch.save(state, checkpoint_dir / f"epoch_{epoch + 1}.pth")
         if is_best:
-            torch.save(state, Path(args.checkpoint_dir) / "best.pth")
+            torch.save(state, checkpoint_dir / "best.pth")
 
     writer.close()
 

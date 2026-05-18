@@ -102,7 +102,11 @@ def load_checkpoint(model, resume_arg, checkpoint_dir, device, model_name="Model
 
     new_state_dict = {}
     for k, v in state_dict.items():
-        if k in ["pos_mean", "pos_std", "va_mean", "va_std"]:
+        if k in [
+            "pos_mean", "pos_std", "va_mean", "va_std",
+            "lane_center", "lane_scale", "class_center", "class_scale",
+            "lane_min", "lane_max", "class_min", "class_max",
+        ]:
             continue
         new_state_dict[k.replace("module.", "")] = v
 
@@ -124,6 +128,14 @@ class HistReconstructionMetrics:
         self.va_abs_sum = {key: torch.zeros(2, dtype=torch.float64) for key in self.regions}
         self.va_coord_se = {key: torch.zeros(2, dtype=torch.float64) for key in self.regions}
         self.va_point_count = {key: 0.0 for key in self.regions}
+
+        self.lane_correct = {key: 0.0 for key in self.regions}
+        self.lane_se_sum = {key: 0.0 for key in self.regions}
+        self.lane_point_count = {key: 0.0 for key in self.regions}
+
+        self.class_correct = {key: 0.0 for key in self.regions}
+        self.class_se_sum = {key: 0.0 for key in self.regions}
+        self.class_point_count = {key: 0.0 for key in self.regions}
 
     def update(self, pred, target, mask):
         pred = pred.detach()
@@ -153,6 +165,28 @@ class HistReconstructionMetrics:
                 self.va_coord_se[region] += torch.sum((va_diff ** 2) * coord_mask, dim=(0, 1)).double().cpu()
                 self.va_point_count[region] += float(region_float.sum().item())
 
+        if pred.shape[-1] >= 5 and target.shape[-1] >= 5:
+            pred_lane = torch.round(pred[..., 4]).long()
+            target_lane = torch.round(target[..., 4]).long()
+            lane_diff = pred[..., 4] - target[..., 4]
+            lane_equal = (pred_lane == target_lane)
+            for region, region_mask in region_masks.items():
+                region_float = region_mask.float()
+                self.lane_correct[region] += float((lane_equal.float() * region_float).sum().item())
+                self.lane_se_sum[region] += float(((lane_diff ** 2) * region_float).sum().item())
+                self.lane_point_count[region] += float(region_float.sum().item())
+
+        if pred.shape[-1] >= 6 and target.shape[-1] >= 6:
+            pred_class = torch.round(pred[..., 5]).long()
+            target_class = torch.round(target[..., 5]).long()
+            class_diff = pred[..., 5] - target[..., 5]
+            class_equal = (pred_class == target_class)
+            for region, region_mask in region_masks.items():
+                region_float = region_mask.float()
+                self.class_correct[region] += float((class_equal.float() * region_float).sum().item())
+                self.class_se_sum[region] += float(((class_diff ** 2) * region_float).sum().item())
+                self.class_point_count[region] += float(region_float.sum().item())
+
     @staticmethod
     def safe_div(numerator, denominator):
         return numerator / denominator if denominator > 0 else 0.0
@@ -179,16 +213,36 @@ class HistReconstructionMetrics:
                 va_l1[region] = [0.0, 0.0]
                 va_rmse[region] = [0.0, 0.0]
 
+        lane_acc = {}
+        lane_mse = {}
+        for region in self.regions:
+            lane_acc[region] = self.safe_div(self.lane_correct[region], self.lane_point_count[region])
+            lane_mse[region] = self.safe_div(self.lane_se_sum[region], self.lane_point_count[region])
+
+        class_acc = {}
+        class_mse = {}
+        for region in self.regions:
+            class_acc[region] = self.safe_div(self.class_correct[region], self.class_point_count[region])
+            class_mse[region] = self.safe_div(self.class_se_sum[region], self.class_point_count[region])
+
         xy_ade_m["known"] = xy_ade_m["unmasked"]
         xy_rmse_m["known"] = xy_rmse_m["unmasked"]
         va_l1["known"] = va_l1["unmasked"]
         va_rmse["known"] = va_rmse["unmasked"]
+        lane_acc["known"] = lane_acc["unmasked"]
+        lane_mse["known"] = lane_mse["unmasked"]
+        class_acc["known"] = class_acc["unmasked"]
+        class_mse["known"] = class_mse["unmasked"]
 
         return {
             "xy_ade_m": xy_ade_m,
             "xy_rmse_m": xy_rmse_m,
             "va_l1": va_l1,
             "va_rmse": va_rmse,
+            "lane_acc": lane_acc,
+            "lane_mse": lane_mse,
+            "class_acc": class_acc,
+            "class_mse": class_mse,
         }
 
 
@@ -213,6 +267,18 @@ def print_metrics(summary, title, mask_ratio, random_mask_ratio, block_mask_star
     print(f"{'All':<12} | {summary['va_l1']['all'][0]:<14.6f} | {summary['va_rmse']['all'][0]:<16.6f} | {summary['va_l1']['all'][1]:<16.6f} | {summary['va_rmse']['all'][1]:<16.6f}")
     print(f"{'Unmasked':<12} | {summary['va_l1']['unmasked'][0]:<14.6f} | {summary['va_rmse']['unmasked'][0]:<16.6f} | {summary['va_l1']['unmasked'][1]:<16.6f} | {summary['va_rmse']['unmasked'][1]:<16.6f}")
     print(f"{'Masked':<12} | {summary['va_l1']['masked'][0]:<14.6f} | {summary['va_rmse']['masked'][0]:<16.6f} | {summary['va_l1']['masked'][1]:<16.6f} | {summary['va_rmse']['masked'][1]:<16.6f}")
+    print('-' * 96)
+    print(f"{'Lane Region':<12} | {'Accuracy':<12} | {'MSE':<12}")
+    print('-' * 96)
+    print(f"{'All':<12} | {summary['lane_acc']['all']:<12.6f} | {summary['lane_mse']['all']:<12.6f}")
+    print(f"{'Unmasked':<12} | {summary['lane_acc']['unmasked']:<12.6f} | {summary['lane_mse']['unmasked']:<12.6f}")
+    print(f"{'Masked':<12} | {summary['lane_acc']['masked']:<12.6f} | {summary['lane_mse']['masked']:<12.6f}")
+    print('-' * 96)
+    print(f"{'Class Region':<12} | {'Accuracy':<12} | {'MSE':<12}")
+    print('-' * 96)
+    print(f"{'All':<12} | {summary['class_acc']['all']:<12.6f} | {summary['class_mse']['all']:<12.6f}")
+    print(f"{'Unmasked':<12} | {summary['class_acc']['unmasked']:<12.6f} | {summary['class_mse']['unmasked']:<12.6f}")
+    print(f"{'Masked':<12} | {summary['class_acc']['masked']:<12.6f} | {summary['class_mse']['masked']:<12.6f}")
     print('=' * 96)
 
 
@@ -275,6 +341,8 @@ def main():
                 "xy_mask_rmse": f"{summary['xy_rmse_m']['masked']:.4f}",
                 "v_mask_l1": f"{summary['va_l1']['masked'][0]:.4f}",
                 "a_mask_l1": f"{summary['va_l1']['masked'][1]:.4f}",
+                "lane_mask_acc": f"{summary['lane_acc']['masked']:.4f}",
+                "class_mask_acc": f"{summary['class_acc']['masked']:.4f}",
             })
 
             if batch_idx % 100 == 0:

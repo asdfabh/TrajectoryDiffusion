@@ -34,145 +34,167 @@ def build_hist_mask(hist, mask_ratio=0.4, random_mask_ratio=0.7, block_mask_star
     )
 
 
-def prepare_fut_batch(
-    batch,
-    feature_dim,
-    device="cuda",
-    include_hist_mask=False,
-    mask_ratio=0.4,
-    random_mask_ratio=0.7,
-    block_mask_start=False,
-):
-    """整理 future 分支所需的 batch 字段。"""
-    if int(feature_dim) != 4:
-        raise ValueError("future 分支当前仅支持 feature_dim=4: [rel_x, rel_y, v, a]。")
+def wrap_angle(angle):
+    """将角度差包裹到 [-pi, pi]。"""
+    return torch.atan2(torch.sin(angle), torch.cos(angle))
 
-    hist = torch.cat((batch["hist"], batch["va"]), dim=-1).to(device)
-    hist_nbrs = torch.cat((batch["nbrs"], batch["nbrs_va"]), dim=-1).to(device)
+def normalize_traj_valid_mask(valid_mask, pred):
+    """将不同形状的 future 有效位掩码统一成 `[B, T]` 浮点张量。"""
+    if valid_mask is None:
+        return torch.ones(pred.shape[0], pred.shape[1], device=pred.device, dtype=pred.dtype)
+    if valid_mask.dim() == 3:
+        valid_mask = valid_mask[..., 0]
+    return (valid_mask > 0.5).to(pred.device).float()
 
-    prepared = {
-        "hist": hist,
-        "hist_nbrs": hist_nbrs,
-        "fut": batch["fut"].to(device),
-        "op_mask": batch["op_mask"].to(device),
-        "mask": batch["mask"].to(device),
-        "temporal_mask": batch["temporal_mask"].to(device),
-        "extras": {
-            "ego_lane": batch["lane"].to(device),
-            "nbr_lane": batch["nbrs_lane"].to(device),
-        },
-    }
 
-    if include_hist_mask:
-        hist_mask = build_hist_mask(
-            hist,
-            mask_ratio=mask_ratio,
-            random_mask_ratio=random_mask_ratio,
-            block_mask_start=block_mask_start,
-        ).to(device)
-        hist_masked = torch.cat((hist_mask * hist, hist_mask), dim=-1).to(device)
-        prepared["hist_mask"] = hist_mask
-        prepared["hist_masked"] = hist_masked
+def compute_batch_metric(pred, target, valid_mask=None):
+    """计算单个 batch 的 RMSE / ADE / FDE。"""
+    pred_xy = pred[..., :2]
+    target_xy = target[..., :2]
+    valid_mask = normalize_traj_valid_mask(valid_mask, pred_xy)
 
-    return prepared
+    diff = pred_xy - target_xy
+    dist_sq = torch.sum(diff ** 2, dim=-1)
+    dist = torch.norm(diff, dim=-1)
+    rmse = torch.sqrt((dist_sq * valid_mask).sum() / (valid_mask.sum() + 1e-6))
+    ade = (dist * valid_mask).sum() / (valid_mask.sum() + 1e-6)
+
+    valid_counts = valid_mask.sum(dim=1).long()
+    has_valid = valid_counts > 0
+    last_idx = torch.clamp(valid_counts - 1, min=0)
+    final_dist = dist.gather(1, last_idx.unsqueeze(1)).squeeze(1)
+    fde = (final_dist * has_valid.float()).sum() / (has_valid.float().sum() + 1e-6)
+    return rmse, ade, fde
+
+
+def compute_batch_kinematic_metrics(pred, target, valid_mask=None, meter_per_unit=0.3048):
+    """计算单个 batch 的 theta MAE(度) 与 v MAE(m/s)。"""
+    valid_mask = normalize_traj_valid_mask(valid_mask, pred)
+
+    theta_mae_deg = pred.new_tensor(0.0)
+    v_mae_mps = pred.new_tensor(0.0)
+
+    if pred.size(-1) >= 3 and target.size(-1) >= 3:
+        theta_diff = wrap_angle(pred[..., 2] - target[..., 2]).abs()
+        theta_mae_deg = theta_diff.mul(180.0 / torch.pi)
+        theta_mae_deg = (theta_mae_deg * valid_mask).sum() / (valid_mask.sum() + 1e-6)
+
+    if pred.size(-1) >= 4 and target.size(-1) >= 4:
+        v_diff = (pred[..., 3] - target[..., 3]).abs()
+        v_mae_mps = (v_diff * valid_mask).sum() / (valid_mask.sum() + 1e-6)
+        v_mae_mps = v_mae_mps * float(meter_per_unit)
+
+    return theta_mae_deg, v_mae_mps
+
+
+def select_closest_prediction(all_preds, target, valid_mask=None):
+    """从多模态预测中选择整段 future RMSE 最小的轨迹。"""
+    target_xy = target[..., :2].unsqueeze(1)
+    valid_mask = normalize_traj_valid_mask(valid_mask, all_preds[:, 0]).unsqueeze(1)
+
+    diff = all_preds[..., :2] - target_xy
+    dist_sq = torch.sum(diff ** 2, dim=-1)
+    mse_k = (dist_sq * valid_mask).sum(dim=2) / (valid_mask.sum(dim=2) + 1e-6)
+    best_idx = torch.argmin(mse_k, dim=1)
+
+    bsz, _, t_len, feat_dim = all_preds.shape
+    gather_idx = best_idx.view(bsz, 1, 1, 1).expand(bsz, 1, t_len, feat_dim)
+    best_pred = all_preds.gather(1, gather_idx).squeeze(1)
+    return best_pred, best_idx, torch.sqrt(mse_k)
+
+
+def build_eval_timestep_pairs(train_timestep_max, num_inference_steps, inference_trunc_timestep):
+    """构造显式 DDIM 推理步，例如 30->24->18->12->6->0。"""
+    if inference_trunc_timestep % num_inference_steps != 0:
+        raise ValueError("Inference trunc timestep must be divisible by num_inference_steps.")
+
+    step_stride = inference_trunc_timestep // num_inference_steps
+    current_timesteps = []
+    next_timesteps = []
+    current_t = int(inference_trunc_timestep)
+
+    for _ in range(int(num_inference_steps)):
+        next_t = max(current_t - int(step_stride), 0)
+        current_timesteps.append(int(current_t))
+        next_timesteps.append(int(next_t))
+        current_t = next_t
+
+    if current_timesteps[0] >= train_timestep_max or next_timesteps[-1] != 0:
+        raise ValueError("Invalid fut inference timestep schedule.")
+    return current_timesteps, next_timesteps
+
+
+def ddim_step(scheduler, pred_x0, sample, current_timestep, next_timestep):
+    """在同一条 alpha_bar 曲线上执行显式 t_cur -> t_next 的 DDIM 确定性更新。"""
+    alpha_prod_t = scheduler.alphas_cumprod[current_timestep].to(device=sample.device, dtype=sample.dtype)
+    alpha_prod_next = scheduler.alphas_cumprod[next_timestep].to(device=sample.device, dtype=sample.dtype)
+    beta_prod_t = (1 - alpha_prod_t).clamp(min=1e-6)
+    beta_prod_next = (1 - alpha_prod_next).clamp(min=0.0)
+    pred_epsilon = (sample - alpha_prod_t.sqrt() * pred_x0) / beta_prod_t.sqrt()
+    return alpha_prod_next.sqrt() * pred_x0 + beta_prod_next.sqrt() * pred_epsilon
 
 
 class TrajectoryMetrics:
-    """累计 future 轨迹的 RMSE / DE / ADE / FDE 统计量。"""
+    """
+    累计逐时刻 RMSE / FDE，以及逐时刻前缀 ADE。
+
+    口径约定：
+    - RMSE/FDE: 只统计当前时刻 t
+    - ADE: 统计从起点到当前时刻 t 的前缀平均
+    - RMSE 按 TAME 口径，以点数量为分母
+    """
 
     def __init__(self, pred_len, meter_per_unit=0.3048):
-        """初始化固定预测长度的指标容器。"""
         self.pred_len = int(pred_len)
         self.meter_per_unit = float(meter_per_unit)
         self.total_coord_se = torch.zeros(self.pred_len, dtype=torch.float64)
         self.total_de = torch.zeros(self.pred_len, dtype=torch.float64)
+        self.total_theta_abs_deg = torch.zeros(self.pred_len, dtype=torch.float64)
+        self.total_v_abs = torch.zeros(self.pred_len, dtype=torch.float64)
         self.total_counts = torch.zeros(self.pred_len, dtype=torch.float64)
-        self.total_coord_counts = torch.zeros(self.pred_len, dtype=torch.float64)
-        self.total_dist_sum = 0.0
-        self.total_valid_points = 0.0
-        self.total_fde_sum = 0.0
-        self.total_fde_count = 0.0
 
     @staticmethod
     def normalize_valid_mask(valid_mask, pred):
         """将不同形状的有效位掩码统一成 `[B, T]` 浮点张量。"""
-        if valid_mask is None:
-            return torch.ones(pred.shape[0], pred.shape[1], device=pred.device, dtype=pred.dtype)
-        if valid_mask.dim() == 3:
-            valid_mask = valid_mask[..., 0]
-        return (valid_mask > 0.5).to(pred.device).float()
+        return normalize_traj_valid_mask(valid_mask, pred)
 
     def update(self, pred, target, valid_mask=None):
-        """累积一个 batch 的轨迹误差。"""
-        pred = pred[:, :self.pred_len, :2]
-        target = target[:, :self.pred_len, :2]
+        """累积一个 batch 的逐时刻平方误差、位移误差和有效样本数。"""
+        pred = pred[:, :self.pred_len]
+        target = target[:, :self.pred_len]
         valid_mask = self.normalize_valid_mask(valid_mask, pred)[:, :pred.size(1)]
 
-        diff = pred - target
-        coord_valid_mask = valid_mask.unsqueeze(-1)
-        coord_sq = diff ** 2
+        diff = pred[..., :2] - target[..., :2]
         dist_sq = torch.sum(diff ** 2, dim=-1)
         dist = torch.sqrt(dist_sq)
 
-        self.total_coord_se += torch.sum(coord_sq * coord_valid_mask, dim=(0, 2)).double().cpu()
+        self.total_coord_se += torch.sum(dist_sq * valid_mask, dim=0).double().cpu()
         self.total_de += torch.sum(dist * valid_mask, dim=0).double().cpu()
+        if pred.size(-1) >= 3 and target.size(-1) >= 3:
+            theta_diff_deg = wrap_angle(pred[..., 2] - target[..., 2]).abs() * (180.0 / torch.pi)
+            self.total_theta_abs_deg += torch.sum(theta_diff_deg * valid_mask, dim=0).double().cpu()
+        if pred.size(-1) >= 4 and target.size(-1) >= 4:
+            v_diff = (pred[..., 3] - target[..., 3]).abs()
+            self.total_v_abs += torch.sum(v_diff * valid_mask, dim=0).double().cpu()
         self.total_counts += torch.sum(valid_mask, dim=0).double().cpu()
-        self.total_coord_counts += torch.sum(coord_valid_mask, dim=(0, 2)).double().cpu()
-        self.total_dist_sum += float(torch.sum(dist * valid_mask).item())
-        self.total_valid_points += float(torch.sum(valid_mask).item())
-
-        t_idx = torch.arange(dist.size(1), device=dist.device).unsqueeze(0).expand_as(dist)
-        masked_idx = torch.where(valid_mask > 0, t_idx, t_idx.new_full(t_idx.shape, -1))
-        last_idx = masked_idx.max(dim=1).values
-        has_valid = last_idx >= 0
-        final_dist = dist.gather(1, last_idx.clamp(min=0).unsqueeze(1)).squeeze(1)
-        self.total_fde_sum += float(torch.sum(final_dist * has_valid.float()).item())
-        self.total_fde_count += float(torch.sum(has_valid.float()).item())
 
     def summary(self):
-        """输出累计后的标量和逐时刻指标。"""
+        """输出逐时刻 RMSE / FDE 与逐时刻前缀 ADE。"""
         counts = self.total_counts.clamp(min=1.0)
-        coord_counts = self.total_coord_counts.clamp(min=1.0)
-        mse_per_step_ft2 = self.total_coord_se / coord_counts
-        rmse_per_step_ft = torch.sqrt(mse_per_step_ft2)
-        de_per_step_ft = self.total_de / counts
-        cumsum_de = torch.cumsum(self.total_de, dim=0)
-        cumsum_counts = torch.cumsum(self.total_counts, dim=0).clamp(min=1.0)
-        ade_prefix_ft = cumsum_de / cumsum_counts
-
-        overall_ade_ft = 0.0 if self.total_valid_points == 0 else self.total_dist_sum / self.total_valid_points
-        overall_fde_ft = 0.0 if self.total_fde_count == 0 else self.total_fde_sum / self.total_fde_count
-        total_coord_count_value = float(self.total_coord_counts.sum().item())
-        total_coord_counts = self.total_coord_counts.sum().clamp(min=1.0)
-        overall_mse_ft2 = 0.0 if total_coord_count_value == 0.0 else float((self.total_coord_se.sum() / total_coord_counts).item())
-        overall_rmse_ft = 0.0 if total_coord_count_value == 0.0 else float(torch.sqrt(self.total_coord_se.sum() / total_coord_counts).item())
+        rmse_per_step_ft = torch.sqrt(self.total_coord_se / counts)
+        fde_per_step_ft = self.total_de / counts
+        ade_per_step_ft = torch.cumsum(self.total_de, dim=0) / torch.cumsum(self.total_counts, dim=0).clamp(min=1.0)
+        theta_mae_per_step_deg = self.total_theta_abs_deg / counts
+        v_mae_per_step_ftps = self.total_v_abs / counts
 
         return {
-            "mse_per_step_ft2": mse_per_step_ft2,
-            "mse_per_step_m2": mse_per_step_ft2 * (self.meter_per_unit ** 2),
             "rmse_per_step_ft": rmse_per_step_ft,
             "rmse_per_step_m": rmse_per_step_ft * self.meter_per_unit,
-            "de_per_step_ft": de_per_step_ft,
-            "de_per_step_m": de_per_step_ft * self.meter_per_unit,
-            "ade_prefix_ft": ade_prefix_ft,
-            "ade_prefix_m": ade_prefix_ft * self.meter_per_unit,
-            "overall_ade_ft": overall_ade_ft,
-            "overall_fde_ft": overall_fde_ft,
-            "overall_mse_ft2": overall_mse_ft2,
-            "overall_mse_m2": overall_mse_ft2 * (self.meter_per_unit ** 2),
-            "overall_rmse_ft": overall_rmse_ft,
-            "overall_ade_m": overall_ade_ft * self.meter_per_unit,
-            "overall_fde_m": overall_fde_ft * self.meter_per_unit,
-            "overall_rmse_m": overall_rmse_ft * self.meter_per_unit,
+            "fde_per_step_ft": fde_per_step_ft,
+            "fde_per_step_m": fde_per_step_ft * self.meter_per_unit,
+            "ade_per_step_ft": ade_per_step_ft,
+            "ade_per_step_m": ade_per_step_ft * self.meter_per_unit,
+            "theta_mae_per_step_deg": theta_mae_per_step_deg,
+            "v_mae_per_step_ftps": v_mae_per_step_ftps,
+            "v_mae_per_step_mps": v_mae_per_step_ftps * self.meter_per_unit,
         }
-
-
-def format_timestep_metrics(metric_tensor, meter_per_unit=0.3048, time_step_labels=None):
-    """将逐时刻指标格式化为便于日志输出的字符串。"""
-    labels = time_step_labels or [("1s", 4), ("2s", 9), ("3s", 14), ("4s", 19), ("5s", 24)]
-    values = []
-    for label, t_idx in labels:
-        if t_idx < metric_tensor.numel():
-            val_ft = float(metric_tensor[t_idx].item())
-            values.append(f"{label}: {val_ft:.3f} ft ({val_ft * meter_per_unit:.3f} m)")
-    return " | ".join(values) if values else "no valid timestep"
