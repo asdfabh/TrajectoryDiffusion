@@ -76,9 +76,8 @@ class DiffusionFut(nn.Module):
         plan_anchor = torch.load(anchor_path, map_location="cpu")
         self.plan_anchor = nn.Parameter(plan_anchor.float(), requires_grad=False)
 
-    def computeKinematicLoss(self, pred_x0, valid_mask, fut_dt):
+    def computeKinematicLoss(self, pred_phys, valid_mask, fut_dt):
         loss_fn = F.l1_loss # F.smooth_l1_loss
-        pred_phys = self.denorm(pred_x0)
         x = pred_phys[..., 0]
         y = pred_phys[..., 1]
         theta = pred_phys[..., 2]
@@ -92,7 +91,7 @@ class DiffusionFut(nn.Module):
         valid_pair = valid_mask[:, :-1] * valid_mask[:, 1:]
         valid_pair_sum = valid_pair.sum()
         if valid_pair_sum.item() <= 0:
-            zero = pred_x0.new_zeros(())
+            zero = pred_phys.new_zeros(())
             return zero, zero
 
         kin_pred = torch.stack([rx, ry], dim=-1)
@@ -103,7 +102,7 @@ class DiffusionFut(nn.Module):
         kin_res_mean = (kin_res * valid_pair).sum() / (valid_pair_sum + 1e-6)
         return loss_kin, kin_res_mean
 
-    def computeLoss(self, pred_x0, target_x0, valid_mask):
+    def computeLoss(self, pred_phys, target_phys, valid_mask):
         lambda_xy = 1.0
         lambda_theta = 0.5
         lambda_v = 0.5
@@ -113,18 +112,17 @@ class DiffusionFut(nn.Module):
 
         valid_sum = valid_mask.sum(dim=1) + 1e-6
 
-        xy_loss_map = loss_fn(pred_x0[..., :2], target_x0[..., :2], reduction="none").mean(dim=-1)
+        xy_loss_map = loss_fn(pred_phys[..., :2], target_phys[..., :2], reduction="none").mean(dim=-1)
         loss_xy = ((xy_loss_map * valid_mask).sum(dim=1) / valid_sum).mean()
 
-        theta_std = self.fut_std[2].to(device=pred_x0.device, dtype=pred_x0.dtype).clamp(min=1e-6)
-        theta_diff = wrap_angle((pred_x0[..., 2] - target_x0[..., 2]) * theta_std) / theta_std
+        theta_diff = wrap_angle(pred_phys[..., 2] - target_phys[..., 2])
         theta_loss_map = loss_fn(theta_diff, torch.zeros_like(theta_diff), reduction="none")
         loss_theta = ((theta_loss_map * valid_mask).sum(dim=1) / valid_sum).mean()
 
-        v_loss_map = loss_fn(pred_x0[..., 3], target_x0[..., 3], reduction="none")
+        v_loss_map = loss_fn(pred_phys[..., 3], target_phys[..., 3], reduction="none")
         loss_v = ((v_loss_map * valid_mask).sum(dim=1) / valid_sum).mean()
 
-        loss_kin, kin_res_mean = self.computeKinematicLoss(pred_x0, valid_mask, fut_dt)
+        loss_kin, kin_res_mean = self.computeKinematicLoss(pred_phys, valid_mask, fut_dt)
         loss_total = lambda_xy * loss_xy + lambda_theta * loss_theta + lambda_v * loss_v + lambda_kin * loss_kin
         logs = {
             "loss": loss_total.detach(),
@@ -136,15 +134,14 @@ class DiffusionFut(nn.Module):
         }
         return loss_total, logs
 
-    # 单 anchor 训练：先按 GT 在 xy 空间选择最近 anchor，再只对该 anchor 做加噪、去噪和损失回传。
+    # 训练入口：Index 与 WTA score 在 raw xy 空间计算，损失在物理坐标系(ft)计算。
     def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
         bsz, t_len, _ = future.shape
         valid_mask = (op_mask[..., 0] > 0.5).float().to(device) # [B,T]
-        target_x0 = self.norm(future) # [B,T,D]
 
         anchor_phys_all = self.plan_anchor.to(device=device).unsqueeze(0).expand(bsz, -1, -1, -1) # [B,K,T,D]
         anchor_x0_all = self.norm(anchor_phys_all)
-        anchor_nearest_idx = self.computeAnchorNearestIndex(target_x0, anchor_x0_all, valid_mask) # [B]
+        anchor_nearest_idx = torch.argmin(self.computeRawXyMseScore(anchor_phys_all, future, valid_mask), dim=-1) # [B]
 
         if self.train_assignment == "hybrid_wta":
             k = anchor_x0_all.size(1)
@@ -160,14 +157,15 @@ class DiffusionFut(nn.Module):
             context_tokens_all = context_tokens.repeat_interleave(k, dim=0)
             pred_x0_all = self.denoiseOnce(x_t, timesteps_all, context_tokens_all)
             pred_x0_all = pred_x0_all.view(bsz, k, t_len, self.output_dim)
+            pred_phys_all = self.denorm(pred_x0_all)
 
             with torch.no_grad():
-                pred_score = self.computeMaskedMseScore(self.denorm(pred_x0_all), future, valid_mask)
-                anchor_score = self.computeMaskedMseScore(anchor_phys_all, future, valid_mask)
+                pred_score = self.computeRawXyMseScore(pred_phys_all, future, valid_mask)
+                anchor_score = self.computeRawXyMseScore(anchor_phys_all, future, valid_mask)
                 mode_idx = torch.argmin(pred_score + self.hybrid_alpha * anchor_score, dim=-1)
 
-            pred_x0 = self.gatherMode(pred_x0_all, mode_idx)
-            loss, loss_logs = self.computeLoss(pred_x0, target_x0, valid_mask)
+            pred_phys = self.gatherMode(pred_phys_all, mode_idx)
+            loss, loss_logs = self.computeLoss(pred_phys, future, valid_mask)
             same_rate = (mode_idx == anchor_nearest_idx).float().mean()
             max_win_ratio = torch.bincount(mode_idx.detach(), minlength=k).float().max() / max(float(bsz), 1.0)
             loss_logs["assign_same_rate"] = same_rate.detach()
@@ -183,7 +181,8 @@ class DiffusionFut(nn.Module):
         context_tokens = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask) # [B,T,D]
 
         pred_x0 = self.denoiseOnce(x_t, timesteps, context_tokens) # [B,T,D]
-        loss, loss_logs = self.computeLoss(pred_x0, target_x0, valid_mask)
+        pred_phys = self.denorm(pred_x0)
+        loss, loss_logs = self.computeLoss(pred_phys, future, valid_mask)
         loss_logs["assign_same_rate"] = pred_x0.new_tensor(1.0)
         loss_logs["assign_max_win_ratio"] = (
             torch.bincount(mode_idx.detach(), minlength=anchor_x0_all.size(1)).float().max() / max(float(bsz), 1.0)
@@ -243,14 +242,7 @@ class DiffusionFut(nn.Module):
         pred_delta = self.dit(input_embedded, t_emb, context_tokens)
         return x_t + pred_delta
 
-    def computeAnchorNearestIndex(self, target_x0, anchor_x0_all, valid_mask):
-        valid_time = valid_mask.unsqueeze(1)
-        dist = torch.linalg.norm(target_x0.unsqueeze(1)[..., :2] - anchor_x0_all[..., :2], dim=-1)
-        numer = (dist * valid_time).sum(dim=-1)
-        denom = valid_time.sum(dim=-1) + 1e-6
-        return torch.argmin(numer / denom, dim=-1)
-
-    def computeMaskedMseScore(self, pred_phys_all, target_phys, valid_mask):
+    def computeRawXyMseScore(self, pred_phys_all, target_phys, valid_mask):
         valid_time = valid_mask.unsqueeze(1)
         diff = pred_phys_all[..., :2] - target_phys.unsqueeze(1)[..., :2]
         dist_sq = torch.sum(diff.square(), dim=-1)
