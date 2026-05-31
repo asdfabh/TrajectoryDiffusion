@@ -33,8 +33,9 @@ class DiffusionFut(nn.Module):
         # Anchor条件下扩散与推理参数。
         self.num_train_timesteps = int(args.num_train_timesteps_fut)
         self.num_inference_steps = int(args.num_inference_steps)
-        self.train_assignment = str(getattr(args, "fut_train_assignment", "anchor")).strip().lower()
-        self.hybrid_alpha = float(getattr(args, "fut_hybrid_alpha", 0.1))
+        self.hybrid_alpha = float(args.fut_hybrid_alpha)
+        self.cascade_intermediate_weight = float(args.fut_cascade_intermediate_weight)
+        self.cascade_final_weight = float(args.fut_cascade_final_weight)
 
         self.train_timestep_max = 50
         self.inference_trunc_timestep = 30
@@ -58,9 +59,11 @@ class DiffusionFut(nn.Module):
             clip_sample=False,
         )
 
-        dit_block = dit.DiTBlock(self.hidden_dim, self.heads, self.dropout, self.mlp_ratio)
-        final_layer = dit.FinalLayer(self.hidden_dim, self.output_dim)
-        self.dit = dit.DiT(dit_block=dit_block, final_layer=final_layer, depth=self.depth)
+        self.dit_blocks = nn.ModuleList()
+        self.output_heads = nn.ModuleList()
+        for _ in range(self.depth):
+            self.dit_blocks.append(dit.DiTBlock(self.hidden_dim, self.heads, self.dropout, self.mlp_ratio))
+            self.output_heads.append(dit.FinalLayer(self.hidden_dim, self.output_dim))
 
         # 仅对 Ego future 做归一化，当前 future 定义为 [x, y, theta, v]。
         if self.dataset_name == "ngsim":
@@ -104,9 +107,9 @@ class DiffusionFut(nn.Module):
 
     def computeLoss(self, pred_phys, target_phys, valid_mask):
         lambda_xy = 1.0
-        lambda_theta = 0.5
-        lambda_v = 0.5
-        lambda_kin = 0.20
+        lambda_theta = 0.05
+        lambda_v = 0.05
+        lambda_kin = 0.10
         fut_dt = 0.2
         loss_fn = F.l1_loss
 
@@ -134,6 +137,21 @@ class DiffusionFut(nn.Module):
         }
         return loss_total, logs
 
+    def mergeCascadeLoss(self, pred_phys_levels, target_phys, valid_mask):
+        final_loss, final_logs = self.computeLoss(pred_phys_levels[-1], target_phys, valid_mask)
+        aux_loss = final_loss.new_zeros(())
+        for pred_phys in pred_phys_levels[:-1]:
+            level_loss, _ = self.computeLoss(pred_phys, target_phys, valid_mask)
+            aux_loss = aux_loss + level_loss
+        aux_loss = aux_loss / float(len(pred_phys_levels) - 1)
+
+        weighted_aux_loss = self.cascade_intermediate_weight * aux_loss
+        total_loss = self.cascade_final_weight * final_loss + weighted_aux_loss
+        final_logs["loss"] = total_loss.detach()
+        final_logs["loss_final"] = final_loss.detach()
+        final_logs["loss_cascade_aux"] = weighted_aux_loss.detach()
+        return total_loss, final_logs
+
     # 训练入口：Index 与 WTA score 在 raw xy 空间计算，损失在物理坐标系(ft)计算。
     def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
         bsz, t_len, _ = future.shape
@@ -143,50 +161,35 @@ class DiffusionFut(nn.Module):
         anchor_x0_all = self.norm(anchor_phys_all)
         anchor_nearest_idx = torch.argmin(self.computeRawXyMseScore(anchor_phys_all, future, valid_mask), dim=-1) # [B]
 
-        if self.train_assignment == "hybrid_wta":
-            k = anchor_x0_all.size(1)
-            noise = torch.randn_like(anchor_x0_all) # [B,K,T,D]
-            timesteps = torch.randint(0, self.train_timestep_max, (bsz,), device=device).long() # [B]
-            timesteps_all = timesteps.repeat_interleave(k) # [B*K]
-            x_t = self.diffusion_scheduler.add_noise(
-                anchor_x0_all.reshape(bsz * k, t_len, self.output_dim),
-                noise.reshape(bsz * k, t_len, self.output_dim),
-                timesteps_all,
-            ).float()
-            context_tokens = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
-            context_tokens_all = context_tokens.repeat_interleave(k, dim=0)
-            pred_x0_all = self.denoiseOnce(x_t, timesteps_all, context_tokens_all)
-            pred_x0_all = pred_x0_all.view(bsz, k, t_len, self.output_dim)
-            pred_phys_all = self.denorm(pred_x0_all)
-
-            with torch.no_grad():
-                pred_score = self.computeRawXyMseScore(pred_phys_all, future, valid_mask)
-                anchor_score = self.computeRawXyMseScore(anchor_phys_all, future, valid_mask)
-                mode_idx = torch.argmin(pred_score + self.hybrid_alpha * anchor_score, dim=-1)
-
-            pred_phys = self.gatherMode(pred_phys_all, mode_idx)
-            loss, loss_logs = self.computeLoss(pred_phys, future, valid_mask)
-            same_rate = (mode_idx == anchor_nearest_idx).float().mean()
-            max_win_ratio = torch.bincount(mode_idx.detach(), minlength=k).float().max() / max(float(bsz), 1.0)
-            loss_logs["assign_same_rate"] = same_rate.detach()
-            loss_logs["assign_max_win_ratio"] = max_win_ratio.detach()
-            return loss, loss_logs
-
-        mode_idx = anchor_nearest_idx
-        anchor_x0 = self.gatherMode(anchor_x0_all, mode_idx) # [B,T,D]
-
-        noise = torch.randn_like(anchor_x0) # [B,T,D]
+        k = anchor_x0_all.size(1)
+        noise = torch.randn_like(anchor_x0_all) # [B,K,T,D]
         timesteps = torch.randint(0, self.train_timestep_max, (bsz,), device=device).long() # [B]
-        x_t = self.diffusion_scheduler.add_noise(anchor_x0, noise, timesteps).float() # [B,T,D]
-        context_tokens = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask) # [B,T,D]
+        timesteps_all = timesteps.repeat_interleave(k) # [B*K]
+        x_t = self.diffusion_scheduler.add_noise(
+            anchor_x0_all.reshape(bsz * k, t_len, self.output_dim),
+            noise.reshape(bsz * k, t_len, self.output_dim),
+            timesteps_all,
+        ).float()
+        context_tokens = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
+        context_tokens_all = context_tokens.repeat_interleave(k, dim=0)
+        pred_x0_levels = self.forwardDenoiseCascade(x_t, timesteps_all, context_tokens_all)
+        pred_x0_all = pred_x0_levels[-1].view(bsz, k, t_len, self.output_dim)
+        pred_phys_all = self.denorm(pred_x0_all)
 
-        pred_x0 = self.denoiseOnce(x_t, timesteps, context_tokens) # [B,T,D]
-        pred_phys = self.denorm(pred_x0)
-        loss, loss_logs = self.computeLoss(pred_phys, future, valid_mask)
-        loss_logs["assign_same_rate"] = pred_x0.new_tensor(1.0)
-        loss_logs["assign_max_win_ratio"] = (
-            torch.bincount(mode_idx.detach(), minlength=anchor_x0_all.size(1)).float().max() / max(float(bsz), 1.0)
-        ).detach()
+        with torch.no_grad():
+            pred_score = self.computeRawXyMseScore(pred_phys_all, future, valid_mask)
+            anchor_score = self.computeRawXyMseScore(anchor_phys_all, future, valid_mask)
+            mode_idx = torch.argmin(pred_score + self.hybrid_alpha * anchor_score, dim=-1)
+
+        pred_phys_levels = [
+            self.gatherMode(self.denorm(pred_x0.view(bsz, k, t_len, self.output_dim)), mode_idx)
+            for pred_x0 in pred_x0_levels
+        ]
+        loss, loss_logs = self.mergeCascadeLoss(pred_phys_levels, future, valid_mask)
+        same_rate = (mode_idx == anchor_nearest_idx).float().mean()
+        max_win_ratio = torch.bincount(mode_idx.detach(), minlength=k).float().max() / max(float(bsz), 1.0)
+        loss_logs["assign_same_rate"] = same_rate.detach()
+        loss_logs["assign_max_win_ratio"] = max_win_ratio.detach()
         return loss, loss_logs
 
 
@@ -208,7 +211,7 @@ class DiffusionFut(nn.Module):
 
         for current_timestep, next_timestep in zip(self.eval_current_timesteps, self.eval_next_timesteps):
             timesteps = torch.full((x_t.size(0),), int(current_timestep), device=x_t.device, dtype=torch.long)
-            pred_x0 = self.denoiseOnce(x_t, timesteps, context_tokens)
+            pred_x0 = self.forwardDenoiseCascade(x_t, timesteps, context_tokens)[-1]
             x_t = ddim_step(diffusion_scheduler, pred_x0, x_t, int(current_timestep), int(next_timestep))
 
         pred_phys = self.denorm(pred_x0.view(bsz, k, t_len, self.output_dim))
@@ -226,7 +229,7 @@ class DiffusionFut(nn.Module):
         mean = self.fut_mean.to(device=x.device, dtype=x.dtype)
         std = self.fut_std.to(device=x.device, dtype=x.dtype).clamp(min=1e-6)
         x_norm[..., :self.output_dim] = (x[..., :self.output_dim] - mean[:self.output_dim]) / std[:self.output_dim]
-        x_norm[..., :self.output_dim] = torch.clamp(x_norm[..., :self.output_dim], -5.0, 5.0)
+        x_norm[..., :self.output_dim] = torch.clamp(x_norm[..., :self.output_dim], -8.0, 8.0)
         return x_norm
 
     def denorm(self, x):
@@ -236,11 +239,18 @@ class DiffusionFut(nn.Module):
         x_denorm[..., :self.output_dim] = x[..., :self.output_dim] * std[:self.output_dim] + mean[:self.output_dim]
         return x_denorm
 
-    def denoiseOnce(self, x_t, timesteps, context_tokens):
+    def forwardDenoiseCascade(self, x_t, timesteps, context_tokens):
+        preds = []
+        current_x = x_t
         t_emb = self.timestep_embedder(timesteps)
-        input_embedded = self.input_embedding(x_t) + self.pos_embedding(x_t)
-        pred_delta = self.dit(input_embedded, t_emb, context_tokens)
-        return x_t + pred_delta
+        for block, output_head in zip(self.dit_blocks, self.output_heads):
+            input_embedded = self.input_embedding(current_x) + self.pos_embedding(current_x)
+            hidden = block(input_embedded, t_emb, context_tokens)
+            pred_delta = output_head(hidden)
+            pred_x0 = current_x + pred_delta
+            preds.append(pred_x0)
+            current_x = pred_x0.detach()
+        return preds
 
     def computeRawXyMseScore(self, pred_phys_all, target_phys, valid_mask):
         valid_time = valid_mask.unsqueeze(1)

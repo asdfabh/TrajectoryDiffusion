@@ -62,8 +62,9 @@ def get_args_parser():
     # Fut train/inference
     parser.add_argument("--num_inference_steps", default=3, type=int)
     parser.add_argument("--fut_k", default=9, type=int)
-    parser.add_argument("--fut_train_assignment", default="hybrid_wta", type=str, choices=["anchor", "hybrid_wta"])
     parser.add_argument("--fut_hybrid_alpha", default=0.1, type=float)
+    parser.add_argument("--fut_cascade_intermediate_weight", default=0.5, type=float)
+    parser.add_argument("--fut_cascade_final_weight", default=1.0, type=float)
 
     # Fut visualization
     parser.add_argument("--fut_enable_eval_vis", default=0, type=int)

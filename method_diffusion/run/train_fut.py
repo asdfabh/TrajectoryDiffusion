@@ -25,6 +25,8 @@ LOSS_STAT_KEYS = [
     "loss_theta",
     "loss_v",
     "loss_kin",
+    "loss_final",
+    "loss_cascade_aux",
     "kin_res_mean",
     "assign_same_rate",
     "assign_max_win_ratio",
@@ -75,6 +77,8 @@ def write_csv_log(csv_path, epoch, train_stats, eval_rmse, eval_ade, eval_fde, e
         "train_loss_theta": train_stats["loss_theta"],
         "train_loss_v": train_stats["loss_v"],
         "train_loss_kin": train_stats["loss_kin"],
+        "train_loss_final": train_stats["loss_final"],
+        "train_loss_cascade_aux": train_stats["loss_cascade_aux"],
         "train_kin_res_mean": train_stats["kin_res_mean"],
         "train_assign_same_rate": train_stats["assign_same_rate"],
         "train_assign_max_win_ratio": train_stats["assign_max_win_ratio"],
@@ -99,6 +103,8 @@ def init_csv_log(csv_path):
         "train_loss_theta",
         "train_loss_v",
         "train_loss_kin",
+        "train_loss_final",
+        "train_loss_cascade_aux",
         "train_kin_res_mean",
         "train_assign_same_rate",
         "train_assign_max_win_ratio",
@@ -122,6 +128,8 @@ def write_tensorboard_log(writer, epoch, train_stats, eval_rmse, eval_ade, eval_
     writer.add_scalar("Loss/TrainTheta", train_stats["loss_theta"], epoch)
     writer.add_scalar("Loss/TrainV", train_stats["loss_v"], epoch)
     writer.add_scalar("Loss/TrainKinematic", train_stats["loss_kin"], epoch)
+    writer.add_scalar("Loss/TrainFinal", train_stats["loss_final"], epoch)
+    writer.add_scalar("Loss/TrainCascadeAux", train_stats["loss_cascade_aux"], epoch)
     writer.add_scalar("Loss/KinematicResidualMean", train_stats["kin_res_mean"], epoch)
     writer.add_scalar("Train/AssignSameRate", train_stats["assign_same_rate"], epoch)
     writer.add_scalar("Train/AssignMaxWinRatio", train_stats["assign_max_win_ratio"], epoch)
@@ -143,6 +151,8 @@ def print_eval_summary(epoch, total_epochs, train_stats, eval_rmse, eval_ade, ev
         f"theta={train_stats['loss_theta']:.6f} | "
         f"v={train_stats['loss_v']:.6f} | "
         f"kin={train_stats['loss_kin']:.6f} | "
+        f"final={train_stats['loss_final']:.6f} | "
+        f"cascade_aux={train_stats['loss_cascade_aux']:.6f} | "
         f"kin_res={train_stats['kin_res_mean']:.6f} | "
         f"assign_same={train_stats['assign_same_rate']:.4f} | "
         f"assign_max={train_stats['assign_max_win_ratio']:.4f} | "
