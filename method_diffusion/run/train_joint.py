@@ -12,7 +12,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.config import get_args_parser
-from method_diffusion.dataset.ngsim_dataset import NgsimDataset
+from method_diffusion.dataset.build import build_trajectory_dataset, get_split_path, meter_per_unit
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.run.train_fut import prepare_input_data
@@ -24,7 +24,6 @@ HIST_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "hist"
 JOINT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "joint"
 JOINT_FUT_CHECKPOINT_DIR = JOINT_CHECKPOINT_DIR / "fut"
 JOINT_HIST_CHECKPOINT_DIR = JOINT_CHECKPOINT_DIR / "hist"
-METER_PER_FOOT = 0.3048
 
 def build_hist_masked(hist, mask_ratio, random_mask_ratio, block_mask_start):
     hist_mask = mixed_mask(
@@ -219,7 +218,7 @@ def train_epoch(
 
 
 @torch.no_grad()
-def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, mask_ratio, random_mask_ratio, block_mask_start):
+def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, mask_ratio, random_mask_ratio, block_mask_start, metric_meter_per_unit):
     was_fut_training = model_fut.training
     was_hist_training = model_hist.training
     model_fut.eval()
@@ -256,10 +255,10 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, mask
             all_preds = model_fut.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
             pred_fut = all_preds.squeeze(1)
         eval_rmse, eval_ade, eval_fde = compute_batch_metric(pred_fut, fut, op_mask)
-        eval_theta_deg, eval_v_mps = compute_batch_kinematic_metrics(pred_fut, fut, op_mask, meter_per_unit=METER_PER_FOOT)
-        eval_rmse = float(eval_rmse.item()) * METER_PER_FOOT
-        eval_ade = float(eval_ade.item()) * METER_PER_FOOT
-        eval_fde = float(eval_fde.item()) * METER_PER_FOOT
+        eval_theta_deg, eval_v_mps = compute_batch_kinematic_metrics(pred_fut, fut, op_mask, meter_per_unit=metric_meter_per_unit)
+        eval_rmse = float(eval_rmse.item()) * metric_meter_per_unit
+        eval_ade = float(eval_ade.item()) * metric_meter_per_unit
+        eval_fde = float(eval_fde.item()) * metric_meter_per_unit
         eval_theta_deg = float(eval_theta_deg.item())
         eval_v_mps = float(eval_v_mps.item())
 
@@ -293,9 +292,11 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, mask
 
 def main():
     args = get_args_parser().parse_args()
-    args.checkpoint_dir = str(JOINT_FUT_CHECKPOINT_DIR)
-    JOINT_FUT_CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    tensorboard_log_dir = Path(args.checkpoint_dir) / "log"
+    dataset_name = str(args.dataset).lower()
+    checkpoint_dir = JOINT_FUT_CHECKPOINT_DIR / dataset_name
+    args.checkpoint_dir = str(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    tensorboard_log_dir = checkpoint_dir / "log"
     tensorboard_log_dir.mkdir(parents=True, exist_ok=True)
     log_csv_path = tensorboard_log_dir / "train_log.csv"
     if not log_csv_path.exists() or args.resume_fut in ("none", "", None):
@@ -303,27 +304,22 @@ def main():
     writer = SummaryWriter(log_dir=str(tensorboard_log_dir))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset_name = str(args.dataset).lower()
-    data_root = Path(args.data_root_highd if dataset_name == "highd" else args.data_root_ngsim)
-    train_path = str(data_root / "TrainSet.mat")
-    val_path = str(data_root / "ValSet.mat")
+    train_path = str(get_split_path(args, dataset_name, "Train"))
+    val_path = str(get_split_path(args, dataset_name, "Val"))
+    metric_meter_per_unit = meter_per_unit(dataset_name)
     print(f"[JointTrain] Dataset: {dataset_name}")
     print(f"[JointTrain] Train path: {train_path}")
     print(f"[JointTrain] Val path: {val_path}")
 
-    train_dataset = NgsimDataset(
+    train_dataset = build_trajectory_dataset(
         train_path,
-        t_h=30,
-        t_f=50,
-        d_s=2,
+        dataset_name,
         enc_size=args.encoder_input_dim,
         feature_dim=args.feature_dim,
     )
-    val_dataset = NgsimDataset(
+    val_dataset = build_trajectory_dataset(
         val_path,
-        t_h=30,
-        t_f=50,
-        d_s=2,
+        dataset_name,
         enc_size=args.encoder_input_dim,
         feature_dim=args.feature_dim,
     )
@@ -388,6 +384,7 @@ def main():
             mask_ratio=mask_ratio,
             random_mask_ratio=random_mask_ratio,
             block_mask_start=block_mask_start,
+            metric_meter_per_unit=metric_meter_per_unit,
         )
         current_lr_fut = float(optimizer.param_groups[0]["lr"])
 

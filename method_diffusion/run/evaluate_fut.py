@@ -10,7 +10,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.config import get_args_parser
-from method_diffusion.dataset.ngsim_dataset import NgsimDataset
+from method_diffusion.dataset.build import build_trajectory_dataset, get_test_split_path, meter_per_unit
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.run.train_fut import prepare_input_data
 from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_closest_prediction
@@ -18,7 +18,6 @@ from method_diffusion.utils.visualization import visualize_scene_prediction
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
-METER_PER_FOOT = 0.3048
 
 
 # 解析 fut checkpoint 标识并返回实际文件路径。
@@ -48,8 +47,21 @@ def load_checkpoint(model, resume_arg, checkpoint_dir, device):
     return model
 
 
+def get_time_pairs(fut_steps):
+    """按未来步数生成 (label, index) 对。dt=0.2s/步。"""
+    if fut_steps >= 25:
+        return [("1s", 4), ("2s", 9), ("3s", 14), ("4s", 19), ("5s", 24)]
+    # RounD: 20 步 → 4s
+    pairs = []
+    for t_sec in (1, 2, 3, 4):
+        idx = int(t_sec / 0.2) - 1
+        if idx < fut_steps:
+            pairs.append((f"{t_sec}s", idx))
+    return pairs
+
+
 def print_metrics(metrics, title):
-    time_pairs = [("1s", 4), ("2s", 9), ("3s", 14), ("4s", 19), ("5s", 24)]
+    time_pairs = get_time_pairs(len(metrics["rmse_per_step_m"]))
     valid_pairs = [(label, idx) for label, idx in time_pairs if idx < len(metrics["rmse_per_step_m"])]
 
     print("\n" + "=" * 30 + f" {title} " + "=" * 30)
@@ -78,14 +90,10 @@ def print_metrics(metrics, title):
 # 构建 TestSet dataloader。
 def build_test_loader(args):
     dataset_name = str(args.dataset).lower()
-    data_root = Path(args.data_root_highd if dataset_name == "highd" else args.data_root_ngsim)
-    test_path = data_root / "TestSet.mat"
-    # test_path = data_root / "ValSet.mat"
-    if not test_path.exists():
-        test_path = data_root / "ValSet.mat"
+    test_path = get_test_split_path(args, dataset_name)
     print(f"[FutEval] Dataset: {dataset_name}")
     print(f"[FutEval] Test path: {test_path}")
-    test_dataset = NgsimDataset(str(test_path), t_h=30, t_f=50, d_s=2, enc_size=args.encoder_input_dim, feature_dim=args.feature_dim)
+    test_dataset = build_trajectory_dataset(test_path, dataset_name, enc_size=args.encoder_input_dim, feature_dim=args.feature_dim)
 
     return DataLoader(
         test_dataset,
@@ -101,9 +109,9 @@ def build_test_loader(args):
 
 # 执行 TestSet 评估并打印周期性与最终指标。
 @torch.no_grad()
-def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis):
+def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis, metric_meter_per_unit):
     model.eval()
-    metrics = TrajectoryMetrics(model.T)
+    metrics = TrajectoryMetrics(model.T, meter_per_unit=metric_meter_per_unit)
     k_samples = max(1, int(fut_k))
     eval_name = f"Fut ClosestGT-RMSE@{k_samples}" if k_samples > 1 else "Fut single-mode"
 
@@ -125,7 +133,7 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis):
                     valid_mask=(op_mask[..., 0] > 0.5).float(),
                     pred_all=all_preds,
                     pred_best_idx=best_idx,
-                    meter_per_foot=METER_PER_FOOT,
+                    meter_per_foot=metric_meter_per_unit,
                     batch_idx=0,
                     title="Future Prediction",
                     highlight_label="Best",
@@ -137,12 +145,13 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis):
         metrics.update(pred_fut, fut, op_mask)
         summary = metrics.summary()
         last_idx = min(model.T, len(summary["rmse_per_step_m"])) - 1
+        last_sec = int(model.T * 0.2)
         pbar.set_postfix({
-            "ade_5s": f"{summary['ade_per_step_m'][last_idx]:.4f}",
-            "fde_5s": f"{summary['fde_per_step_m'][last_idx]:.4f}",
-            "rmse_5s": f"{summary['rmse_per_step_m'][last_idx]:.4f}",
-            "theta_5s": f"{summary['theta_mae_per_step_deg'][last_idx]:.4f}",
-            "v_5s": f"{summary['v_mae_per_step_mps'][last_idx]:.4f}",
+            f"ade_{last_sec}s": f"{summary['ade_per_step_m'][last_idx]:.4f}",
+            f"fde_{last_sec}s": f"{summary['fde_per_step_m'][last_idx]:.4f}",
+            f"rmse_{last_sec}s": f"{summary['rmse_per_step_m'][last_idx]:.4f}",
+            f"theta_{last_sec}s": f"{summary['theta_mae_per_step_deg'][last_idx]:.4f}",
+            f"v_{last_sec}s": f"{summary['v_mae_per_step_mps'][last_idx]:.4f}",
         })
 
         if batch_idx % 100 == 0:
@@ -156,7 +165,7 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis):
 # 初始化模型、数据与 checkpoint，并执行 fut 测试评估。
 def main():
     args = get_args_parser().parse_args()
-    args.checkpoint_dir = str(FUT_CHECKPOINT_DIR)
+    args.checkpoint_dir = str(FUT_CHECKPOINT_DIR / str(args.dataset).strip().lower())
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"[FutEval] Device: {device}")
@@ -166,7 +175,7 @@ def main():
     test_loader = build_test_loader(args)
     model = DiffusionFut(args).to(device)
     load_checkpoint(model, args.resume_fut, args.checkpoint_dir, device)
-    evaluate(model, test_loader, device, args.feature_dim, args.fut_k, enable_eval_vis=int(args.fut_enable_eval_vis) > 0)
+    evaluate(model, test_loader, device, args.feature_dim, args.fut_k, enable_eval_vis=int(args.fut_enable_eval_vis) > 0, metric_meter_per_unit=meter_per_unit(args.dataset))
 
 
 if __name__ == "__main__":

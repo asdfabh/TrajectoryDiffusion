@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch import nn
 from diffusers.schedulers import DDIMScheduler
 
+from method_diffusion.dataset.build import get_time_params
 from method_diffusion.models import dit_fut as dit
 from method_diffusion.models.hist_encoder import HistEncoder
 from method_diffusion.utils.fut_utils import build_eval_timestep_pairs, ddim_step, wrap_angle
@@ -27,8 +28,10 @@ class DiffusionFut(nn.Module):
         self.dropout = float(args.dropout_fut)
         self.mlp_ratio = int(args.mlp_ratio_fut)
         self.time_embedding_size = int(args.time_embedding_size_fut)
-        self.T = int(args.T_f)
+        t_h, _, d_s, fut_steps = get_time_params(self.dataset_name)
+        self.T = fut_steps
         self.fut_k = max(1, int(args.fut_k))
+        args.hist_length = t_h // d_s + 1 # (RounD=11, 其他=16)
 
         # Anchor条件下扩散与推理参数。
         self.num_train_timesteps = int(args.num_train_timesteps_fut)
@@ -72,8 +75,11 @@ class DiffusionFut(nn.Module):
         elif self.dataset_name == "highd":
             self.register_buffer("fut_mean", torch.tensor([0.06540795, 221.13193, 1.5697229, 85.08167], dtype=torch.float32), persistent=False)
             self.register_buffer("fut_std", torch.tensor([1.3484404, 142.16895, 0.048561804, 24.186338], dtype=torch.float32), persistent=False)
+        elif self.dataset_name == "round":
+            self.register_buffer("fut_mean", torch.tensor([1.184816403201482, 6.183393379855639, 1.203041719745027, 6.281713600887428], dtype=torch.float32), persistent=False)
+            self.register_buffer("fut_std", torch.tensor([1.699010782220082, 4.606644949752387, 0.5806019163455398, 2.7653540536338386], dtype=torch.float32), persistent=False)
         else:
-            raise ValueError(f"Unsupported dataset '{self.dataset_name}' for fut normalization. Supported: highd, ngsim")
+            raise ValueError(f"Unsupported dataset '{self.dataset_name}' for fut normalization. Supported: highd, ngsim, round")
 
         anchor_path = Path(__file__).resolve().parent.parent / "dataset" / "anchor" / f"{self.dataset_name}_k{self.fut_k}.pt"
         plan_anchor = torch.load(anchor_path, map_location="cpu")

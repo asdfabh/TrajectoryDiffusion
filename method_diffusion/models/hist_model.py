@@ -1,3 +1,4 @@
+from method_diffusion.dataset.build import get_time_params
 from method_diffusion.models import dit_hist as dit
 from torch import nn
 from diffusers.schedulers import DDIMScheduler
@@ -25,7 +26,11 @@ class DiffusionPast(nn.Module):
         self.num_train_timesteps = args.num_train_timesteps
         self.time_embedding_size = args.time_embedding_size
         self.num_inference_steps = args.num_inference_steps
-        self.T = int(args.T)
+        t_h, _, d_s, _ = get_time_params(self.dataset_name)
+        hist_steps = t_h // d_s + 1
+        self.T = hist_steps
+        # 覆盖 args 上的 hist_length，使 HistEncoder 读到正确的值
+        args.hist_length = hist_steps
 
         # 输入嵌入层和位置编码，相加得到Dit的输入
         self.input_embedding = nn.Linear(self.feature_dim, self.input_dim)
@@ -73,9 +78,22 @@ class DiffusionPast(nn.Module):
             lane_max = [4.0]
             class_min = [2.0]
             class_max = [2.0]
+        elif self.dataset_name == "round":
+            pos_mean = [0.21476346782684114, -2.7462148094960694]
+            pos_std = [0.40718978172079595, 2.8838958256672043]
+            va_mean = [4.558927923270354, -0.0915744207937553]
+            va_std = [3.3793411037783105, 0.22323507250486305]
+            lane_center = [59.0]
+            lane_scale = [59.0]
+            class_center = [1.0]
+            class_scale = [1.0]
+            lane_min = [0.0]
+            lane_max = [118.0]
+            class_min = [1.0]
+            class_max = [1.0]
         else:
             raise ValueError(
-                f"Unsupported dataset '{self.dataset_name}' for hist normalization. Supported: highd, ngsim"
+                f"Unsupported dataset '{self.dataset_name}' for hist normalization. Supported: highd, ngsim, round"
             )
 
         self.register_buffer("pos_mean", torch.tensor(pos_mean, dtype=torch.float32), persistent=False)

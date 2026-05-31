@@ -10,11 +10,10 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.models.hist_model import DiffusionPast
-from method_diffusion.dataset.ngsim_hist_dataset import NgsimHistDataset
+from method_diffusion.dataset.build import build_hist_dataset, get_test_split_path, meter_per_unit
 from method_diffusion.config import get_args_parser
 from method_diffusion.utils.mask_util import mixed_mask
 
-METER_PER_FOOT = 0.3048
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 HIST_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "hist"
 
@@ -116,8 +115,8 @@ def load_checkpoint(model, resume_arg, checkpoint_dir, device, model_name="Model
 
 
 class HistReconstructionMetrics:
-    def __init__(self, meter_per_foot=METER_PER_FOOT):
-        self.meter_per_foot = float(meter_per_foot)
+    def __init__(self, meter_per_unit=0.3048):
+        self.meter_per_foot = float(meter_per_unit)
         self.regions = ("all", "unmasked", "masked")
 
         self.xy_dist_sum = {key: 0.0 for key in self.regions}
@@ -284,21 +283,18 @@ def print_metrics(summary, title, mask_ratio, random_mask_ratio, block_mask_star
 
 def main():
     args = get_eval_args()
-    args.checkpoint_dir = str(HIST_CHECKPOINT_DIR)
+    dataset_name = str(args.dataset).lower()
+    args.checkpoint_dir = str(HIST_CHECKPOINT_DIR / dataset_name)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     print(f"[HistEval] Checkpoint dir: {args.checkpoint_dir}")
-
-    dataset_name = str(args.dataset).lower()
-    data_root = Path(args.data_root_highd if dataset_name == "highd" else args.data_root_ngsim)
-    test_path = data_root / "TestSet.mat"
-    if not test_path.exists():
-        test_path = data_root / "ValSet.mat"
+    test_path = get_test_split_path(args, dataset_name)
     print(f"[HistEval] Dataset: {dataset_name}")
     print(f"[HistEval] Test path: {test_path}")
 
-    test_dataset = NgsimHistDataset(str(test_path), t_h=30, d_s=2)
+    metric_meter_per_unit = meter_per_unit(dataset_name)
+    test_dataset = build_hist_dataset(str(test_path), dataset_name)
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
@@ -310,7 +306,7 @@ def main():
 
     model = DiffusionPast(args).to(device)
     load_checkpoint(model, args.resume_hist, args.checkpoint_dir, device, model_name="HistModel")
-    metrics = HistReconstructionMetrics()
+    metrics = HistReconstructionMetrics(meter_per_unit=metric_meter_per_unit)
     mask_ratio = max(0.0, min(1.0, float(args.mask_prob)))
     random_mask_ratio = max(0.0, min(1.0, float(args.random_mask_ratio)))
     block_mask_start = int(args.block_mask_start) > 0

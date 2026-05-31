@@ -12,7 +12,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.config import get_args_parser
-from method_diffusion.dataset.ngsim_hist_dataset import NgsimHistDataset
+from method_diffusion.dataset.build import build_hist_dataset, get_split_path, meter_per_unit
 from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.utils.mask_util import mixed_mask
 
@@ -76,7 +76,7 @@ def init_csv_log(csv_path):
         "train_a_unknown",
         "train_a_known",
         "val_loss",
-        "val_masked_ade_ft",
+        "val_masked_ade_raw",
         "val_masked_ade_m",
         "lr",
     ]
@@ -85,7 +85,7 @@ def init_csv_log(csv_path):
         writer.writeheader()
 
 
-def write_csv_log(csv_path, epoch, train_stats, eval_stats, lr):
+def write_csv_log(csv_path, epoch, train_stats, eval_stats, lr, to_m):
     row = {
         "epoch": epoch,
         "train_loss": train_stats["loss_total"],
@@ -96,8 +96,8 @@ def write_csv_log(csv_path, epoch, train_stats, eval_stats, lr):
         "train_a_unknown": train_stats["loss_a_unknown"],
         "train_a_known": train_stats["loss_a_known"],
         "val_loss": eval_stats["loss"],
-        "val_masked_ade_ft": eval_stats["masked_ade_ft"],
-        "val_masked_ade_m": eval_stats["masked_ade_ft"] * 0.3048,
+        "val_masked_ade_raw": eval_stats["masked_ade_ft"],
+        "val_masked_ade_m": eval_stats["masked_ade_ft"] * to_m,
         "lr": lr,
     }
     with csv_path.open("a", newline="", encoding="utf-8") as f:
@@ -259,7 +259,8 @@ def evaluate(model, dataloader, device, epoch, feature_dim, mask_ratio, random_m
 
 def main():
     args = get_args_parser().parse_args()
-    args.checkpoint_dir = str(HIST_CHECKPOINT_DIR)
+    dataset_name = str(args.dataset).lower()
+    args.checkpoint_dir = str(HIST_CHECKPOINT_DIR / dataset_name)
     Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
     tensorboard_log_dir = Path(args.checkpoint_dir) / "log"
@@ -270,17 +271,14 @@ def main():
     writer = SummaryWriter(log_dir=str(tensorboard_log_dir))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    dataset_name = str(args.dataset).lower()
-    data_root = Path(args.data_root_highd if dataset_name == "highd" else args.data_root_ngsim)
-    train_path = str(data_root / "TrainSet.mat")
-    val_path = str(data_root / "ValSet.mat")
+    train_path = str(get_split_path(args, dataset_name, "Train"))
+    val_path = str(get_split_path(args, dataset_name, "Val"))
     print(f"[HistTrain] Dataset: {dataset_name}")
     print(f"[HistTrain] Train path: {train_path}")
     print(f"[HistTrain] Val path: {val_path}")
 
-    train_dataset = NgsimHistDataset(train_path, t_h=30, d_s=2)
-    val_dataset = NgsimHistDataset(val_path, t_h=30, d_s=2)
+    train_dataset = build_hist_dataset(train_path, dataset_name)
+    val_dataset = build_hist_dataset(val_path, dataset_name)
 
     train_loader = DataLoader(
         train_dataset,
@@ -335,8 +333,9 @@ def main():
             block_mask_start,
         )
         current_lr = optimizer.param_groups[0]["lr"]
+        to_m = meter_per_unit(dataset_name)
 
-        write_csv_log(log_csv_path, epoch + 1, train_stats, eval_stats, current_lr)
+        write_csv_log(log_csv_path, epoch + 1, train_stats, eval_stats, current_lr, to_m)
 
         writer.add_scalar("Loss/Train", train_stats["loss_total"], epoch + 1)
         writer.add_scalar("Loss/TrainXYUnknown", train_stats["loss_xy_unknown"], epoch + 1)
@@ -346,7 +345,7 @@ def main():
         writer.add_scalar("Loss/TrainAUnknown", train_stats["loss_a_unknown"], epoch + 1)
         writer.add_scalar("Loss/TrainAKnown", train_stats["loss_a_known"], epoch + 1)
         writer.add_scalar("Eval/Loss", eval_stats["loss"], epoch + 1)
-        writer.add_scalar("Eval/MaskedADE_ft", eval_stats["masked_ade_ft"], epoch + 1)
+        writer.add_scalar("Eval/MaskedADE_m", eval_stats["masked_ade_ft"] * to_m, epoch + 1)
 
         print(
             f"Epoch {epoch + 1}/{args.num_epochs} | "
@@ -360,7 +359,7 @@ def main():
             f"mask_ratio={mask_ratio:.2f} | "
             f"rand_ratio={random_mask_ratio:.2f} | "
             f"val_loss={eval_stats['loss']:.6f} | "
-            f"mask_ade={eval_stats['masked_ade_ft']:.4f}ft"
+            f"mask_ade={eval_stats['masked_ade_ft'] * to_m:.4f}m"
         )
 
         scheduler.step()

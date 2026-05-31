@@ -4,9 +4,10 @@ def get_args_parser():
     parser = argparse.ArgumentParser("Set diffusion predicter", add_help=False)
 
     # Data
-    parser.add_argument("--dataset", default="ngsim", type=str, choices=["ngsim", "highd"])
+    parser.add_argument("--dataset", default="ngsim", type=str, choices=["ngsim", "highd", "round"])
     parser.add_argument("--data_root_ngsim", default="/mnt/datasets/ngsimdata", type=str)
     parser.add_argument("--data_root_highd", default="/mnt/datasets/highDdata", type=str)
+    parser.add_argument("--data_root_round", default="/mnt/datasets/round", type=str)
 
     # Train runtime
     parser.add_argument("--batch_size", default=512, type=int)

@@ -16,13 +16,13 @@ from method_diffusion.run.evaluate import (
     prepare_input_data as prepare_hist_input_data,
 )
 from method_diffusion.run.evaluate_fut import (
-    METER_PER_FOOT,
     build_test_loader,
     load_checkpoint as load_fut_checkpoint,
     print_metrics,
 )
 from method_diffusion.run.train_fut import prepare_input_data
 from method_diffusion.run.train_joint import JOINT_FUT_CHECKPOINT_DIR, JOINT_HIST_CHECKPOINT_DIR
+from method_diffusion.dataset.build import meter_per_unit
 from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_closest_prediction
 from method_diffusion.utils.visualization import visualize_scene_prediction
 
@@ -31,22 +31,25 @@ def get_eval_args():
     return get_args_parser().parse_args()
 
 
-def resolve_hist_checkpoint_dir(resume_hist):
+def resolve_hist_checkpoint_dir(resume_hist, dataset_name):
     resume_path = Path(str(resume_hist))
     if resume_path.exists():
         return resume_path.parent
 
-    for checkpoint_dir in [JOINT_HIST_CHECKPOINT_DIR, HIST_CHECKPOINT_DIR]:
-        if (checkpoint_dir / "checkpoint_best.pth").exists():
-            return checkpoint_dir
-    return HIST_CHECKPOINT_DIR
+    for base_dir in [JOINT_HIST_CHECKPOINT_DIR, HIST_CHECKPOINT_DIR]:
+        candidate = base_dir / dataset_name / "checkpoint_best.pth"
+        if candidate.exists():
+            return candidate.parent
+        if (base_dir / "checkpoint_best.pth").exists():
+            return base_dir
+    return HIST_CHECKPOINT_DIR / dataset_name
 
 
 @torch.no_grad()
-def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enable_eval_vis, mask_ratio, random_mask_ratio, block_mask_start):
+def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enable_eval_vis, mask_ratio, random_mask_ratio, block_mask_start, metric_meter_per_unit):
     model_hist.eval()
     model_fut.eval()
-    metrics = TrajectoryMetrics(model_fut.T)
+    metrics = TrajectoryMetrics(model_fut.T, meter_per_unit=metric_meter_per_unit)
     k_samples = max(1, int(fut_k))
     eval_name = f"Joint Fut ClosestGT-RMSE@{k_samples}" if k_samples > 1 else "Joint Fut single-mode"
 
@@ -85,7 +88,7 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enab
                 valid_mask=(op_mask[..., 0] > 0.5).float(),
                 pred_all=all_preds,
                 pred_best_idx=best_idx,
-                meter_per_foot=METER_PER_FOOT,
+                meter_per_foot=metric_meter_per_unit,
                 title="Joint Hist Reconstruction + Future Prediction",
                 highlight_label="Best",
                 hist_masked=hist_masked,
@@ -95,12 +98,13 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enab
         metrics.update(pred_fut, fut, op_mask)
         summary = metrics.summary()
         last_idx = min(model_fut.T, len(summary["rmse_per_step_m"])) - 1
+        last_sec = int(model_fut.T * 0.2)
         pbar.set_postfix({
-            "ade_5s": f"{summary['ade_per_step_m'][last_idx]:.4f}",
-            "fde_5s": f"{summary['fde_per_step_m'][last_idx]:.4f}",
-            "rmse_5s": f"{summary['rmse_per_step_m'][last_idx]:.4f}",
-            "theta_5s": f"{summary['theta_mae_per_step_deg'][last_idx]:.4f}",
-            "v_5s": f"{summary['v_mae_per_step_mps'][last_idx]:.4f}",
+            f"ade_{last_sec}s": f"{summary['ade_per_step_m'][last_idx]:.4f}",
+            f"fde_{last_sec}s": f"{summary['fde_per_step_m'][last_idx]:.4f}",
+            f"rmse_{last_sec}s": f"{summary['rmse_per_step_m'][last_idx]:.4f}",
+            f"theta_{last_sec}s": f"{summary['theta_mae_per_step_deg'][last_idx]:.4f}",
+            f"v_{last_sec}s": f"{summary['v_mae_per_step_mps'][last_idx]:.4f}",
         })
 
         if batch_idx % 100 == 0:
@@ -114,8 +118,9 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enab
 def main():
     args = get_eval_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    hist_checkpoint_dir = resolve_hist_checkpoint_dir(args.resume_hist)
-    fut_checkpoint_dir = JOINT_FUT_CHECKPOINT_DIR
+    dataset_name = str(args.dataset).strip().lower()
+    hist_checkpoint_dir = resolve_hist_checkpoint_dir(args.resume_hist, dataset_name)
+    fut_checkpoint_dir = JOINT_FUT_CHECKPOINT_DIR / dataset_name
 
     print(f"[JointEval] Device: {device}")
     print(f"[JointEval] Hist checkpoint dir: {hist_checkpoint_dir}")
@@ -138,6 +143,7 @@ def main():
         mask_ratio=max(0.0, min(1.0, float(args.mask_prob))),
         random_mask_ratio=max(0.0, min(1.0, float(args.random_mask_ratio))),
         block_mask_start=int(args.block_mask_start) > 0,
+        metric_meter_per_unit=meter_per_unit(args.dataset),
     )
 
 

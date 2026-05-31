@@ -13,12 +13,11 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.config import get_args_parser
-from method_diffusion.dataset.ngsim_dataset import NgsimDataset
+from method_diffusion.dataset.build import build_trajectory_dataset, get_split_path, meter_per_unit
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.run.train_fut import (
     FUT_CHECKPOINT_DIR,
     LOSS_STAT_KEYS,
-    METER_PER_FOOT,
     init_csv_log,
     load_checkpoint,
     print_eval_summary,
@@ -132,7 +131,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, device, epoch, feature_dim, rank):
+def evaluate(model, dataloader, device, epoch, feature_dim, rank, metric_meter_per_unit):
     fut_model = model.module if hasattr(model, "module") else model
     model.eval()
 
@@ -166,16 +165,16 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
             all_preds = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
             pred_fut = all_preds.squeeze(1)
         eval_rmse, eval_ade, eval_fde = compute_batch_metric(pred_fut, fut, op_mask)
-        eval_theta_deg, eval_v_mps = compute_batch_kinematic_metrics(pred_fut, fut, op_mask, meter_per_unit=METER_PER_FOOT)
-        rmse_5s_idx = min(24, pred_fut.size(1) - 1, fut.size(1) - 1)
+        eval_theta_deg, eval_v_mps = compute_batch_kinematic_metrics(pred_fut, fut, op_mask, meter_per_unit=metric_meter_per_unit)
+        rmse_5s_idx = pred_fut.size(1) - 1  # last valid future step
         final_valid_mask = (op_mask[:, rmse_5s_idx, 0] > 0.5).float()
         final_diff = pred_fut[:, rmse_5s_idx, :2] - fut[:, rmse_5s_idx, :2]
         final_dist_sq = torch.sum(final_diff.square(), dim=-1)
         total_rmse_5s_se += float((final_dist_sq * final_valid_mask).sum().item())
         total_rmse_5s_count += float(final_valid_mask.sum().item())
-        eval_rmse = float(eval_rmse.item()) * METER_PER_FOOT
-        eval_ade = float(eval_ade.item()) * METER_PER_FOOT
-        eval_fde = float(eval_fde.item()) * METER_PER_FOOT
+        eval_rmse = float(eval_rmse.item()) * metric_meter_per_unit
+        eval_ade = float(eval_ade.item()) * metric_meter_per_unit
+        eval_fde = float(eval_fde.item()) * metric_meter_per_unit
         eval_theta_deg = float(eval_theta_deg.item())
         eval_v_mps = float(eval_v_mps.item())
 
@@ -192,7 +191,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
                     "avg_rmse_m": f"{(total_rmse / num_batches):.4f}",
                     "avg_ade_m": f"{(total_ade / num_batches):.4f}",
                     "avg_fde_m": f"{(total_fde / num_batches):.4f}",
-                    "rmse_5s_m": f"{(total_rmse_5s_se / max(total_rmse_5s_count, 1e-6)) ** 0.5 * METER_PER_FOOT:.4f}",
+                    "rmse_5s_m": f"{(total_rmse_5s_se / max(total_rmse_5s_count, 1e-6)) ** 0.5 * metric_meter_per_unit:.4f}",
                     "avg_theta_deg": f"{(total_theta_deg / num_batches):.4f}",
                     "avg_v_mps": f"{(total_v_mps / num_batches):.4f}",
                 }
@@ -216,7 +215,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
     model.train()
 
     denom = max(int(stats[7].item()), 1)
-    eval_rmse_5s = (float(stats[3].item()) / max(float(stats[4].item()), 1e-6)) ** 0.5 * METER_PER_FOOT
+    eval_rmse_5s = (float(stats[3].item()) / max(float(stats[4].item()), 1e-6)) ** 0.5 * metric_meter_per_unit
     return (
         float(stats[0].item()) / denom,
         float(stats[1].item()) / denom,
@@ -230,7 +229,8 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank):
 def main():
     rank, local_rank, world_size, device = setup_ddp()
     args = get_args_parser().parse_args()
-    checkpoint_dir = FUT_CHECKPOINT_DIR
+    dataset_name = str(args.dataset).lower()
+    checkpoint_dir = FUT_CHECKPOINT_DIR / dataset_name
 
     writer = None
     log_csv_path = None
@@ -241,29 +241,23 @@ def main():
         log_csv_path = tensorboard_log_dir / "train_log.csv"
         init_csv_log(log_csv_path)
         writer = SummaryWriter(log_dir=str(tensorboard_log_dir))
-
-    dataset_name = str(args.dataset).lower()
-    data_root = Path(args.data_root_highd if dataset_name == "highd" else args.data_root_ngsim)
-    train_path = str(data_root / "TrainSet.mat")
-    val_path = str(data_root / "ValSet.mat")
+    train_path = str(get_split_path(args, dataset_name, "Train"))
+    val_path = str(get_split_path(args, dataset_name, "Val"))
+    metric_meter_per_unit = meter_per_unit(dataset_name)
     if is_main_process(rank):
         print(f"[DDP FutTrain] Dataset: {dataset_name}")
         print(f"[DDP FutTrain] Train path: {train_path}")
         print(f"[DDP FutTrain] Val path: {val_path}")
 
-    train_dataset = NgsimDataset(
+    train_dataset = build_trajectory_dataset(
         train_path,
-        t_h=30,
-        t_f=50,
-        d_s=2,
+        dataset_name,
         enc_size=args.encoder_input_dim,
         feature_dim=args.feature_dim,
     )
-    val_dataset = NgsimDataset(
+    val_dataset = build_trajectory_dataset(
         val_path,
-        t_h=30,
-        t_f=50,
-        d_s=2,
+        dataset_name,
         enc_size=args.encoder_input_dim,
         feature_dim=args.feature_dim,
     )
@@ -312,7 +306,8 @@ def main():
         train_sampler.set_epoch(epoch)
 
         train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim, rank)
-        eval_rmse, eval_ade, eval_fde, eval_rmse_5s, eval_theta_deg, eval_v_mps = evaluate(model, val_loader, device, epoch + 1, args.feature_dim, rank)
+        eval_rmse, eval_ade, eval_fde, eval_rmse_5s, eval_theta_deg, eval_v_mps = evaluate(
+            model, val_loader, device, epoch + 1, args.feature_dim, rank, metric_meter_per_unit)
         selection_score = float(eval_rmse)
         current_lr = optimizer.param_groups[0]["lr"]
 

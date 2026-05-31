@@ -1,27 +1,6 @@
-import inspect
-
 import torch
 
-from method_diffusion.dataset.ngsim_dataset import NgsimDataset
 from method_diffusion.utils.mask_util import mixed_mask
-
-
-def build_ngsim_dataset(mat_path, args):
-    """按数据集构造函数签名过滤参数，避免不同版本接口不兼容。"""
-    dataset_kwargs = {
-        "t_h": 30,
-        "t_f": 50,
-        "d_s": 2,
-        "enc_size": args.encoder_input_dim,
-        "feature_dim": args.feature_dim,
-        "future_only": True,
-    }
-    sig = inspect.signature(NgsimDataset.__init__)
-    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-    if has_var_kw:
-        return NgsimDataset(mat_path, **dataset_kwargs)
-    filtered = {k: v for k, v in dataset_kwargs.items() if k in sig.parameters}
-    return NgsimDataset(mat_path, **filtered)
 
 
 def build_hist_mask(hist, mask_ratio=0.4, random_mask_ratio=0.7, block_mask_start=False):

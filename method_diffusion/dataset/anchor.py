@@ -7,35 +7,46 @@ from sklearn.cluster import KMeans
 from tqdm import tqdm
 
 from method_diffusion.dataset.future_features import build_anchor_xy_theta_v
-from method_diffusion.dataset.ngsim_dataset import NgsimDataset
+from method_diffusion.dataset.build import build_trajectory_dataset, get_split_path, get_time_params, meter_per_unit
 
 
 def get_args():
     parser = argparse.ArgumentParser("Anchor tools")
-    parser.add_argument("--dataset", default="ngsim", type=str, choices=["ngsim", "highd"])
+    parser.add_argument("--dataset", default="ngsim", type=str, choices=["ngsim", "highd", "round"])
     parser.add_argument("--data_root_ngsim", default="/mnt/datasets/ngsimdata", type=str)
     parser.add_argument("--data_root_highd", default="/mnt/datasets/highDdata", type=str)
+    parser.add_argument("--data_root_round", default="/mnt/datasets/round", type=str)
     parser.add_argument("--hist_length", default=16, type=int)
     parser.add_argument("--pred_length", default=25, type=int)
-    parser.add_argument("--anchor_k", default=12, type=int, help="anchor 个数，即 KMeans 聚类数")
+    parser.add_argument("--anchor_k", default=9, type=int, help="anchor 个数，即 KMeans 聚类数")
     parser.add_argument("--anchor_kmeans_random_state", default=42, type=int, help="KMeans 随机种子")
     parser.add_argument("--anchor_kmeans_n_init", default=10, type=int, help="KMeans 重启次数")
     return parser.parse_args()
 
 
 def build_anchor_dataset(args):
-    if args.dataset == "ngsim":
-        train_path = Path(args.data_root_ngsim) / "TrainSet.mat"
-    else:
-        train_path = Path(args.data_root_highd) / "TrainSet.mat"
+    train_path = get_split_path(args, args.dataset, "Train")
+    t_h, t_f, d_s, fut_steps = get_time_params(args.dataset)
 
-    print(f"Loading dataset from {train_path}...")
-    return NgsimDataset(
+    print(f"Loading dataset from {train_path} (t_h={t_h}, t_f={t_f})...")
+    return build_trajectory_dataset(
         str(train_path),
-        t_h=(args.hist_length - 1) * 2,
-        t_f=args.pred_length * 2,
-        d_s=2,
+        args.dataset,
+        t_h=t_h,
+        t_f=t_f,
+        d_s=d_s,
     )
+
+def anchor_time_pairs(fut_steps):
+    """按未来步数生成 (label, index) 对。dt=0.2s/步。"""
+    if fut_steps >= 25:
+        return [("1s", 4), ("2s", 9), ("3s", 14), ("4s", 19), ("5s", 24)]
+    pairs = []
+    for t_sec in (1, 2, 3, 4):
+        idx = int(t_sec / 0.2) - 1
+        if idx < fut_steps:
+            pairs.append((f"{t_sec}s", idx))
+    return pairs
 
 
 def get_save_paths(args):
@@ -74,15 +85,16 @@ def visualize_anchors(anchor, vis_path):
 
 def generate_anchors(args):
     dataset = build_anchor_dataset(args)
+    _, _, d_s, fut_steps = get_time_params(args.dataset)
     all_futures_xy = []
 
-    print("Collecting trajectories...")
+    print(f"Collecting trajectories (target {fut_steps} steps)...")
     for i in tqdm(range(len(dataset))):
         ds_id = int(dataset.D[i, 0])
         veh_id = int(dataset.D[i, 1])
         t = dataset.D[i, 2]
         fut = dataset.getFuture(veh_id, t, ds_id)
-        if len(fut) == args.pred_length:
+        if len(fut) == fut_steps:
             all_futures_xy.append(fut[:, :2].reshape(-1))
 
     all_futures_xy = np.stack(all_futures_xy).astype(np.float64)
@@ -95,11 +107,11 @@ def generate_anchors(args):
     )
     kmeans.fit(all_futures_xy)
 
-    anchor_xy = kmeans.cluster_centers_.reshape(args.anchor_k, args.pred_length, 2).astype(np.float32, copy=False)
-    anchor = torch.from_numpy(build_anchor_xy_theta_v(anchor_xy, d_s=2)).float()
+    anchor_xy = kmeans.cluster_centers_.reshape(args.anchor_k, fut_steps, 2).astype(np.float32, copy=False)
+    anchor = torch.from_numpy(build_anchor_xy_theta_v(anchor_xy, d_s=d_s)).float()
     anchor_path, _ = get_save_paths(args)
     torch.save(anchor, anchor_path)
-    print(f"Anchors saved to {anchor_path}")
+    print(f"Anchors saved to {anchor_path} (shape {anchor.shape})")
     return anchor
 
 
@@ -109,10 +121,12 @@ def evaluate_anchors(args, anchor):
 
     dataset = build_anchor_dataset(args)
     anchor = np.asarray(anchor, dtype=np.float32)
+    _, _, _, fut_steps = get_time_params(args.dataset)
+    pred_len = int(anchor.shape[1])
 
-    total_de = np.zeros(args.pred_length, dtype=np.float64)
-    total_coord_se = np.zeros(args.pred_length, dtype=np.float64)
-    total_counts = np.zeros(args.pred_length, dtype=np.float64)
+    total_de = np.zeros(pred_len, dtype=np.float64)
+    total_coord_se = np.zeros(pred_len, dtype=np.float64)
+    total_counts = np.zeros(pred_len, dtype=np.float64)
 
     print("Evaluating anchors...")
     for i in tqdm(range(len(dataset))):
@@ -120,7 +134,7 @@ def evaluate_anchors(args, anchor):
         veh_id = int(dataset.D[i, 1])
         t = dataset.D[i, 2]
         fut = dataset.getFuture(veh_id, t, ds_id)
-        if len(fut) != args.pred_length:
+        if len(fut) != pred_len:
             continue
 
         fut_xy = fut[:, :2].astype(np.float32, copy=False)
@@ -140,13 +154,14 @@ def evaluate_anchors(args, anchor):
     counts = np.clip(total_counts, a_min=1.0, a_max=None)
     mean_ade = total_de.sum() / counts.sum()
     mean_fde = total_de[-1] / counts[-1]
+    to_m = meter_per_unit(args.dataset)
     print(
-        f"Anchor Eval | ADE: {mean_ade * 0.3048:.4f} m | "
-        f"FDE: {mean_fde * 0.3048:.4f} m"
+        f"Anchor Eval | ADE: {mean_ade * to_m:.4f} m | "
+        f"FDE: {mean_fde * to_m:.4f} m"
     )
 
-    rmse_per_step_m = np.sqrt(total_coord_se / counts) * 0.3048
-    time_pairs = [("1s", 4), ("2s", 9), ("3s", 14), ("4s", 19), ("5s", 24)]
+    rmse_per_step_m = np.sqrt(total_coord_se / counts) * to_m
+    time_pairs = anchor_time_pairs(pred_len)
     rmse_items = []
     for label, idx in time_pairs:
         if idx < len(rmse_per_step_m):
