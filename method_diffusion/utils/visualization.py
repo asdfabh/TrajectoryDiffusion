@@ -178,7 +178,7 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
                                 pred_all=None, pred_best_idx=None, future_mask=None,
                                 batch_idx=0, metrics=None, input_unit="m",
                                 title=None, highlight_label="Best",
-                                hist_masked=None, hist_reconstructed=None):
+                                hist_masked=None, hist_reconstructed=None, dataset_name=None):
     """绘制 fut model 最终预测结果。"""
 
     def safe_get_batch(data, b_idx, batch_ndim=3):
@@ -308,20 +308,20 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
 
     nbrs_vis = reconstruct_nbrs_from_mask(hist_nbrs, temporal_mask, idx)
 
-    # 绘图窗口尺寸：默认16：9，展示16：4
-    fig, ax = plt.subplots(figsize=(16, 4))
-    # fig, ax = plt.subplots(figsize=(16, 9))
+    is_round = str(dataset_name).strip().lower() == "round"
+    fig, ax = plt.subplots(figsize=(16, 16) if is_round else (16, 4))
     lane_lines = (-5.4864, -1.8288, 1.8288, 5.4864)
 
-    for lane_y in lane_lines:
-        ax.axhline(
-            y=lane_y,
-            color='gray',
-            linestyle='--',
-            linewidth=1.0,
-            alpha=0.7,
-            zorder=0,
-        )
+    if not is_round:
+        for lane_y in lane_lines:
+            ax.axhline(
+                y=lane_y,
+                color='gray',
+                linestyle='--',
+                linewidth=1.0,
+                alpha=0.7,
+                zorder=0,
+            )
 
     nbr_color = '#B8860B'
     ego_color = '#1F77B4'
@@ -474,9 +474,13 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
         loc='best',
         handler_map={tuple: HandlerTuple(ndivide=None)},
     )
-    ax.grid(False)
-    ax.set_aspect('auto')
-    ax.set_ylim(-5.4864, 5.4864)
+    if is_round:
+        ax.grid(True, linestyle='--', linewidth=0.6, alpha=0.35)
+        ax.set_aspect('auto')
+    else:
+        ax.grid(False)
+        ax.set_aspect('auto')
+        ax.set_ylim(-5.4864, 5.4864)
     plt.tight_layout()
     fig.canvas.draw()
     for nbr_x, nbr_y in nbr_vehicle_centers:
@@ -506,7 +510,7 @@ def visualize_scene_prediction(hist, hist_nbrs, temporal_mask, future, pred, val
                                pred_all=None, pred_best_idx=None,
                                batch_idx=0, title=None,
                                highlight_label="Best", hist_masked=None,
-                               hist_reconstructed=None):
+                               hist_reconstructed=None, dataset_name=None):
     """统一场景可视化：hist、mask、重建、周车、future 与预测结果。"""
     vis_metrics = _compute_vis_metrics(
         pred_traj=pred[batch_idx],
@@ -536,4 +540,5 @@ def visualize_scene_prediction(hist, hist_nbrs, temporal_mask, future, pred, val
         highlight_label=highlight_label,
         hist_masked=hist_masked,
         hist_reconstructed=hist_reconstructed,
+        dataset_name=dataset_name,
     )

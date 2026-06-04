@@ -4,7 +4,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser("Set diffusion predicter", add_help=False)
 
     # Data
-    parser.add_argument("--dataset", default="highd", type=str, choices=["ngsim", "highd", "round"])
+    parser.add_argument("--dataset", default="round", type=str, choices=["ngsim", "highd", "round"])
     parser.add_argument("--data_root_ngsim", default="/mnt/datasets/ngsimdata", type=str)
     parser.add_argument("--data_root_highd", default="/mnt/datasets/highDdata", type=str)
     parser.add_argument("--data_root_round", default="/mnt/datasets/round", type=str)
@@ -68,7 +68,7 @@ def get_args_parser():
     parser.add_argument("--fut_cascade_final_weight", default=1.0, type=float)
 
     # Fut visualization
-    parser.add_argument("--fut_enable_eval_vis", default=1, type=int)
+    parser.add_argument("--fut_enable_eval_vis", default=0, type=int)
     parser.add_argument("--hist_enable_train_vis", default=0, type=int)
     parser.add_argument("--hist_enable_eval_vis", default=0, type=int)
 

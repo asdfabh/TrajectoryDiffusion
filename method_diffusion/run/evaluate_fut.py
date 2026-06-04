@@ -109,7 +109,7 @@ def build_test_loader(args):
 
 # 执行 TestSet 评估并打印周期性与最终指标。
 @torch.no_grad()
-def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis):
+def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis, dataset_name=None):
     model.eval()
     metrics = TrajectoryMetrics(model.T)
     k_samples = max(1, int(fut_k))
@@ -136,6 +136,7 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis):
                     batch_idx=0,
                     title="Future Prediction",
                     highlight_label="Best",
+                    dataset_name=dataset_name,
                 )
         else:
             all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
@@ -174,7 +175,7 @@ def main():
     test_loader = build_test_loader(args)
     model = DiffusionFut(args).to(device)
     load_checkpoint(model, args.resume_fut, args.checkpoint_dir, device)
-    evaluate(model, test_loader, device, args.feature_dim, args.fut_k, enable_eval_vis=int(args.fut_enable_eval_vis) > 0)
+    evaluate(model, test_loader, device, args.feature_dim, args.fut_k, enable_eval_vis=int(args.fut_enable_eval_vis) > 0, dataset_name=args.dataset)
 
 
 if __name__ == "__main__":

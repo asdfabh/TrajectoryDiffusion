@@ -45,7 +45,7 @@ def resolve_hist_checkpoint_dir(resume_hist, dataset_name):
 
 
 @torch.no_grad()
-def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enable_eval_vis, mask_ratio, random_mask_ratio, block_mask_start):
+def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enable_eval_vis, mask_ratio, random_mask_ratio, block_mask_start, dataset_name=None):
     model_hist.eval()
     model_fut.eval()
     metrics = TrajectoryMetrics(model_fut.T)
@@ -91,6 +91,7 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enab
                 highlight_label="Best",
                 hist_masked=hist_masked,
                 hist_reconstructed=pred_hist,
+                dataset_name=dataset_name,
             )
 
         metrics.update(pred_fut, fut, op_mask)
@@ -141,6 +142,7 @@ def main():
         mask_ratio=max(0.0, min(1.0, float(args.mask_prob))),
         random_mask_ratio=max(0.0, min(1.0, float(args.random_mask_ratio))),
         block_mask_start=int(args.block_mask_start) > 0,
+        dataset_name=args.dataset,
     )
 
 
