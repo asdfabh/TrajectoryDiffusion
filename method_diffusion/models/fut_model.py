@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch import nn
 from diffusers.schedulers import DDIMScheduler
 
-from method_diffusion.dataset.build import get_time_params
+from method_diffusion.dataset.build import get_raw_dt, get_time_params
 from method_diffusion.models import dit_fut as dit
 from method_diffusion.models.hist_encoder import HistEncoder
 from method_diffusion.utils.fut_utils import build_eval_timestep_pairs, ddim_step, wrap_angle
@@ -30,6 +30,7 @@ class DiffusionFut(nn.Module):
         self.time_embedding_size = int(args.time_embedding_size_fut)
         t_h, _, d_s, fut_steps = get_time_params(self.dataset_name)
         self.T = fut_steps
+        self.fut_dt = get_raw_dt(self.dataset_name) * int(d_s)
         self.fut_k = max(1, int(args.fut_k))
         args.hist_length = t_h // d_s + 1 # (RounD=11, 其他=16)
 
@@ -70,14 +71,14 @@ class DiffusionFut(nn.Module):
 
         # 仅对 Ego future 做归一化，当前 future 定义为 [x, y, theta, v]。
         if self.dataset_name == "ngsim":
-            self.register_buffer("fut_mean", torch.tensor([-0.018481300419643788, 19.901456979887765, 1.534715060900053, 7.686064458330523], dtype=torch.float32), persistent=False)
-            self.register_buffer("fut_std", torch.tensor([0.39658419502216957, 17.144594402690345, 0.2643295194116367, 4.498907161934344], dtype=torch.float32), persistent=False)
+            self.register_buffer("fut_mean", torch.tensor([-0.018481300192213692, 19.901456733555143, 1.5347150608999751, 7.688126783170447], dtype=torch.float32), persistent=False)
+            self.register_buffer("fut_std", torch.tensor([0.3965841901361471, 17.14459418994866, 0.2643295194022676, 4.496338420923352], dtype=torch.float32), persistent=False)
         elif self.dataset_name == "highd":
-            self.register_buffer("fut_mean", torch.tensor([0.01993634166889612, 67.40101141151132, 1.5697229208053323, 25.932893225547133], dtype=torch.float32), persistent=False)
-            self.register_buffer("fut_std", torch.tensor([0.41100463701171336, 43.3330928936307, 0.04856180398145771, 7.371995854137716], dtype=torch.float32), persistent=False)
+            self.register_buffer("fut_mean", torch.tensor([0.019936341418358722, 67.40101057744636, 1.5697229208053853, 25.932254791953657], dtype=torch.float32), persistent=False)
+            self.register_buffer("fut_std", torch.tensor([0.4110046317788714, 43.33309235856911, 0.048561804002511096, 7.373680213426009], dtype=torch.float32), persistent=False)
         elif self.dataset_name == "round":
-            self.register_buffer("fut_mean", torch.tensor([0.7595664185247786, 5.124497475239467, 1.2556389840836275, 6.34337379345497], dtype=torch.float32), persistent=False)
-            self.register_buffer("fut_std", torch.tensor([1.1549527518280254, 3.789278215200064, 0.5711560130982952, 2.7548072256166347], dtype=torch.float32), persistent=False)
+            self.register_buffer("fut_mean", torch.tensor([4.144265328735691, 10.315414212723727, 0.9530915750767849, 5.86565709902721], dtype=torch.float32), persistent=False)
+            self.register_buffer("fut_std", torch.tensor([5.759155224937898, 7.615898744195818, 0.6706842296092105, 2.875255178810614], dtype=torch.float32), persistent=False)
         else:
             raise ValueError(f"Unsupported dataset '{self.dataset_name}' for fut normalization. Supported: highd, ngsim, round")
 
@@ -87,36 +88,35 @@ class DiffusionFut(nn.Module):
 
     def computeKinematicLoss(self, pred_phys, valid_mask, fut_dt):
         loss_fn = F.l1_loss # F.smooth_l1_loss
-        x = pred_phys[..., 0]
-        y = pred_phys[..., 1]
+        xy = pred_phys[..., :2]
         theta = pred_phys[..., 2]
         v = pred_phys[..., 3]
 
-        x_kin_next = x[:, :-1] + v[:, :-1] * torch.cos(theta[:, :-1]) * fut_dt
-        y_kin_next = y[:, :-1] + v[:, :-1] * torch.sin(theta[:, :-1]) * fut_dt
-        rx = x[:, 1:] - x_kin_next
-        ry = y[:, 1:] - y_kin_next
+        origin = xy.new_zeros(xy.size(0), 1, 2)
+        xy_prev = torch.cat([origin, xy[:, :-1]], dim=1)
+        xy_kin = xy_prev + torch.stack([
+            v * torch.cos(theta) * fut_dt,
+            v * torch.sin(theta) * fut_dt,
+        ], dim=-1)
+        residual = xy - xy_kin
 
-        valid_pair = valid_mask[:, :-1] * valid_mask[:, 1:]
-        valid_pair_sum = valid_pair.sum()
-        if valid_pair_sum.item() <= 0:
+        valid_sum = valid_mask.sum()
+        if valid_sum.item() <= 0:
             zero = pred_phys.new_zeros(())
             return zero, zero
 
-        kin_pred = torch.stack([rx, ry], dim=-1)
-        kin_target = torch.zeros_like(kin_pred)
-        loss_map = loss_fn(kin_pred, kin_target, reduction="none").mean(dim=-1)
-        loss_kin = (loss_map * valid_pair).sum() / (valid_pair_sum + 1e-6)
-        kin_res = torch.sqrt(rx.square() + ry.square() + 1e-12)
-        kin_res_mean = (kin_res * valid_pair).sum() / (valid_pair_sum + 1e-6)
+        kin_target = torch.zeros_like(residual)
+        loss_map = loss_fn(residual, kin_target, reduction="none").mean(dim=-1)
+        loss_kin = (loss_map * valid_mask).sum() / (valid_sum + 1e-6)
+        kin_res = torch.sqrt(residual.square().sum(dim=-1) + 1e-12)
+        kin_res_mean = (kin_res * valid_mask).sum() / (valid_sum + 1e-6)
         return loss_kin, kin_res_mean
 
     def computeLoss(self, pred_phys, target_phys, valid_mask):
         lambda_xy = 1.0
-        lambda_theta = 0.0
-        lambda_v = 0.0
+        lambda_theta = 0.1
+        lambda_v = 0.1
         lambda_kin = 0.10
-        fut_dt = 0.2
         loss_fn = F.l1_loss
 
         valid_sum = valid_mask.sum(dim=1) + 1e-6
@@ -128,10 +128,11 @@ class DiffusionFut(nn.Module):
         theta_loss_map = loss_fn(theta_diff, torch.zeros_like(theta_diff), reduction="none")
         loss_theta = ((theta_loss_map * valid_mask).sum(dim=1) / valid_sum).mean()
 
-        v_loss_map = loss_fn(pred_phys[..., 3], target_phys[..., 3], reduction="none")
+        v_scale = self.fut_std.to(device=pred_phys.device, dtype=pred_phys.dtype)[3].clamp(min=1e-6)
+        v_loss_map = loss_fn((pred_phys[..., 3] - target_phys[..., 3]) / v_scale, torch.zeros_like(pred_phys[..., 3]), reduction="none")
         loss_v = ((v_loss_map * valid_mask).sum(dim=1) / valid_sum).mean()
 
-        loss_kin, kin_res_mean = self.computeKinematicLoss(pred_phys, valid_mask, fut_dt)
+        loss_kin, kin_res_mean = self.computeKinematicLoss(pred_phys, valid_mask, self.fut_dt)
         loss_total = lambda_xy * loss_xy + lambda_theta * loss_theta + lambda_v * loss_v + lambda_kin * loss_kin
         logs = {
             "loss": loss_total.detach(),

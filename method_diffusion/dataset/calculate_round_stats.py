@@ -19,12 +19,12 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-from method_diffusion.dataset.build import get_time_params
-from method_diffusion.dataset.future_features import derive_theta_from_positions
+from method_diffusion.dataset.build import get_raw_dt, get_time_params
+from method_diffusion.dataset.future_features import build_xy_theta_v_from_positions
 
 
 # ---------------------------------------------------------------------------
-# 轻量 Dataset：仅提取 future [x,y,θ,v]、hist [x,y]、va [lon_vel,lat_vel]
+# 轻量 Dataset：仅提取 future [x,y,θ,v]、hist [x,y]、va [lon_vel,lon_acc]
 # 不做邻居搜索、不做网格编码、不做 lat/lon encoding
 # ---------------------------------------------------------------------------
 
@@ -32,14 +32,15 @@ class RounDStatsDataset(Dataset):
     """
     极简 RounD 数据访问器，对齐 NgsimFutureDataset 的轻量模式。
 
-    tracks 列: Frame(0), X(1), Y(2), Heading(3), LonVel(4), LatVel(5), ...
+    tracks 列: Frame(0), X(1), Y(2), Heading(3), LonVel(4), LatVel(5), LonAcc(6), ...
     输出 (fut, hist, va)，其中 fut 为 ego-frame [x, y, θ, v]。
     """
 
-    def __init__(self, mat_file, t_h=20, t_f=40, d_s=2):
+    def __init__(self, mat_file, t_h=50, t_f=100, d_s=5):
         self.t_h = int(t_h)
         self.t_f = int(t_f)
         self.d_s = int(d_s)
+        self.raw_dt = get_raw_dt("round")
         self.max_hist = t_h // d_s + 1  # 11
         self.max_fut = t_f // d_s       # 20
 
@@ -47,6 +48,7 @@ class RounDStatsDataset(Dataset):
         self.IDX_Y = 2
         self.IDX_HEADING = 3
         self.IDX_LON_VEL = 4
+        self.IDX_LON_ACC = 6
 
         self.D, self.T = self._load(mat_file)
         self._track_cache = {}
@@ -137,9 +139,7 @@ class RounDStatsDataset(Dataset):
             return None
 
         fut_xy = self._rotate_to_ego(fut_global, ego_pos, ego_heading)
-        theta = derive_theta_from_positions(fut_xy, np.zeros(2, dtype=np.float32))
-        speed = track[fut_start:fut_end:self.d_s, self.IDX_LON_VEL:self.IDX_LON_VEL + 1].astype(np.float32)
-        fut = np.concatenate([fut_xy, theta, speed], axis=1).astype(np.float32)
+        fut = build_xy_theta_v_from_positions(fut_xy, np.zeros(2, dtype=np.float32), self.d_s, track_dt=self.raw_dt)
 
         # --- hist: ego-frame [x, y] ---
         hist_start = max(0, frame_idx - self.t_h)
@@ -148,8 +148,9 @@ class RounDStatsDataset(Dataset):
             return None
         hist = self._rotate_to_ego(hist_global, ego_pos, ego_heading)
 
-        # --- va: [lon_vel, lat_vel] ---
-        va = track[hist_start:frame_idx + 1:self.d_s, self.IDX_LON_VEL:self.IDX_LON_VEL + 2].astype(np.float32)
+        # --- va: [lon_vel, lon_acc] ---
+        hist_track = track[hist_start:frame_idx + 1:self.d_s]
+        va = np.column_stack((hist_track[:, self.IDX_LON_VEL], hist_track[:, self.IDX_LON_ACC])).astype(np.float32)
         if len(va) < self.max_hist:
             return None
 

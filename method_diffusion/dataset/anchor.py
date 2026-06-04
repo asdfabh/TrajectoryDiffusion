@@ -7,7 +7,7 @@ from sklearn.cluster import KMeans
 from tqdm import tqdm
 
 from method_diffusion.dataset.future_features import build_anchor_xy_theta_v
-from method_diffusion.dataset.build import build_trajectory_dataset, get_split_path, get_time_params
+from method_diffusion.dataset.build import build_trajectory_dataset, get_raw_dt, get_split_path, get_time_params
 
 
 def get_args():
@@ -87,6 +87,7 @@ def visualize_anchors(anchor, vis_path):
 def generate_anchors(args):
     dataset = build_anchor_dataset(args)
     _, _, d_s, fut_steps = get_time_params(args.dataset)
+    raw_dt = get_raw_dt(args.dataset)
     all_futures_xy = []
 
     print(f"Collecting trajectories (target {fut_steps} steps)...")
@@ -111,7 +112,7 @@ def generate_anchors(args):
     kmeans.fit(all_futures_xy)
 
     anchor_xy = kmeans.cluster_centers_.reshape(args.anchor_k, fut_steps, 2).astype(np.float32, copy=False)
-    anchor = torch.from_numpy(build_anchor_xy_theta_v(anchor_xy, d_s=d_s)).float()
+    anchor = torch.from_numpy(build_anchor_xy_theta_v(anchor_xy, d_s=d_s, track_dt=raw_dt)).float()
     anchor_path, _ = get_save_paths(args)
     torch.save(anchor, anchor_path)
     print(f"Anchors saved to {anchor_path} (shape {anchor.shape})")

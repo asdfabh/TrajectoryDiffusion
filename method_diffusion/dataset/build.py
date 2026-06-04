@@ -8,13 +8,19 @@ from method_diffusion.dataset.round_dataset import RoundDataset, RoundHistDatase
 SUPPORTED_DATASETS = ("ngsim", "highd", "round")
 
 # 数据集默认时间参数: (t_h, t_f, d_s, fut_steps)
-#   t_h, t_f = 原始帧数 (0.1s/帧)
-#   d_s       = 降采样步长 (2 → 0.2s/步)
+#   t_h, t_f = 原始帧数
+#   d_s       = 降采样步长
 #   fut_steps = 模型输出的未来步数 (= t_f / d_s)
 _DATASET_TIME_PARAMS = {
     "ngsim":  (30, 50, 2, 25),
     "highd":  (30, 50, 2, 25),
-    "round":  (20, 40, 2, 20),
+    "round":  (50, 100, 5, 20),
+}
+
+_DATASET_RAW_DT = {
+    "ngsim": 0.1,
+    "highd": 0.1,
+    "round": 0.04,
 }
 
 
@@ -29,6 +35,11 @@ def normalize_dataset_name(dataset):
 def get_time_params(dataset):
     """返回 (t_h, t_f, d_s, fut_steps)。调用方可用 fut_steps 设置模型 T_f。"""
     return _DATASET_TIME_PARAMS[normalize_dataset_name(dataset)]
+
+
+def get_raw_dt(dataset):
+    """返回原始轨迹帧间隔，单位秒。"""
+    return _DATASET_RAW_DT[normalize_dataset_name(dataset)]
 
 
 def get_data_root(args, dataset):

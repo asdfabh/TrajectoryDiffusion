@@ -4,7 +4,7 @@ from torch.utils.data import Dataset
 import scipy.io as scp
 import h5py
 
-from method_diffusion.dataset.future_features import derive_theta_from_positions
+from method_diffusion.dataset.future_features import build_xy_theta_v_from_positions
 
 
 class RoundDataset(Dataset):
@@ -15,7 +15,7 @@ class RoundDataset(Dataset):
     history / neighbor 使用 ego 局部坐标，future 为 [x, y, theta, v]。
     """
 
-    def __init__(self, mat_file, t_h=20, t_f=40, d_s=2, enc_size=64, grid_size=(13, 3), feature_dim=4):
+    def __init__(self, mat_file, t_h=50, t_f=100, d_s=5, enc_size=64, grid_size=(13, 3), feature_dim=4):
         self.D, self.T = self._load_mat(mat_file)
         self.t_h = int(t_h)
         self.t_f = int(t_f)
@@ -23,6 +23,7 @@ class RoundDataset(Dataset):
         self.enc_size = int(enc_size)
         self.grid_size = grid_size
         self.feature_dim = int(feature_dim)
+        self.raw_dt = 0.04
         self.max_hist_len = self.t_h // self.d_s + 1
         self.max_fut_len = self.t_f // self.d_s if self.t_f > 0 else 0
 
@@ -31,6 +32,7 @@ class RoundDataset(Dataset):
         self.idx_y = 2
         self.idx_heading = 3
         self.idx_v = 4
+        self.idx_a = 6
         self.idx_lane = 8
         self.valid_indices = self._build_valid_indices()
 
@@ -173,9 +175,7 @@ class RoundDataset(Dataset):
             return np.empty((0, 4), dtype=np.float32)
 
         fut_xy = self.rotate_to_ego_frame(fut_global, ego_pos, ego_heading)
-        theta = derive_theta_from_positions(fut_xy, np.zeros(2, dtype=np.float32))
-        speed = track[stpt:enpt:self.d_s, self.idx_v:self.idx_v + 1].astype(np.float32, copy=False)
-        return np.concatenate([fut_xy, theta, speed], axis=1).astype(np.float32, copy=False)
+        return build_xy_theta_v_from_positions(fut_xy, np.zeros(2, dtype=np.float32), self.d_s, track_dt=self.raw_dt)
 
     def getVA(self, veh_id, t, ds_id):
         track = self._get_track(ds_id, veh_id)
@@ -186,7 +186,8 @@ class RoundDataset(Dataset):
             return np.empty((0, 2), dtype=np.float32)
 
         stpt = max(0, frame_idx - self.t_h)
-        va = track[stpt:frame_idx + 1:self.d_s, self.idx_v:self.idx_v + 2]
+        hist_track = track[stpt:frame_idx + 1:self.d_s]
+        va = np.column_stack((hist_track[:, self.idx_v], hist_track[:, self.idx_a]))
         if len(va) < self.max_hist_len:
             return np.empty((0, 2), dtype=np.float32)
         return va.astype(np.float32, copy=False)
@@ -401,7 +402,7 @@ class RoundDataset(Dataset):
 class RoundHistDataset(RoundDataset):
     """rounD history-only 数据集，输出对齐 NgsimHistDataset。"""
 
-    def __init__(self, mat_file, t_h=20, t_f=0, d_s=2, **kwargs):
+    def __init__(self, mat_file, t_h=50, t_f=0, d_s=5, **kwargs):
         super().__init__(mat_file, t_h=t_h, t_f=t_f, d_s=d_s, **kwargs)
 
     def __getitem__(self, idx):
