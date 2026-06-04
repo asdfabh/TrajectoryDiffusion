@@ -6,6 +6,9 @@ import scipy.io as scp
 from method_diffusion.dataset.future_features import build_future_xy_theta_v
 
 
+RAW_TO_METER = 0.3048
+
+
 # Dataset class for the dataset
 class NgsimDataset(Dataset):
 
@@ -19,6 +22,7 @@ class NgsimDataset(Dataset):
         self.enc_size = enc_size  # size of the grid cell
         self.feature_dim = feature_dim
         self.grid_size = grid_size  # size of social context grid
+        self.position_scale = RAW_TO_METER
         self.alltime = 0
         # self.count = 0
 
@@ -139,7 +143,7 @@ class NgsimDataset(Dataset):
 
             if len(hist) < self.t_h // self.d_s + 1:
                 return np.empty([0, 2])
-            return hist
+            return hist.astype(np.float32, copy=False) * self.position_scale
 
     # Helper function to get track history
     def getHistory(self, vehId, t, refVehId, dsId):
@@ -162,7 +166,7 @@ class NgsimDataset(Dataset):
                 hist = vehTrack[stpt:enpt:self.d_s, 1:3] - refPos
             if len(hist) < self.t_h // self.d_s + 1:
                 return np.empty([0, 2])
-            return hist
+            return hist.astype(np.float32, copy=False) * self.position_scale
 
     # Helper function to get track distance
     def getdistance(self, vehId, t, refVehId, dsId):
@@ -189,13 +193,19 @@ class NgsimDataset(Dataset):
 
             if len(hist) < self.t_h // self.d_s + 1:
                 return np.empty([0, 1])
-            return distance
+            return distance.astype(np.float32, copy=False) * self.position_scale
 
     # Helper function to get track future
     def getFuture(self, vehId, t, dsId):
         vehTrack = self.T[dsId - 1][vehId - 1].transpose()
         frame_idx = np.argwhere(vehTrack[:, 0] == t).item()
-        return build_future_xy_theta_v(vehTrack, frame_idx, self.t_f, self.d_s)
+        fut = build_future_xy_theta_v(vehTrack, frame_idx, self.t_f, self.d_s)
+        if len(fut) == 0:
+            return fut
+        fut = fut.astype(np.float32, copy=True)
+        fut[:, 0:2] *= self.position_scale
+        fut[:, 3:4] *= self.position_scale
+        return fut
 
     # Collate function for dataloader
     def collate_fn(self, samples):

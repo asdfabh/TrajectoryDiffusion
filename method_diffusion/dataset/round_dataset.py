@@ -32,6 +32,7 @@ class RoundDataset(Dataset):
         self.idx_heading = 3
         self.idx_v = 4
         self.idx_lane = 8
+        self.valid_indices = self._build_valid_indices()
 
     def _load_mat(self, mat_file):
         try:
@@ -60,7 +61,38 @@ class RoundDataset(Dataset):
         return traj, tracks
 
     def __len__(self):
-        return len(self.D)
+        return len(self.valid_indices)
+
+    def _build_valid_indices(self):
+        valid_indices = []
+        for idx in range(len(self.D)):
+            if self._is_valid_index(idx):
+                valid_indices.append(idx)
+        return np.asarray(valid_indices, dtype=np.int64)
+
+    def _is_valid_index(self, idx):
+        ds_id = int(self.D[idx, 0])
+        veh_id = int(self.D[idx, 1])
+        t = self.D[idx, 2]
+
+        track = self._get_track(ds_id, veh_id)
+        if track is None:
+            return False
+        frame_idx = self._find_frame_idx(track, t)
+        if frame_idx is None:
+            return False
+
+        hist_start = max(0, frame_idx - self.t_h)
+        hist_len = len(track[hist_start:frame_idx + 1:self.d_s])
+        if hist_len < self.max_hist_len:
+            return False
+
+        if self.max_fut_len == 0:
+            return True
+        fut_start = frame_idx + self.d_s
+        fut_end = min(len(track), frame_idx + self.t_f + 1)
+        fut_len = len(track[fut_start:fut_end:self.d_s])
+        return fut_len >= self.max_fut_len
 
     def _get_track(self, ds_id, veh_id):
         if veh_id <= 0 or self.T.shape[1] <= veh_id - 1:
@@ -270,11 +302,10 @@ class RoundDataset(Dataset):
         )
 
     def __getitem__(self, idx):
-        for offset in range(len(self.D)):
-            sample = self._build_sample((idx + offset) % len(self.D))
-            if sample is not None:
-                return sample
-        raise IndexError("No valid rounD samples found.")
+        sample = self._build_sample(int(self.valid_indices[idx]))
+        if sample is None:
+            raise IndexError(f"Invalid rounD sample after filtering: idx={idx}")
+        return sample
 
     def collate_fn(self, samples):
         nbr_batch_size = sum(len(sample[2]) for sample in samples)

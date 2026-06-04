@@ -70,14 +70,14 @@ class DiffusionFut(nn.Module):
 
         # 仅对 Ego future 做归一化，当前 future 定义为 [x, y, theta, v]。
         if self.dataset_name == "ngsim":
-            self.register_buffer("fut_mean", torch.tensor([-0.06063419, 65.293495, 1.5347151, 25.216747], dtype=torch.float32), persistent=False)
-            self.register_buffer("fut_std", torch.tensor([1.3011292, 56.24867, 0.26432952, 14.760194], dtype=torch.float32), persistent=False)
+            self.register_buffer("fut_mean", torch.tensor([-0.018481300419643788, 19.901456979887765, 1.534715060900053, 7.686064458330523], dtype=torch.float32), persistent=False)
+            self.register_buffer("fut_std", torch.tensor([0.39658419502216957, 17.144594402690345, 0.2643295194116367, 4.498907161934344], dtype=torch.float32), persistent=False)
         elif self.dataset_name == "highd":
-            self.register_buffer("fut_mean", torch.tensor([0.06540795, 221.13193, 1.5697229, 85.08167], dtype=torch.float32), persistent=False)
-            self.register_buffer("fut_std", torch.tensor([1.3484404, 142.16895, 0.048561804, 24.186338], dtype=torch.float32), persistent=False)
+            self.register_buffer("fut_mean", torch.tensor([0.01993634166889612, 67.40101141151132, 1.5697229208053323, 25.932893225547133], dtype=torch.float32), persistent=False)
+            self.register_buffer("fut_std", torch.tensor([0.41100463701171336, 43.3330928936307, 0.04856180398145771, 7.371995854137716], dtype=torch.float32), persistent=False)
         elif self.dataset_name == "round":
-            self.register_buffer("fut_mean", torch.tensor([1.184816403201482, 6.183393379855639, 1.203041719745027, 6.281713600887428], dtype=torch.float32), persistent=False)
-            self.register_buffer("fut_std", torch.tensor([1.699010782220082, 4.606644949752387, 0.5806019163455398, 2.7653540536338386], dtype=torch.float32), persistent=False)
+            self.register_buffer("fut_mean", torch.tensor([0.7595664185247786, 5.124497475239467, 1.2556389840836275, 6.34337379345497], dtype=torch.float32), persistent=False)
+            self.register_buffer("fut_std", torch.tensor([1.1549527518280254, 3.789278215200064, 0.5711560130982952, 2.7548072256166347], dtype=torch.float32), persistent=False)
         else:
             raise ValueError(f"Unsupported dataset '{self.dataset_name}' for fut normalization. Supported: highd, ngsim, round")
 
@@ -113,8 +113,8 @@ class DiffusionFut(nn.Module):
 
     def computeLoss(self, pred_phys, target_phys, valid_mask):
         lambda_xy = 1.0
-        lambda_theta = 0.05
-        lambda_v = 0.05
+        lambda_theta = 0.0
+        lambda_v = 0.0
         lambda_kin = 0.10
         fut_dt = 0.2
         loss_fn = F.l1_loss
@@ -158,7 +158,7 @@ class DiffusionFut(nn.Module):
         final_logs["loss_cascade_aux"] = weighted_aux_loss.detach()
         return total_loss, final_logs
 
-    # 训练入口：Index 与 WTA score 在 raw xy 空间计算，损失在物理坐标系(ft)计算。
+    # 训练入口：Index 与 WTA score 在米制 xy 空间计算，损失也在米制物理坐标系计算。
     def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
         bsz, t_len, _ = future.shape
         valid_mask = (op_mask[..., 0] > 0.5).float().to(device) # [B,T]

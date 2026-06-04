@@ -10,7 +10,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.models.hist_model import DiffusionPast
-from method_diffusion.dataset.build import build_hist_dataset, get_test_split_path, meter_per_unit
+from method_diffusion.dataset.build import build_hist_dataset, get_test_split_path
 from method_diffusion.config import get_args_parser
 from method_diffusion.utils.mask_util import mixed_mask
 
@@ -115,8 +115,7 @@ def load_checkpoint(model, resume_arg, checkpoint_dir, device, model_name="Model
 
 
 class HistReconstructionMetrics:
-    def __init__(self, meter_per_unit=0.3048):
-        self.meter_per_foot = float(meter_per_unit)
+    def __init__(self):
         self.regions = ("all", "unmasked", "masked")
 
         self.xy_dist_sum = {key: 0.0 for key in self.regions}
@@ -194,20 +193,20 @@ class HistReconstructionMetrics:
         xy_ade_m = {}
         xy_rmse_m = {}
         for region in self.regions:
-            xy_ade_ft = self.safe_div(self.xy_dist_sum[region], self.xy_point_count[region])
-            xy_rmse_ft = self.safe_div(self.xy_coord_se[region], self.xy_coord_count[region]) ** 0.5
-            xy_ade_m[region] = xy_ade_ft * self.meter_per_foot
-            xy_rmse_m[region] = xy_rmse_ft * self.meter_per_foot
+            xy_ade = self.safe_div(self.xy_dist_sum[region], self.xy_point_count[region])
+            xy_rmse = self.safe_div(self.xy_coord_se[region], self.xy_coord_count[region]) ** 0.5
+            xy_ade_m[region] = xy_ade
+            xy_rmse_m[region] = xy_rmse
 
         va_l1 = {}
         va_rmse = {}
         for region in self.regions:
             point_count = self.va_point_count[region]
             if point_count > 0:
-                l1_ft = self.va_abs_sum[region] / point_count
-                rmse_ft = torch.sqrt(self.va_coord_se[region] / point_count)
-                va_l1[region] = (l1_ft * self.meter_per_foot).tolist()
-                va_rmse[region] = (rmse_ft * self.meter_per_foot).tolist()
+                l1 = self.va_abs_sum[region] / point_count
+                rmse = torch.sqrt(self.va_coord_se[region] / point_count)
+                va_l1[region] = l1.tolist()
+                va_rmse[region] = rmse.tolist()
             else:
                 va_l1[region] = [0.0, 0.0]
                 va_rmse[region] = [0.0, 0.0]
@@ -293,7 +292,6 @@ def main():
     print(f"[HistEval] Dataset: {dataset_name}")
     print(f"[HistEval] Test path: {test_path}")
 
-    metric_meter_per_unit = meter_per_unit(dataset_name)
     test_dataset = build_hist_dataset(str(test_path), dataset_name)
     test_loader = DataLoader(
         test_dataset,
@@ -306,7 +304,7 @@ def main():
 
     model = DiffusionPast(args).to(device)
     load_checkpoint(model, args.resume_hist, args.checkpoint_dir, device, model_name="HistModel")
-    metrics = HistReconstructionMetrics(meter_per_unit=metric_meter_per_unit)
+    metrics = HistReconstructionMetrics()
     mask_ratio = max(0.0, min(1.0, float(args.mask_prob)))
     random_mask_ratio = max(0.0, min(1.0, float(args.random_mask_ratio)))
     block_mask_start = int(args.block_mask_start) > 0

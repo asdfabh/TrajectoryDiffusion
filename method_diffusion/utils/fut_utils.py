@@ -46,7 +46,7 @@ def compute_batch_metric(pred, target, valid_mask=None):
     return rmse, ade, fde
 
 
-def compute_batch_kinematic_metrics(pred, target, valid_mask=None, meter_per_unit=0.3048):
+def compute_batch_kinematic_metrics(pred, target, valid_mask=None):
     """计算单个 batch 的 theta MAE(度) 与 v MAE(m/s)。"""
     valid_mask = normalize_traj_valid_mask(valid_mask, pred)
 
@@ -61,7 +61,6 @@ def compute_batch_kinematic_metrics(pred, target, valid_mask=None, meter_per_uni
     if pred.size(-1) >= 4 and target.size(-1) >= 4:
         v_diff = (pred[..., 3] - target[..., 3]).abs()
         v_mae_mps = (v_diff * valid_mask).sum() / (valid_mask.sum() + 1e-6)
-        v_mae_mps = v_mae_mps * float(meter_per_unit)
 
     return theta_mae_deg, v_mae_mps
 
@@ -123,9 +122,8 @@ class TrajectoryMetrics:
     - RMSE 按 TAME 口径，以点数量为分母
     """
 
-    def __init__(self, pred_len, meter_per_unit=0.3048):
+    def __init__(self, pred_len):
         self.pred_len = int(pred_len)
-        self.meter_per_unit = float(meter_per_unit)
         self.total_coord_se = torch.zeros(self.pred_len, dtype=torch.float64)
         self.total_de = torch.zeros(self.pred_len, dtype=torch.float64)
         self.total_theta_abs_deg = torch.zeros(self.pred_len, dtype=torch.float64)
@@ -160,20 +158,16 @@ class TrajectoryMetrics:
     def summary(self):
         """输出逐时刻 RMSE / FDE 与逐时刻前缀 ADE。"""
         counts = self.total_counts.clamp(min=1.0)
-        rmse_per_step_ft = torch.sqrt(self.total_coord_se / counts)
-        fde_per_step_ft = self.total_de / counts
-        ade_per_step_ft = torch.cumsum(self.total_de, dim=0) / torch.cumsum(self.total_counts, dim=0).clamp(min=1.0)
+        rmse_per_step_m = torch.sqrt(self.total_coord_se / counts)
+        fde_per_step_m = self.total_de / counts
+        ade_per_step_m = torch.cumsum(self.total_de, dim=0) / torch.cumsum(self.total_counts, dim=0).clamp(min=1.0)
         theta_mae_per_step_deg = self.total_theta_abs_deg / counts
-        v_mae_per_step_ftps = self.total_v_abs / counts
+        v_mae_per_step_mps = self.total_v_abs / counts
 
         return {
-            "rmse_per_step_ft": rmse_per_step_ft,
-            "rmse_per_step_m": rmse_per_step_ft * self.meter_per_unit,
-            "fde_per_step_ft": fde_per_step_ft,
-            "fde_per_step_m": fde_per_step_ft * self.meter_per_unit,
-            "ade_per_step_ft": ade_per_step_ft,
-            "ade_per_step_m": ade_per_step_ft * self.meter_per_unit,
+            "rmse_per_step_m": rmse_per_step_m,
+            "fde_per_step_m": fde_per_step_m,
+            "ade_per_step_m": ade_per_step_m,
             "theta_mae_per_step_deg": theta_mae_per_step_deg,
-            "v_mae_per_step_ftps": v_mae_per_step_ftps,
-            "v_mae_per_step_mps": v_mae_per_step_ftps * self.meter_per_unit,
+            "v_mae_per_step_mps": v_mae_per_step_mps,
         }

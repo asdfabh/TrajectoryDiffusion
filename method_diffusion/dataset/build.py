@@ -70,10 +70,3 @@ def build_hist_dataset(mat_path, dataset, **kwargs):
     if dataset_name == "round":
         return RoundHistDataset(str(mat_path), **kwargs)
     return NgsimHistDataset(str(mat_path), **kwargs)
-
-
-def meter_per_unit(dataset):
-    dataset_name = normalize_dataset_name(dataset)
-    if dataset_name == "round":
-        return 1.0
-    return 0.3048

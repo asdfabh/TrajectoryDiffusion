@@ -12,7 +12,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.config import get_args_parser
-from method_diffusion.dataset.build import build_trajectory_dataset, get_split_path, meter_per_unit
+from method_diffusion.dataset.build import build_trajectory_dataset, get_split_path
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.run.train_fut import prepare_input_data
@@ -218,7 +218,7 @@ def train_epoch(
 
 
 @torch.no_grad()
-def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, mask_ratio, random_mask_ratio, block_mask_start, metric_meter_per_unit):
+def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, mask_ratio, random_mask_ratio, block_mask_start):
     was_fut_training = model_fut.training
     was_hist_training = model_hist.training
     model_fut.eval()
@@ -255,10 +255,10 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, mask
             all_preds = model_fut.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
             pred_fut = all_preds.squeeze(1)
         eval_rmse, eval_ade, eval_fde = compute_batch_metric(pred_fut, fut, op_mask)
-        eval_theta_deg, eval_v_mps = compute_batch_kinematic_metrics(pred_fut, fut, op_mask, meter_per_unit=metric_meter_per_unit)
-        eval_rmse = float(eval_rmse.item()) * metric_meter_per_unit
-        eval_ade = float(eval_ade.item()) * metric_meter_per_unit
-        eval_fde = float(eval_fde.item()) * metric_meter_per_unit
+        eval_theta_deg, eval_v_mps = compute_batch_kinematic_metrics(pred_fut, fut, op_mask)
+        eval_rmse = float(eval_rmse.item())
+        eval_ade = float(eval_ade.item())
+        eval_fde = float(eval_fde.item())
         eval_theta_deg = float(eval_theta_deg.item())
         eval_v_mps = float(eval_v_mps.item())
 
@@ -306,7 +306,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_path = str(get_split_path(args, dataset_name, "Train"))
     val_path = str(get_split_path(args, dataset_name, "Val"))
-    metric_meter_per_unit = meter_per_unit(dataset_name)
     print(f"[JointTrain] Dataset: {dataset_name}")
     print(f"[JointTrain] Train path: {train_path}")
     print(f"[JointTrain] Val path: {val_path}")
@@ -384,7 +383,6 @@ def main():
             mask_ratio=mask_ratio,
             random_mask_ratio=random_mask_ratio,
             block_mask_start=block_mask_start,
-            metric_meter_per_unit=metric_meter_per_unit,
         )
         current_lr_fut = float(optimizer.param_groups[0]["lr"])
 

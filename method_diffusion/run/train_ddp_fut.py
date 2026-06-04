@@ -13,7 +13,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.config import get_args_parser
-from method_diffusion.dataset.build import build_trajectory_dataset, get_split_path, meter_per_unit
+from method_diffusion.dataset.build import build_trajectory_dataset, get_split_path
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.run.train_fut import (
     FUT_CHECKPOINT_DIR,
@@ -131,7 +131,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, rank):
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, device, epoch, feature_dim, rank, metric_meter_per_unit):
+def evaluate(model, dataloader, device, epoch, feature_dim, rank):
     fut_model = model.module if hasattr(model, "module") else model
     model.eval()
 
@@ -165,16 +165,16 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank, metric_meter_p
             all_preds = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
             pred_fut = all_preds.squeeze(1)
         eval_rmse, eval_ade, eval_fde = compute_batch_metric(pred_fut, fut, op_mask)
-        eval_theta_deg, eval_v_mps = compute_batch_kinematic_metrics(pred_fut, fut, op_mask, meter_per_unit=metric_meter_per_unit)
+        eval_theta_deg, eval_v_mps = compute_batch_kinematic_metrics(pred_fut, fut, op_mask)
         rmse_5s_idx = pred_fut.size(1) - 1  # last valid future step
         final_valid_mask = (op_mask[:, rmse_5s_idx, 0] > 0.5).float()
         final_diff = pred_fut[:, rmse_5s_idx, :2] - fut[:, rmse_5s_idx, :2]
         final_dist_sq = torch.sum(final_diff.square(), dim=-1)
         total_rmse_5s_se += float((final_dist_sq * final_valid_mask).sum().item())
         total_rmse_5s_count += float(final_valid_mask.sum().item())
-        eval_rmse = float(eval_rmse.item()) * metric_meter_per_unit
-        eval_ade = float(eval_ade.item()) * metric_meter_per_unit
-        eval_fde = float(eval_fde.item()) * metric_meter_per_unit
+        eval_rmse = float(eval_rmse.item())
+        eval_ade = float(eval_ade.item())
+        eval_fde = float(eval_fde.item())
         eval_theta_deg = float(eval_theta_deg.item())
         eval_v_mps = float(eval_v_mps.item())
 
@@ -191,7 +191,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank, metric_meter_p
                     "avg_rmse_m": f"{(total_rmse / num_batches):.4f}",
                     "avg_ade_m": f"{(total_ade / num_batches):.4f}",
                     "avg_fde_m": f"{(total_fde / num_batches):.4f}",
-                    "rmse_5s_m": f"{(total_rmse_5s_se / max(total_rmse_5s_count, 1e-6)) ** 0.5 * metric_meter_per_unit:.4f}",
+                    "rmse_5s_m": f"{(total_rmse_5s_se / max(total_rmse_5s_count, 1e-6)) ** 0.5:.4f}",
                     "avg_theta_deg": f"{(total_theta_deg / num_batches):.4f}",
                     "avg_v_mps": f"{(total_v_mps / num_batches):.4f}",
                 }
@@ -215,7 +215,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank, metric_meter_p
     model.train()
 
     denom = max(int(stats[7].item()), 1)
-    eval_rmse_5s = (float(stats[3].item()) / max(float(stats[4].item()), 1e-6)) ** 0.5 * metric_meter_per_unit
+    eval_rmse_5s = (float(stats[3].item()) / max(float(stats[4].item()), 1e-6)) ** 0.5
     return (
         float(stats[0].item()) / denom,
         float(stats[1].item()) / denom,
@@ -243,7 +243,6 @@ def main():
         writer = SummaryWriter(log_dir=str(tensorboard_log_dir))
     train_path = str(get_split_path(args, dataset_name, "Train"))
     val_path = str(get_split_path(args, dataset_name, "Val"))
-    metric_meter_per_unit = meter_per_unit(dataset_name)
     if is_main_process(rank):
         print(f"[DDP FutTrain] Dataset: {dataset_name}")
         print(f"[DDP FutTrain] Train path: {train_path}")
@@ -307,7 +306,7 @@ def main():
 
         train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim, rank)
         eval_rmse, eval_ade, eval_fde, eval_rmse_5s, eval_theta_deg, eval_v_mps = evaluate(
-            model, val_loader, device, epoch + 1, args.feature_dim, rank, metric_meter_per_unit)
+            model, val_loader, device, epoch + 1, args.feature_dim, rank)
         selection_score = float(eval_rmse)
         current_lr = optimizer.param_groups[0]["lr"]
 

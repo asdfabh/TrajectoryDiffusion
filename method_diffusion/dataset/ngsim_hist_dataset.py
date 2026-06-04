@@ -3,6 +3,8 @@ import torch
 from torch.utils.data import Dataset
 import scipy.io as scp
 
+from method_diffusion.dataset.ngsim_dataset import RAW_TO_METER
+
 
 class NgsimHistDataset(Dataset):
     """
@@ -17,6 +19,7 @@ class NgsimHistDataset(Dataset):
         self.t_h = int(t_h)
         self.d_s = int(d_s)
         self.maxlen = self.t_h // self.d_s + 1
+        self.position_scale = RAW_TO_METER
 
         # 轨迹缓存：避免重复 transpose
         self._track_cache = {}
@@ -69,8 +72,8 @@ class NgsimHistDataset(Dataset):
             return None
 
         ref_pos = track[frame_idx, 1:3]
-        hist = (hist_raw[:, 1:3] - ref_pos).astype(np.float32, copy=False)
-        va = hist_raw[:, 3:5].astype(np.float32, copy=False)
+        hist = (hist_raw[:, 1:3] - ref_pos).astype(np.float32, copy=False) * self.position_scale
+        va = hist_raw[:, 3:5].astype(np.float32, copy=False) * self.position_scale
         lane = hist_raw[:, 5:6].astype(np.float32, copy=False)
         cclass = hist_raw[:, 6:7].astype(np.float32, copy=False)
         return hist, va, lane, cclass

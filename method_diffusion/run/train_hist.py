@@ -12,7 +12,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.config import get_args_parser
-from method_diffusion.dataset.build import build_hist_dataset, get_split_path, meter_per_unit
+from method_diffusion.dataset.build import build_hist_dataset, get_split_path
 from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.utils.mask_util import mixed_mask
 
@@ -76,7 +76,6 @@ def init_csv_log(csv_path):
         "train_a_unknown",
         "train_a_known",
         "val_loss",
-        "val_masked_ade_raw",
         "val_masked_ade_m",
         "lr",
     ]
@@ -85,7 +84,7 @@ def init_csv_log(csv_path):
         writer.writeheader()
 
 
-def write_csv_log(csv_path, epoch, train_stats, eval_stats, lr, to_m):
+def write_csv_log(csv_path, epoch, train_stats, eval_stats, lr):
     row = {
         "epoch": epoch,
         "train_loss": train_stats["loss_total"],
@@ -96,8 +95,7 @@ def write_csv_log(csv_path, epoch, train_stats, eval_stats, lr, to_m):
         "train_a_unknown": train_stats["loss_a_unknown"],
         "train_a_known": train_stats["loss_a_known"],
         "val_loss": eval_stats["loss"],
-        "val_masked_ade_raw": eval_stats["masked_ade_ft"],
-        "val_masked_ade_m": eval_stats["masked_ade_ft"] * to_m,
+        "val_masked_ade_m": eval_stats["masked_ade_m"],
         "lr": lr,
     }
     with csv_path.open("a", newline="", encoding="utf-8") as f:
@@ -221,7 +219,7 @@ def evaluate(model, dataloader, device, epoch, feature_dim, mask_ratio, random_m
 
     if len(dataloader) == 0:
         model.train()
-        return {"loss": 0.0, "masked_ade_ft": 0.0}
+        return {"loss": 0.0, "masked_ade_m": 0.0}
 
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Val", dynamic_ncols=True)
     for batch in pbar:
@@ -244,16 +242,16 @@ def evaluate(model, dataloader, device, epoch, feature_dim, mask_ratio, random_m
         num_batches += 1
         pbar.set_postfix({
             "avg_loss": f"{(total_loss / num_batches):.6f}",
-            "avg_mask_ade_ft": f"{(total_masked_ade / num_batches):.4f}",
+            "avg_mask_ade_m": f"{(total_masked_ade / num_batches):.4f}",
         })
 
     model.train()
     if num_batches == 0:
-        return {"loss": 0.0, "masked_ade_ft": 0.0}
+        return {"loss": 0.0, "masked_ade_m": 0.0}
 
     return {
         "loss": total_loss / num_batches,
-        "masked_ade_ft": total_masked_ade / num_batches,
+        "masked_ade_m": total_masked_ade / num_batches,
     }
 
 
@@ -333,9 +331,7 @@ def main():
             block_mask_start,
         )
         current_lr = optimizer.param_groups[0]["lr"]
-        to_m = meter_per_unit(dataset_name)
-
-        write_csv_log(log_csv_path, epoch + 1, train_stats, eval_stats, current_lr, to_m)
+        write_csv_log(log_csv_path, epoch + 1, train_stats, eval_stats, current_lr)
 
         writer.add_scalar("Loss/Train", train_stats["loss_total"], epoch + 1)
         writer.add_scalar("Loss/TrainXYUnknown", train_stats["loss_xy_unknown"], epoch + 1)
@@ -345,7 +341,7 @@ def main():
         writer.add_scalar("Loss/TrainAUnknown", train_stats["loss_a_unknown"], epoch + 1)
         writer.add_scalar("Loss/TrainAKnown", train_stats["loss_a_known"], epoch + 1)
         writer.add_scalar("Eval/Loss", eval_stats["loss"], epoch + 1)
-        writer.add_scalar("Eval/MaskedADE_m", eval_stats["masked_ade_ft"] * to_m, epoch + 1)
+        writer.add_scalar("Eval/MaskedADE_m", eval_stats["masked_ade_m"], epoch + 1)
 
         print(
             f"Epoch {epoch + 1}/{args.num_epochs} | "
@@ -359,7 +355,7 @@ def main():
             f"mask_ratio={mask_ratio:.2f} | "
             f"rand_ratio={random_mask_ratio:.2f} | "
             f"val_loss={eval_stats['loss']:.6f} | "
-            f"mask_ade={eval_stats['masked_ade_ft'] * to_m:.4f}m"
+            f"mask_ade={eval_stats['masked_ade_m']:.4f}m"
         )
 
         scheduler.step()
@@ -374,7 +370,7 @@ def main():
             "scheduler_state_dict": scheduler.state_dict(),
             "loss": train_stats["loss_total"],
             "eval_loss": eval_stats["loss"],
-            "eval_masked_ade": eval_stats["masked_ade_ft"],
+            "eval_masked_ade": eval_stats["masked_ade_m"],
             "best_loss": best_loss,
         }
 

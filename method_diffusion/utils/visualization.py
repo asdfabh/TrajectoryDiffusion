@@ -107,7 +107,7 @@ def _build_vehicle_legend_handle(color):
     return (line_handle, rect_handle)
 
 
-def plot_hist_reconstruction(hist_original, hist_masked, hist_pred, fig_num1=3, fig_num2=3, input_unit="ft"):
+def plot_hist_reconstruction(hist_original, hist_masked, hist_pred, fig_num1=3, fig_num2=3, input_unit="m"):
     """绘制 hist 重建结果：原始轨迹、掩码位置、预测轨迹。"""
     num_samples = len(hist_original)
     fig_num1 = num_samples // fig_num2 + (num_samples % fig_num2 > 0)
@@ -134,8 +134,8 @@ def plot_hist_reconstruction(hist_original, hist_masked, hist_pred, fig_num1=3, 
         ax.plot(hist_p[:, 1], hist_p[:, 0], 'o-', color='green',
                 markersize=3, linewidth=1.5, label='Predicted', zorder=6)
 
-        ax.set_ylim(-20, 20)
-        for y in [18, 6, -6, -18]:
+        ax.set_ylim(-6.1, 6.1)
+        for y in [5.4864, 1.8288, -1.8288, -5.4864]:
             ax.axhline(y=y, color='gray', linestyle='--', linewidth=1, zorder=1)
 
         ax.set_xlabel(f'Lateral Position ({input_unit})')
@@ -152,7 +152,7 @@ def plot_hist_reconstruction(hist_original, hist_masked, hist_pred, fig_num1=3, 
 
 
 def visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_train_vis=False, enable_eval_vis=False,
-                                  batch_idx=0, input_unit="ft"):
+                                  batch_idx=0, input_unit="m"):
     """按配置开关控制 hist 重建可视化。"""
     if stage == "train":
         if not enable_train_vis:
@@ -176,7 +176,7 @@ def visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_train_v
 
 def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, future=None, pred=None,
                                 pred_all=None, pred_best_idx=None, future_mask=None,
-                                batch_idx=0, metrics=None, input_unit="ft",
+                                batch_idx=0, metrics=None, input_unit="m",
                                 title=None, highlight_label="Best",
                                 hist_masked=None, hist_reconstructed=None):
     """绘制 fut model 最终预测结果。"""
@@ -311,7 +311,7 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
     # 绘图窗口尺寸：默认16：9，展示16：4
     fig, ax = plt.subplots(figsize=(16, 4))
     # fig, ax = plt.subplots(figsize=(16, 9))
-    lane_lines = (-18.0, -6.0, 6.0, 18.0)
+    lane_lines = (-5.4864, -1.8288, 1.8288, 5.4864)
 
     for lane_y in lane_lines:
         ax.axhline(
@@ -445,7 +445,7 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
             zorder=4,
         )
 
-    unit = input_unit or "ft"
+    unit = input_unit or "m"
     title = "Trajectory Visualization" if title is None else str(title)
     if metrics:
         metric_parts = []
@@ -476,7 +476,7 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
     )
     ax.grid(False)
     ax.set_aspect('auto')
-    ax.set_ylim(-18, 18)
+    ax.set_ylim(-5.4864, 5.4864)
     plt.tight_layout()
     fig.canvas.draw()
     for nbr_x, nbr_y in nbr_vehicle_centers:
@@ -484,8 +484,8 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
             ax,
             center_x=nbr_x,
             center_y=nbr_y,
-            y_size=3.0,
-            x_to_y_ratio=5.0 / 2.0,
+            y_size=1.2,
+            x_to_y_ratio=4.5 / 1.8,
             color=nbr_color,
             zorder=2,
         )
@@ -494,8 +494,8 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
             ax,
             center_x=ego_vehicle_center[0],
             center_y=ego_vehicle_center[1],
-            y_size=3.0,
-            x_to_y_ratio=5.0 / 2.0,
+            y_size=1.2,
+            x_to_y_ratio=4.5 / 1.8,
             color=ego_color,
             zorder=9,
         )
@@ -504,7 +504,7 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
 
 def visualize_scene_prediction(hist, hist_nbrs, temporal_mask, future, pred, valid_mask,
                                pred_all=None, pred_best_idx=None,
-                               meter_per_foot=0.3048, batch_idx=0, title=None,
+                               batch_idx=0, title=None,
                                highlight_label="Best", hist_masked=None,
                                hist_reconstructed=None):
     """统一场景可视化：hist、mask、重建、周车、future 与预测结果。"""
@@ -514,12 +514,12 @@ def visualize_scene_prediction(hist, hist_nbrs, temporal_mask, future, pred, val
         valid_mask=valid_mask[batch_idx],
     )
     metrics = {
-        "ADE": {"ft": 0.0, "m": 0.0},
-        "FDE": {"ft": 0.0, "m": 0.0},
+        "ADE": {"m": 0.0},
+        "FDE": {"m": 0.0},
     }
     if vis_metrics is not None:
-        metrics["ADE"] = {"ft": vis_metrics["ade"], "m": vis_metrics["ade"] * meter_per_foot}
-        metrics["FDE"] = {"ft": vis_metrics["fde"], "m": vis_metrics["fde"] * meter_per_foot}
+        metrics["ADE"] = {"m": vis_metrics["ade"]}
+        metrics["FDE"] = {"m": vis_metrics["fde"]}
     _visualize_scene_prediction(
         hist=hist,
         hist_nbrs=hist_nbrs,
@@ -531,7 +531,7 @@ def visualize_scene_prediction(hist, hist_nbrs, temporal_mask, future, pred, val
         future_mask=valid_mask,
         batch_idx=batch_idx,
         metrics=metrics,
-        input_unit="ft",
+        input_unit="m",
         title=title,
         highlight_label=highlight_label,
         hist_masked=hist_masked,

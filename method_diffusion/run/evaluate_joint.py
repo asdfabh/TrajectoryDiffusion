@@ -22,7 +22,6 @@ from method_diffusion.run.evaluate_fut import (
 )
 from method_diffusion.run.train_fut import prepare_input_data
 from method_diffusion.run.train_joint import JOINT_FUT_CHECKPOINT_DIR, JOINT_HIST_CHECKPOINT_DIR
-from method_diffusion.dataset.build import meter_per_unit
 from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_closest_prediction
 from method_diffusion.utils.visualization import visualize_scene_prediction
 
@@ -46,10 +45,10 @@ def resolve_hist_checkpoint_dir(resume_hist, dataset_name):
 
 
 @torch.no_grad()
-def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enable_eval_vis, mask_ratio, random_mask_ratio, block_mask_start, metric_meter_per_unit):
+def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enable_eval_vis, mask_ratio, random_mask_ratio, block_mask_start):
     model_hist.eval()
     model_fut.eval()
-    metrics = TrajectoryMetrics(model_fut.T, meter_per_unit=metric_meter_per_unit)
+    metrics = TrajectoryMetrics(model_fut.T)
     k_samples = max(1, int(fut_k))
     eval_name = f"Joint Fut ClosestGT-RMSE@{k_samples}" if k_samples > 1 else "Joint Fut single-mode"
 
@@ -88,7 +87,6 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enab
                 valid_mask=(op_mask[..., 0] > 0.5).float(),
                 pred_all=all_preds,
                 pred_best_idx=best_idx,
-                meter_per_foot=metric_meter_per_unit,
                 title="Joint Hist Reconstruction + Future Prediction",
                 highlight_label="Best",
                 hist_masked=hist_masked,
@@ -143,7 +141,6 @@ def main():
         mask_ratio=max(0.0, min(1.0, float(args.mask_prob))),
         random_mask_ratio=max(0.0, min(1.0, float(args.random_mask_ratio))),
         block_mask_start=int(args.block_mask_start) > 0,
-        metric_meter_per_unit=meter_per_unit(args.dataset),
     )
 
 

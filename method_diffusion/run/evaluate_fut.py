@@ -10,7 +10,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from method_diffusion.config import get_args_parser
-from method_diffusion.dataset.build import build_trajectory_dataset, get_test_split_path, meter_per_unit
+from method_diffusion.dataset.build import build_trajectory_dataset, get_test_split_path
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.run.train_fut import prepare_input_data
 from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_closest_prediction
@@ -109,9 +109,9 @@ def build_test_loader(args):
 
 # 执行 TestSet 评估并打印周期性与最终指标。
 @torch.no_grad()
-def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis, metric_meter_per_unit):
+def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis):
     model.eval()
-    metrics = TrajectoryMetrics(model.T, meter_per_unit=metric_meter_per_unit)
+    metrics = TrajectoryMetrics(model.T)
     k_samples = max(1, int(fut_k))
     eval_name = f"Fut ClosestGT-RMSE@{k_samples}" if k_samples > 1 else "Fut single-mode"
 
@@ -133,7 +133,6 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis, met
                     valid_mask=(op_mask[..., 0] > 0.5).float(),
                     pred_all=all_preds,
                     pred_best_idx=best_idx,
-                    meter_per_foot=metric_meter_per_unit,
                     batch_idx=0,
                     title="Future Prediction",
                     highlight_label="Best",
@@ -175,7 +174,7 @@ def main():
     test_loader = build_test_loader(args)
     model = DiffusionFut(args).to(device)
     load_checkpoint(model, args.resume_fut, args.checkpoint_dir, device)
-    evaluate(model, test_loader, device, args.feature_dim, args.fut_k, enable_eval_vis=int(args.fut_enable_eval_vis) > 0, metric_meter_per_unit=meter_per_unit(args.dataset))
+    evaluate(model, test_loader, device, args.feature_dim, args.fut_k, enable_eval_vis=int(args.fut_enable_eval_vis) > 0)
 
 
 if __name__ == "__main__":

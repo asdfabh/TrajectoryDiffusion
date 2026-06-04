@@ -8,6 +8,10 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from method_diffusion.dataset.future_features import build_future_xy_theta_v
+from method_diffusion.dataset.ngsim_hist_dataset import NgsimHistDataset
+
+
+RAW_TO_METER = 0.3048
 
 
 class NgsimFutureDataset(Dataset):
@@ -57,6 +61,9 @@ class NgsimFutureDataset(Dataset):
         fut = build_future_xy_theta_v(track, frame_idx, self.t_f, self.d_s)
         if len(fut) == 0:
             return None
+        fut = fut.astype(np.float32, copy=True)
+        fut[:, 0:2] *= RAW_TO_METER
+        fut[:, 3:4] *= RAW_TO_METER
         return fut
 
     def __getitem__(self, idx):
@@ -88,9 +95,46 @@ def parse_args():
     parser.add_argument("--mat_file", default="/mnt/datasets/highDdata/TrainSet.mat", type=str, help="highDdata or ngsimdata")
     parser.add_argument("--batch_size", default=1024, type=int)
     parser.add_argument("--num_workers", default=8, type=int)
+    parser.add_argument("--t_h", default=30, type=int)
     parser.add_argument("--t_f", default=50, type=int)
     parser.add_argument("--d_s", default=2, type=int)
     return parser.parse_args()
+
+
+def collect_hist_stats(mat_file, t_h, d_s, batch_size, num_workers):
+    dataset = NgsimHistDataset(str(mat_file), t_h=t_h, d_s=d_s)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=dataset.collate_fn,
+        drop_last=False,
+    )
+
+    hist_values = []
+    va_values = []
+    for batch in tqdm(loader, desc="HistStats", ncols=100):
+        valid = batch["sample_valid"]
+        if valid.numel() == 0 or not bool(valid.any()):
+            continue
+        hist_values.append(batch["hist"][valid].reshape(-1, 2).cpu().numpy())
+        va_values.append(batch["va"][valid].reshape(-1, 2).cpu().numpy())
+
+    if len(hist_values) == 0:
+        pos_mean = np.zeros(2, dtype=np.float64)
+        pos_std = np.zeros(2, dtype=np.float64)
+        va_mean = np.zeros(2, dtype=np.float64)
+        va_std = np.zeros(2, dtype=np.float64)
+    else:
+        hist_values = np.concatenate(hist_values, axis=0).astype(np.float64, copy=False)
+        va_values = np.concatenate(va_values, axis=0).astype(np.float64, copy=False)
+        pos_mean = np.mean(hist_values, axis=0)
+        pos_std = np.std(hist_values, axis=0)
+        va_mean = np.mean(va_values, axis=0)
+        va_std = np.std(va_values, axis=0)
+
+    return pos_mean, pos_std, va_mean, va_std
 
 
 def main():
@@ -128,6 +172,18 @@ def main():
     print(f"fut_mean = {fut_mean.tolist()}")
     print(f"fut_std = {fut_std.tolist()}")
     print(f"fut_var = {fut_var.tolist()}")
+
+    pos_mean, pos_std, va_mean, va_std = collect_hist_stats(
+        mat_file=mat_path,
+        t_h=args.t_h,
+        d_s=args.d_s,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+    )
+    print(f"pos_mean = {pos_mean.tolist()}")
+    print(f"pos_std = {pos_std.tolist()}")
+    print(f"va_mean = {va_mean.tolist()}")
+    print(f"va_std = {va_std.tolist()}")
 
 
 if __name__ == "__main__":
