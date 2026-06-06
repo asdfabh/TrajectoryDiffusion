@@ -81,6 +81,104 @@ def select_closest_prediction(all_preds, target, valid_mask=None):
     return best_pred, best_idx, torch.sqrt(mse_k)
 
 
+def sample_xy_errors(pred, target, valid_mask=None):
+    """返回每个样本的 RMSE/ADE/FDE。"""
+    pred_xy = pred[..., :2]
+    target_xy = target[..., :2]
+    valid_mask = normalize_traj_valid_mask(valid_mask, pred_xy)
+
+    diff = pred_xy - target_xy
+    dist_sq = torch.sum(diff.square(), dim=-1)
+    dist = torch.sqrt(dist_sq)
+    valid_count = valid_mask.sum(dim=1).clamp(min=1.0)
+    rmse = torch.sqrt((dist_sq * valid_mask).sum(dim=1) / valid_count)
+    ade = (dist * valid_mask).sum(dim=1) / valid_count
+
+    valid_counts_long = valid_mask.sum(dim=1).long()
+    has_valid = valid_counts_long > 0
+    last_idx = torch.clamp(valid_counts_long - 1, min=0)
+    fde = dist.gather(1, last_idx.unsqueeze(1)).squeeze(1)
+    fde = fde * has_valid.float()
+    return rmse, ade, fde, has_valid
+
+
+class SampleImprovementStats:
+    """累计 refined 相对 baseline 的逐样本 XY 改善统计。"""
+
+    def __init__(self, eps=1e-6):
+        self.eps = float(eps)
+        self.count = 0
+        self.rmse_improved = 0
+        self.rmse_worse = 0
+        self.ade_improved = 0
+        self.ade_worse = 0
+        self.fde_improved = 0
+        self.fde_worse = 0
+        self.total_delta_rmse = 0.0
+        self.total_delta_ade = 0.0
+        self.total_delta_fde = 0.0
+
+    def update(self, baseline, refined, target, valid_mask=None):
+        base_rmse, base_ade, base_fde, has_valid = sample_xy_errors(baseline, target, valid_mask)
+        ref_rmse, ref_ade, ref_fde, _ = sample_xy_errors(refined, target, valid_mask)
+        if not torch.any(has_valid):
+            return
+
+        base_rmse = base_rmse[has_valid]
+        base_ade = base_ade[has_valid]
+        base_fde = base_fde[has_valid]
+        ref_rmse = ref_rmse[has_valid]
+        ref_ade = ref_ade[has_valid]
+        ref_fde = ref_fde[has_valid]
+
+        delta_rmse = ref_rmse - base_rmse
+        delta_ade = ref_ade - base_ade
+        delta_fde = ref_fde - base_fde
+        self.count += int(has_valid.sum().item())
+        self.rmse_improved += int((delta_rmse < -self.eps).sum().item())
+        self.rmse_worse += int((delta_rmse > self.eps).sum().item())
+        self.ade_improved += int((delta_ade < -self.eps).sum().item())
+        self.ade_worse += int((delta_ade > self.eps).sum().item())
+        self.fde_improved += int((delta_fde < -self.eps).sum().item())
+        self.fde_worse += int((delta_fde > self.eps).sum().item())
+        self.total_delta_rmse += float(delta_rmse.sum().item())
+        self.total_delta_ade += float(delta_ade.sum().item())
+        self.total_delta_fde += float(delta_fde.sum().item())
+
+    def summary(self):
+        denom = max(self.count, 1)
+        return {
+            "count": self.count,
+            "rmse_improved_rate": self.rmse_improved / denom,
+            "rmse_worse_rate": self.rmse_worse / denom,
+            "ade_improved_rate": self.ade_improved / denom,
+            "ade_worse_rate": self.ade_worse / denom,
+            "fde_improved_rate": self.fde_improved / denom,
+            "fde_worse_rate": self.fde_worse / denom,
+            "mean_delta_rmse": self.total_delta_rmse / denom,
+            "mean_delta_ade": self.total_delta_ade / denom,
+            "mean_delta_fde": self.total_delta_fde / denom,
+        }
+
+
+def print_sample_improvement(summary, title):
+    print("\n" + "=" * 30 + f" {title} " + "=" * 30)
+    print(f"Samples: {summary['count']}")
+    print(
+        f"RMSE improved/worse: {summary['rmse_improved_rate']:.6f} / "
+        f"{summary['rmse_worse_rate']:.6f}, mean_delta={summary['mean_delta_rmse']:.8f} m"
+    )
+    print(
+        f"ADE  improved/worse: {summary['ade_improved_rate']:.6f} / "
+        f"{summary['ade_worse_rate']:.6f}, mean_delta={summary['mean_delta_ade']:.8f} m"
+    )
+    print(
+        f"FDE  improved/worse: {summary['fde_improved_rate']:.6f} / "
+        f"{summary['fde_worse_rate']:.6f}, mean_delta={summary['mean_delta_fde']:.8f} m"
+    )
+    print("=" * 75)
+
+
 def build_eval_timestep_pairs(train_timestep_max, num_inference_steps, inference_trunc_timestep):
     """构造显式 DDIM 推理步，例如 30->24->18->12->6->0。"""
     if inference_trunc_timestep % num_inference_steps != 0:

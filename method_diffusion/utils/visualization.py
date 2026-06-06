@@ -175,7 +175,9 @@ def visualize_hist_reconstruction(hist, hist_masked, pred, stage, enable_train_v
 
 
 def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, future=None, pred=None,
-                                pred_all=None, pred_best_idx=None, future_mask=None,
+                                pred_all=None, pred_best_idx=None,
+                                refined_pred=None, refined_pred_all=None, refined_pred_best_idx=None,
+                                future_mask=None,
                                 batch_idx=0, metrics=None, input_unit="m",
                                 title=None, highlight_label="Best",
                                 hist_masked=None, hist_reconstructed=None, dataset_name=None):
@@ -290,6 +292,8 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
     hist_masked_arr = safe_get_batch(hist_masked, idx, batch_ndim=3)
     hist_recon = normalize_traj2d(safe_get_batch(hist_reconstructed, idx, batch_ndim=3))
     pred_modes = safe_get_batch(pred_all, idx, batch_ndim=4)
+    refined_single = normalize_traj2d(safe_get_batch(refined_pred, idx, batch_ndim=3))
+    refined_modes = safe_get_batch(refined_pred_all, idx, batch_ndim=4)
 
     if pred_modes is not None:
         pred_modes = np.asarray(pred_modes)
@@ -297,14 +301,26 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
             pred_modes = pred_modes[None, ...]
         if pred_modes.ndim != 3 or pred_modes.shape[-1] < 2:
             pred_modes = None
+    if refined_modes is not None:
+        refined_modes = np.asarray(refined_modes)
+        if refined_modes.ndim == 2 and refined_modes.shape[-1] >= 2:
+            refined_modes = refined_modes[None, ...]
+        if refined_modes.ndim != 3 or refined_modes.shape[-1] < 2:
+            refined_modes = None
 
     best_k = resolve_best_idx(pred_best_idx, idx, 0 if pred_modes is None else pred_modes.shape[0])
     if best_k is None and pred_modes is not None:
         best_k = select_best_by_rmse(pred_modes, gt_fut, fut_mask_arr)
+    refined_best_k = resolve_best_idx(refined_pred_best_idx, idx, 0 if refined_modes is None else refined_modes.shape[0])
+    if refined_best_k is None and refined_modes is not None:
+        refined_best_k = select_best_by_rmse(refined_modes, gt_fut, fut_mask_arr)
 
     pred_best = pred_single
     if pred_best is None and pred_modes is not None and pred_modes.shape[0] > 0:
         pred_best = normalize_traj2d(pred_modes[0 if best_k is None else best_k])
+    refined_best = refined_single
+    if refined_best is None and refined_modes is not None and refined_modes.shape[0] > 0:
+        refined_best = normalize_traj2d(refined_modes[0 if refined_best_k is None else refined_best_k])
 
     nbrs_vis = reconstruct_nbrs_from_mask(hist_nbrs, temporal_mask, idx)
 
@@ -444,6 +460,41 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
             label='best anchor',
             zorder=4,
         )
+    if refined_modes is not None:
+        has_refined_other_label = False
+        for k in range(refined_modes.shape[0]):
+            traj = normalize_traj2d(refined_modes[k])
+            if traj is None:
+                continue
+            is_best = refined_best_k is not None and k == refined_best_k
+            mode_color = '#D4A017' if is_best else '#08306B'
+            label = 'refined best' if is_best else (None if has_refined_other_label else 'refined other')
+            ax.plot(
+                traj[:, 1], traj[:, 0],
+                linestyle='--',
+                marker='o',
+                markersize=3.2 if is_best else 2.0,
+                markeredgewidth=0.9 if is_best else 0.6,
+                linewidth=3.0 if is_best else 1.7,
+                alpha=0.98 if is_best else 0.72,
+                color=mode_color,
+                label=label,
+                zorder=7 if is_best else 6,
+            )
+            if not is_best:
+                has_refined_other_label = True
+    elif refined_best is not None:
+        ax.plot(
+            refined_best[:, 1], refined_best[:, 0],
+            color='#D4A017',
+            linestyle='--',
+            marker='o',
+            markersize=3.2,
+            linewidth=3.0,
+            alpha=0.98,
+            label='refined best',
+            zorder=7,
+        )
 
     unit = input_unit or "m"
     title = "Trajectory Visualization" if title is None else str(title)
@@ -508,6 +559,7 @@ def _visualize_scene_prediction(hist=None, hist_nbrs=None, temporal_mask=None, f
 
 def visualize_scene_prediction(hist, hist_nbrs, temporal_mask, future, pred, valid_mask,
                                pred_all=None, pred_best_idx=None,
+                               refined_pred=None, refined_pred_all=None, refined_pred_best_idx=None,
                                batch_idx=0, title=None,
                                highlight_label="Best", hist_masked=None,
                                hist_reconstructed=None, dataset_name=None):
@@ -524,6 +576,14 @@ def visualize_scene_prediction(hist, hist_nbrs, temporal_mask, future, pred, val
     if vis_metrics is not None:
         metrics["ADE"] = {"m": vis_metrics["ade"]}
         metrics["FDE"] = {"m": vis_metrics["fde"]}
+    refined_metrics = _compute_vis_metrics(
+        pred_traj=None if refined_pred is None else refined_pred[batch_idx],
+        target_traj=future[batch_idx],
+        valid_mask=valid_mask[batch_idx],
+    )
+    if refined_metrics is not None:
+        metrics["Refined ADE"] = {"m": refined_metrics["ade"]}
+        metrics["Refined FDE"] = {"m": refined_metrics["fde"]}
     _visualize_scene_prediction(
         hist=hist,
         hist_nbrs=hist_nbrs,
@@ -532,6 +592,9 @@ def visualize_scene_prediction(hist, hist_nbrs, temporal_mask, future, pred, val
         pred=pred,
         pred_all=pred_all,
         pred_best_idx=pred_best_idx,
+        refined_pred=refined_pred,
+        refined_pred_all=refined_pred_all,
+        refined_pred_best_idx=refined_pred_best_idx,
         future_mask=valid_mask,
         batch_idx=batch_idx,
         metrics=metrics,

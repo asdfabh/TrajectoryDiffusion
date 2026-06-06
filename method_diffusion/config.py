@@ -67,8 +67,20 @@ def get_args_parser():
     parser.add_argument("--fut_cascade_intermediate_weight", default=0.5, type=float)
     parser.add_argument("--fut_cascade_final_weight", default=1.0, type=float)
 
+    # Fut trajectory refiner (TABR)
+    parser.add_argument("--fut_refiner_checkpoint", default="best", type=str)
+    parser.add_argument("--fut_refiner_hidden_dim", default=128, type=int)
+    parser.add_argument("--fut_refiner_max_delta", default=5.0, type=float)
+    parser.add_argument("--fut_refiner_time_power", default=2.0, type=float)
+    parser.add_argument("--fut_refiner_num_basis", default=4, type=int)
+    parser.add_argument("--fut_refiner_lr", default=1e-3, type=float)
+    parser.add_argument("--fut_refiner_fde_weight", default=2.0, type=float)
+    parser.add_argument("--fut_refiner_delta_weight", default=0.01, type=float)
+    parser.add_argument("--fut_refiner_gate_weight", default=0.001, type=float)
+
     # Fut visualization
     parser.add_argument("--fut_enable_eval_vis", default=0, type=int)
+    parser.add_argument("--fut_vis_enable_refine", default=0, type=int)
     parser.add_argument("--hist_enable_train_vis", default=0, type=int)
     parser.add_argument("--hist_enable_eval_vis", default=0, type=int)
 
