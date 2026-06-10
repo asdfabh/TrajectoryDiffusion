@@ -66,9 +66,6 @@ def load_residual_refiner(args, checkpoint_dir, device):
 
     refiner = build_trajectory_refiner(args).to(device)
     state = torch.load(ckpt_path, map_location=device)
-    ckpt_refiner_type = state.get("refiner_type", "temporal_basis")
-    if ckpt_refiner_type is not None and str(ckpt_refiner_type) != "temporal_basis":
-        raise ValueError(f"Unsupported refiner checkpoint type: {ckpt_refiner_type}")
     refiner.load_state_dict(state["model_state_dict"], strict=True)
     refiner.eval()
     print(f"[FutEval] Loaded residual refiner checkpoint: {ckpt_path}")
@@ -156,7 +153,7 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis, fut
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
 
         if k_samples > 1:
-            all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=k_samples)
+            all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, device=device, K=k_samples)
             pred_fut, best_idx, _ = select_closest_prediction(all_preds, fut, op_mask)
             refined_all_preds, _ = residual_refiner(hist, all_preds, fut_dt)
             refined_pred_fut, refined_best_idx, _ = select_closest_prediction(refined_all_preds, fut, op_mask)
@@ -181,7 +178,7 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis, fut
                     dataset_name=dataset_name,
                 )
         else:
-            all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
+            all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, device=device, K=1)
             pred_fut = all_preds.squeeze(1)
             refined_pred_fut, _ = residual_refiner(hist, pred_fut, fut_dt)
 

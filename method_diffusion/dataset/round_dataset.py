@@ -406,9 +406,10 @@ class RoundHistDataset(RoundDataset):
         super().__init__(mat_file, t_h=t_h, t_f=t_f, d_s=d_s, **kwargs)
 
     def __getitem__(self, idx):
-        ds_id = int(self.D[idx, 0])
-        veh_id = int(self.D[idx, 1])
-        t = self.D[idx, 2]
+        raw_idx = int(self.valid_indices[int(idx)])
+        ds_id = int(self.D[raw_idx, 0])
+        veh_id = int(self.D[raw_idx, 1])
+        t = self.D[raw_idx, 2]
         ego = self._ego_pose(ds_id, veh_id, t)
         if ego is None:
             empty_hist = np.empty((0, 2), dtype=np.float32)

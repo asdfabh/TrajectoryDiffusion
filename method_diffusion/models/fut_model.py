@@ -199,10 +199,10 @@ class DiffusionFut(nn.Module):
         loss_logs["assign_max_win_ratio"] = max_win_ratio.detach()
         return loss, loss_logs
 
-
     @torch.no_grad()
-    def forwardEvalMulti(self, hist, hist_nbrs, mask, temporal_mask, future, device, K=None):
-        bsz, t_len, _ = future.shape
+    def forwardEvalMulti(self, hist, hist_nbrs, mask, temporal_mask, device, K=None, t_len=None):
+        bsz = hist.size(0)
+        t_len = self.T
         k = self.fut_k if K is None else max(1, int(K))
 
         context_tokens = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
@@ -222,9 +222,7 @@ class DiffusionFut(nn.Module):
             x_t = ddim_step(diffusion_scheduler, pred_x0, x_t, int(current_timestep), int(next_timestep))
 
         pred_phys = self.denorm(pred_x0.view(bsz, k, t_len, self.output_dim))
-        all_preds = future.unsqueeze(1).repeat(1, k, 1, 1).clone()
-        all_preds[..., :self.output_dim] = pred_phys
-        return all_preds
+        return pred_phys
 
     # 统一前向入口，默认复用训练路径。
     def forward(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):

@@ -134,7 +134,7 @@ def train_epoch(args, fut_model, refiner, dataloader, optimizer, device, epoch):
     for batch_idx, batch in enumerate(pbar, start=1):
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, args.feature_dim, device=device)
         with torch.no_grad():
-            all_preds = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=fut_model.fut_k)
+            all_preds = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, device, K=fut_model.fut_k)
         refined_all, aux = refiner(hist, all_preds, fut_model.fut_dt)
         loss, logs = compute_refiner_loss(
             refined_all,
@@ -170,7 +170,7 @@ def evaluate(args, fut_model, refiner, dataloader, device, epoch):
 
     for batch_idx, batch in enumerate(pbar, start=1):
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, args.feature_dim, device=device)
-        all_preds = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=fut_model.fut_k)
+        all_preds = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, device, K=fut_model.fut_k)
         pred_fut, _, _ = select_closest_prediction(all_preds, fut, op_mask)
         refined_all, _ = refiner(hist, all_preds, fut_model.fut_dt)
         refined_pred, _, _ = select_closest_prediction(refined_all, fut, op_mask)

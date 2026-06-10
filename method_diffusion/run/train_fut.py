@@ -244,10 +244,10 @@ def evaluate(model, dataloader, device, epoch, feature_dim):
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
         if int(model.fut_k) > 1:
-            all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=model.fut_k)
+            all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, device, K=model.fut_k)
             pred_fut, _, _ = select_closest_prediction(all_preds, fut, op_mask)
         else:
-            all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
+            all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, device, K=1)
             pred_fut = all_preds.squeeze(1)
         eval_rmse, eval_ade, eval_fde = compute_batch_metric(pred_fut, fut, op_mask)
         eval_theta_deg, eval_v_mps = compute_batch_kinematic_metrics(pred_fut, fut, op_mask)

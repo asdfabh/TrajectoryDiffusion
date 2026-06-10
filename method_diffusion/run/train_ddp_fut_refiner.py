@@ -87,7 +87,6 @@ def train_epoch(args, fut_model, refiner, dataloader, optimizer, device, epoch, 
                 hist_nbrs,
                 mask,
                 temporal_mask,
-                fut,
                 device,
                 K=fut_model.fut_k,
             )
@@ -160,7 +159,6 @@ def evaluate(args, fut_model, refiner, dataloader, device, epoch, rank):
             hist_nbrs,
             mask,
             temporal_mask,
-            fut,
             device,
             K=fut_model.fut_k,
         )

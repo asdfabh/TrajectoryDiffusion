@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 from method_diffusion.dataset.build import get_raw_dt, get_time_params
 from method_diffusion.dataset.future_features import build_xy_theta_v_from_positions
+from method_diffusion.dataset.round_dataset import RoundHistDataset
 
 
 # ---------------------------------------------------------------------------
@@ -202,8 +203,63 @@ def parse_args():
         help="Path to RounD TrainSet.mat",
     )
     parser.add_argument("--batch_size", default=1024, type=int)
-    parser.add_argument("--num_workers", default=8, type=int)
+    parser.add_argument("--num_workers", default=0, type=int)
     return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# 历史统计：只统计目标车辆自身历史轨迹，不统计邻车
+# ---------------------------------------------------------------------------
+
+def collect_round_hist_stats(mat_path, t_h, d_s, batch_size, num_workers):
+    dataset = RoundHistDataset(str(mat_path), t_h=t_h, t_f=0, d_s=d_s)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=dataset.collate_fn,
+        drop_last=False,
+    )
+
+    hist_values = []
+    va_values = []
+    valid_samples = 0
+
+    for batch in tqdm(loader, desc="RoundHistStats", unit="batch", ncols=100):
+        valid = batch["sample_valid"].bool()
+        if valid.numel() == 0 or not bool(valid.any()):
+            continue
+
+        valid_samples += int(valid.sum().item())
+        hist_values.append(batch["hist"][valid].reshape(-1, 2).cpu().numpy())
+        va_values.append(batch["va"][valid].reshape(-1, 2).cpu().numpy())
+
+    hist_all = (
+        np.concatenate(hist_values, axis=0).astype(np.float64, copy=False)
+        if hist_values
+        else np.empty((0, 2), dtype=np.float64)
+    )
+    va_all = (
+        np.concatenate(va_values, axis=0).astype(np.float64, copy=False)
+        if va_values
+        else np.empty((0, 2), dtype=np.float64)
+    )
+
+    pos_mean = hist_all.mean(axis=0) if hist_all.shape[0] > 0 else np.zeros(2)
+    pos_std = hist_all.std(axis=0) if hist_all.shape[0] > 0 else np.zeros(2)
+    va_mean = va_all.mean(axis=0) if va_all.shape[0] > 0 else np.zeros(2)
+    va_std = va_all.std(axis=0) if va_all.shape[0] > 0 else np.zeros(2)
+
+    return {
+        "valid_samples": valid_samples,
+        "hist_points": hist_all.shape[0],
+        "va_points": va_all.shape[0],
+        "pos_mean": pos_mean,
+        "pos_std": pos_std,
+        "va_mean": va_mean,
+        "va_std": va_std,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -233,32 +289,33 @@ def main():
     )
 
     fut_list = []
-    hist_list = []
-    va_list = []
-
-    for fut_batch, fut_mask, hist_batch, va_batch in tqdm(loader, desc="RoundStats", unit="batch", ncols=100):
+    for fut_batch, fut_mask, _, _ in tqdm(loader, desc="RoundFutureStats", unit="batch", ncols=100):
         valid = fut_batch[fut_mask]
         if valid.numel() > 0:
             fut_list.append(valid.cpu().numpy())
-        hist_list.append(hist_batch.cpu().numpy())
-        va_list.append(va_batch.cpu().numpy())
 
     # ---- 合并 & 计算 ----
     fut_all = np.concatenate(fut_list, axis=0).astype(np.float64, copy=False) if fut_list else np.empty((0, 4))
-    hist_all = np.concatenate(hist_list, axis=0).reshape(-1, 2).astype(np.float64, copy=False) if hist_list else np.empty((0, 2))
-    va_all = np.concatenate(va_list, axis=0).reshape(-1, 2).astype(np.float64, copy=False) if va_list else np.empty((0, 2))
 
     fut_mean = fut_all.mean(axis=0) if fut_all.shape[0] > 0 else np.zeros(4)
     fut_std = fut_all.std(axis=0) if fut_all.shape[0] > 0 else np.zeros(4)
-    pos_mean = hist_all.mean(axis=0) if hist_all.shape[0] > 0 else np.zeros(2)
-    pos_std = hist_all.std(axis=0) if hist_all.shape[0] > 0 else np.zeros(2)
-    va_mean = va_all.mean(axis=0) if va_all.shape[0] > 0 else np.zeros(2)
-    va_std = va_all.std(axis=0) if va_all.shape[0] > 0 else np.zeros(2)
+    hist_stats = collect_round_hist_stats(
+        mat_path=mat_path,
+        t_h=t_h,
+        d_s=d_s,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+    )
+    pos_mean = hist_stats["pos_mean"]
+    pos_std = hist_stats["pos_std"]
+    va_mean = hist_stats["va_mean"]
+    va_std = hist_stats["va_std"]
 
     # ---- 输出 ----
     print(f"\n[RoundStats] fut points:  {fut_all.shape[0]:,}")
-    print(f"[RoundStats] hist points: {hist_all.shape[0]:,}")
-    print(f"[RoundStats] va points:   {va_all.shape[0]:,}")
+    print(f"[RoundStats] hist valid samples: {hist_stats['valid_samples']:,}")
+    print(f"[RoundStats] hist points: {hist_stats['hist_points']:,}")
+    print(f"[RoundStats] va points:   {hist_stats['va_points']:,}")
     print(f"[RoundStats] fut_mean = {fut_mean.tolist()}")
     print(f"[RoundStats] fut_std  = {fut_std.tolist()}")
     print(f"[RoundStats] fut_var  = {(fut_std ** 2).tolist()}")

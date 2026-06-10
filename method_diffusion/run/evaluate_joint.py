@@ -70,10 +70,10 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enab
         _, pred_hist = model_hist.forward_eval(hist, hist_masked, device)
 
         if k_samples > 1:
-            all_preds = model_fut.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, fut, device, K=k_samples)
+            all_preds = model_fut.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, device, K=k_samples)
             pred_fut, best_idx, _ = select_closest_prediction(all_preds, fut, op_mask)
         else:
-            all_preds = model_fut.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, fut, device, K=1)
+            all_preds = model_fut.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, device, K=1)
             pred_fut = all_preds.squeeze(1)
             best_idx = None
 
