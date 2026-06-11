@@ -165,8 +165,8 @@ class TemporalBasisResidualRefiner(nn.Module):
         delta_xy = torch.einsum("tc,bkcd->bktd", basis, control)
         delta_xy = gate.unsqueeze(2) * delta_xy
 
-        refined = traj.clone()
-        refined[..., :2] = refined[..., :2] + delta_xy
+        refined_xy = traj[..., :2] + delta_xy
+        refined = torch.cat([refined_xy, traj[..., 2:]], dim=-1)
         refined = recompute_theta_v_from_xy(refined, dt)
         delta_end = delta_xy[:, :, -1]
         if squeeze_candidate:

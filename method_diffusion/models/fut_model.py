@@ -13,6 +13,7 @@ from method_diffusion.utils.position_encoding import SequentialPositionalEncodin
 
 
 class DiffusionFut(nn.Module):
+    VALID_DENOISE_STAGES = {"train", "eval", "joint_train"}
 
     def __init__(self, args):
         super(DiffusionFut, self).__init__()
@@ -179,7 +180,7 @@ class DiffusionFut(nn.Module):
         ).float()
         context_tokens = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
         context_tokens_all = context_tokens.repeat_interleave(k, dim=0)
-        pred_x0_levels = self.forwardDenoiseCascade(x_t, timesteps_all, context_tokens_all)
+        pred_x0_levels = self.forwardDenoiseCascade(x_t, timesteps_all, context_tokens_all, stage="train")
         pred_x0_all = pred_x0_levels[-1].view(bsz, k, t_len, self.output_dim)
         pred_phys_all = self.denorm(pred_x0_all)
 
@@ -199,8 +200,8 @@ class DiffusionFut(nn.Module):
         loss_logs["assign_max_win_ratio"] = max_win_ratio.detach()
         return loss, loss_logs
 
-    @torch.no_grad()
-    def forwardEvalMulti(self, hist, hist_nbrs, mask, temporal_mask, device, K=None, t_len=None):
+    def forward_eval_multi(self, hist, hist_nbrs, mask, temporal_mask, device, K=None, t_len=None, stage="eval"):
+        self._validate_denoise_stage(stage)
         bsz = hist.size(0)
         t_len = self.T
         k = self.fut_k if K is None else max(1, int(K))
@@ -218,11 +219,15 @@ class DiffusionFut(nn.Module):
 
         for current_timestep, next_timestep in zip(self.eval_current_timesteps, self.eval_next_timesteps):
             timesteps = torch.full((x_t.size(0),), int(current_timestep), device=x_t.device, dtype=torch.long)
-            pred_x0 = self.forwardDenoiseCascade(x_t, timesteps, context_tokens)[-1]
+            pred_x0 = self.forwardDenoiseCascade(x_t, timesteps, context_tokens, stage=stage)[-1]
             x_t = ddim_step(diffusion_scheduler, pred_x0, x_t, int(current_timestep), int(next_timestep))
 
         pred_phys = self.denorm(pred_x0.view(bsz, k, t_len, self.output_dim))
         return pred_phys
+
+    @torch.no_grad()
+    def forwardEvalMulti(self, hist, hist_nbrs, mask, temporal_mask, device, K=None, t_len=None):
+        return self.forward_eval_multi(hist, hist_nbrs, mask, temporal_mask, device, K=K, t_len=t_len, stage="eval")
 
     # 统一前向入口，默认复用训练路径。
     def forward(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
@@ -230,32 +235,38 @@ class DiffusionFut(nn.Module):
 
     # 归一化与反归一化，处理 future [x, y, theta, v]。
     def norm(self, x):
-        x_norm = x.clone()
+        if x.size(-1) != self.output_dim:
+            raise ValueError(f"Expected future dim {self.output_dim}, got {x.size(-1)}.")
         mean = self.fut_mean.to(device=x.device, dtype=x.dtype)
         std = self.fut_std.to(device=x.device, dtype=x.dtype).clamp(min=1e-6)
-        x_norm[..., :self.output_dim] = (x[..., :self.output_dim] - mean[:self.output_dim]) / std[:self.output_dim]
-        x_norm[..., :self.output_dim] = torch.clamp(x_norm[..., :self.output_dim], -8.0, 8.0)
-        return x_norm
+        x_norm = (x[..., :self.output_dim] - mean[:self.output_dim]) / std[:self.output_dim]
+        return torch.clamp(x_norm, -8.0, 8.0)
 
     def denorm(self, x):
-        x_denorm = x.clone()
+        if x.size(-1) != self.output_dim:
+            raise ValueError(f"Expected future dim {self.output_dim}, got {x.size(-1)}.")
         mean = self.fut_mean.to(device=x.device, dtype=x.dtype)
         std = self.fut_std.to(device=x.device, dtype=x.dtype).clamp(min=1e-6)
-        x_denorm[..., :self.output_dim] = x[..., :self.output_dim] * std[:self.output_dim] + mean[:self.output_dim]
-        return x_denorm
+        return x[..., :self.output_dim] * std[:self.output_dim] + mean[:self.output_dim]
 
-    def forwardDenoiseCascade(self, x_t, timesteps, context_tokens):
+    def forwardDenoiseCascade(self, x_t, timesteps, context_tokens, stage="train"):
+        self._validate_denoise_stage(stage)
         preds = []
         current_x = x_t
         t_emb = self.timestep_embedder(timesteps)
+        allow_state_grad = stage == "joint_train"
         for block, output_head in zip(self.dit_blocks, self.output_heads):
             input_embedded = self.input_embedding(current_x) + self.pos_embedding(current_x)
             hidden = block(input_embedded, t_emb, context_tokens)
             pred_delta = output_head(hidden)
             pred_x0 = current_x + pred_delta
             preds.append(pred_x0)
-            current_x = pred_x0.detach()
+            current_x = pred_x0 if allow_state_grad else pred_x0.detach()
         return preds
+
+    def _validate_denoise_stage(self, stage):
+        if stage not in self.VALID_DENOISE_STAGES:
+            raise ValueError(f"Unsupported denoise stage '{stage}'. Expected one of {sorted(self.VALID_DENOISE_STAGES)}.")
 
     def computeRawXyMseScore(self, pred_phys_all, target_phys, valid_mask):
         valid_time = valid_mask.unsqueeze(1)

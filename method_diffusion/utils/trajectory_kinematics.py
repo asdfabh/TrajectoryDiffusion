@@ -5,18 +5,17 @@ from method_diffusion.utils.fut_utils import normalize_traj_valid_mask, wrap_ang
 
 def recompute_theta_v_from_xy(traj, dt):
     """按 future 构造口径，从 xy 后向差分重算 theta/v。"""
-    if traj.size(-1) < 4:
-        raise ValueError(f"Expected trajectory feature dim >= 4, got {traj.size(-1)}")
+    if traj.size(-1) != 4:
+        raise ValueError(f"Expected trajectory feature dim 4, got {traj.size(-1)}")
 
     step_dt = max(float(dt), 1e-6)
-    refined = traj.clone()
-    xy = refined[..., :2]
+    xy = traj[..., :2]
     origin = xy.new_zeros(*xy.shape[:-2], 1, 2)
     xy_prev = torch.cat([origin, xy[..., :-1, :]], dim=-2)
     delta = xy - xy_prev
-    refined[..., 2] = torch.atan2(delta[..., 1], delta[..., 0])
-    refined[..., 3] = torch.linalg.norm(delta, dim=-1) / step_dt
-    return refined
+    theta = torch.atan2(delta[..., 1], delta[..., 0]).unsqueeze(-1)
+    speed = (torch.linalg.norm(delta, dim=-1) / step_dt).unsqueeze(-1)
+    return torch.cat([xy, theta, speed], dim=-1)
 
 
 class PhysicalDiagnostics:

@@ -25,6 +25,8 @@ def get_args_parser():
     parser.add_argument("--joint_hist_lr", default=1e-5, type=float)
     parser.add_argument("--joint_hist_loss_weight", default=0.2, type=float)
     parser.add_argument("--joint_fut_loss_weight", default=1.0, type=float)
+    parser.add_argument("--joint_train_fut", default=0, type=int)
+    parser.add_argument("--joint_fut_lr", default=1e-5, type=float)
 
     # Hist diffusion model
     parser.add_argument("--input_dim", default=128, type=int)
