@@ -221,8 +221,7 @@ class DiffusionPast(nn.Module):
 
         return loss, pred, loss_parts
 
-    @torch.no_grad()
-    def forward_eval(self, hist, hist_masked, device):
+    def forward_completion(self, hist, hist_masked, device, hard_discrete=False, stage="eval"):
         B, T, _ = hist_masked.shape
 
         hist_mask = hist_masked[..., -1:].float()
@@ -261,23 +260,31 @@ class DiffusionPast(nn.Module):
 
         final_pred_norm = hist_mask * known_x0 + mask_unknown * x_t
         final_pred = self.denorm(final_pred_norm)
-        if final_pred.shape[-1] == 6:
+        loss_pred_norm = final_pred_norm
+        if hard_discrete and final_pred.shape[-1] == 6:
             final_pred[..., 4:5] = torch.clamp(torch.round(final_pred[..., 4:5]), self.lane_min, self.lane_max)
             final_pred[..., 5:6] = torch.clamp(torch.round(final_pred[..., 5:6]), self.class_min, self.class_max)
-        loss = torch.nn.functional.mse_loss(final_pred, hist)
+            loss_pred_norm = self.norm(final_pred)
+        loss, _ = self.compute_motion_loss(loss_pred_norm, self.norm(hist), hist_mask)
         visualize_hist_reconstruction(
             hist=hist,
             hist_masked=hist_masked,
             pred=final_pred,
-            stage="eval",
+            stage=stage,
             enable_train_vis=int(getattr(self.args, "hist_enable_train_vis", 0)) > 0,
             enable_eval_vis=int(getattr(self.args, "hist_enable_eval_vis", 0)) > 0,
         )
 
         return loss, final_pred
 
-    def forward(self, hist, hist_masked, device):
-        """Standard forward method for DDP compatibility"""
+    @torch.no_grad()
+    def forward_eval(self, hist, hist_masked, device):
+        return self.forward_completion(hist, hist_masked, device, hard_discrete=True, stage="eval")
+
+    def forward(self, hist, hist_masked, device, completion=False, hard_discrete=False, stage="train"):
+        """兼容 DDP 的标准 forward 入口"""
+        if completion:
+            return self.forward_completion(hist, hist_masked, device, hard_discrete=hard_discrete, stage=stage)
         return self.forward_train(hist, hist_masked, device)
 
     # hist = [B, T, dim], nbrs = [N_total, T, dim]. dim = x, y, v, a, laneID, class

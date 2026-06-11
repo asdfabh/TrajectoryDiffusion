@@ -18,13 +18,16 @@ from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.run.train_fut import prepare_input_data
 from method_diffusion.run.train_joint import (
-    HIST_CHECKPOINT_DIR,
     JOINT_FUT_CHECKPOINT_DIR,
     JOINT_HIST_CHECKPOINT_DIR,
     build_hist_outputs,
+    compute_horizon_rmse_stats,
+    get_joint_report_horizon,
+    hist_checkpoint_dirs_for_dataset,
     init_csv_log,
     load_fut_checkpoint,
     load_hist_checkpoint,
+    normalize_dataset_name,
     write_csv_log,
 )
 from method_diffusion.utils.fut_utils import compute_batch_kinematic_metrics, compute_batch_metric, select_closest_prediction
@@ -80,12 +83,26 @@ def build_distributed_loader(dataset, batch_size, num_workers, sampler, drop_las
     )
 
 
-def load_hist_checkpoint_for_rank(model, resume_hist, checkpoint_dirs, device, rank):
+def load_hist_checkpoint_for_rank(model, resume_hist, checkpoint_dirs, device, rank, trainable=False, dataset_name=None):
     if is_main_process(rank):
-        return load_hist_checkpoint(model, resume_hist, checkpoint_dirs, device)
+        return load_hist_checkpoint(
+            model,
+            resume_hist,
+            checkpoint_dirs,
+            device,
+            trainable=trainable,
+            dataset_name=dataset_name,
+        )
     with open(os.devnull, "w", encoding="utf-8") as devnull:
         with contextlib.redirect_stdout(devnull):
-            return load_hist_checkpoint(model, resume_hist, checkpoint_dirs, device)
+            return load_hist_checkpoint(
+                model,
+                resume_hist,
+                checkpoint_dirs,
+                device,
+                trainable=trainable,
+                dataset_name=dataset_name,
+            )
 
 
 def load_fut_checkpoint_for_rank(args, model, optimizer, scheduler, device, rank):
@@ -108,57 +125,92 @@ def train_epoch(
     mask_ratio,
     random_mask_ratio,
     block_mask_start,
+    train_hist,
+    hist_loss_weight,
+    fut_loss_weight,
 ):
     model_fut.train()
     model_hist.eval()
 
     total_loss = 0.0
+    total_fut_loss = 0.0
+    total_hist_loss = 0.0
     num_batches = 0
 
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Train", ncols=140, disable=not is_main_process(rank))
 
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        pred_hist = build_hist_outputs(
+        hist_loss, pred_hist = build_hist_outputs(
             model_hist=model_hist,
             hist=hist,
             mask_ratio=mask_ratio,
             random_mask_ratio=random_mask_ratio,
             block_mask_start=block_mask_start,
             device=device,
+            train_hist=train_hist,
         )
-        loss, _ = model_fut(pred_hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+        fut_loss, _ = model_fut(pred_hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+        loss = float(fut_loss_weight) * fut_loss
+        if train_hist:
+            loss = loss + float(hist_loss_weight) * hist_loss
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model_fut.parameters(), max_norm=1.0)
+        grad_params = list(model_fut.parameters())
+        if train_hist:
+            grad_params += list(model_hist.parameters())
+        torch.nn.utils.clip_grad_norm_(grad_params, max_norm=1.0)
         optimizer.step()
 
         total_loss += float(loss.item())
+        total_fut_loss += float(fut_loss.item())
+        total_hist_loss += float(hist_loss.item())
         num_batches += 1
 
         if is_main_process(rank):
             pbar.set_postfix({
                 "loss": f"{loss.item():.6f}",
+                "fut": f"{fut_loss.item():.6f}",
+                "hist": f"{hist_loss.item():.6f}",
                 "avg": f"{(total_loss / num_batches):.6f}",
             })
 
     stats = torch.tensor(
         [
             total_loss,
+            total_fut_loss,
+            total_hist_loss,
             float(num_batches),
         ],
         device=device,
         dtype=torch.float64,
     )
     stats = reduce_tensor(stats)
-    denom = max(int(stats[1].item()), 1)
+    denom = max(int(stats[3].item()), 1)
 
-    return {"loss": float(stats[0].item()) / denom}
+    return {
+        "loss": float(stats[0].item()) / denom,
+        "loss_fut": float(stats[1].item()) / denom,
+        "loss_hist": float(stats[2].item()) / denom,
+    }
 
 
 @torch.no_grad()
-def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, rank, mask_ratio, random_mask_ratio, block_mask_start):
+def evaluate(
+    model_fut,
+    model_hist,
+    dataloader,
+    device,
+    epoch,
+    feature_dim,
+    rank,
+    mask_ratio,
+    random_mask_ratio,
+    block_mask_start,
+    horizon_idx,
+    horizon_label,
+):
     was_fut_training = model_fut.training
     was_hist_training = model_hist.training
     fut_model = model_fut.module if hasattr(model_fut, "module") else model_fut
@@ -170,6 +222,8 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, rank
     total_fde = 0.0
     total_theta_deg = 0.0
     total_v_mps = 0.0
+    total_horizon_sse = 0.0
+    total_horizon_count = 0.0
     num_batches = 0
 
     if len(dataloader) == 0:
@@ -177,7 +231,7 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, rank
             model_fut.train()
         if was_hist_training:
             model_hist.train()
-        return 0.0, 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     pbar = tqdm(
         dataloader,
@@ -193,13 +247,14 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, rank
             feature_dim,
             device=device,
         )
-        pred_hist = build_hist_outputs(
+        _, pred_hist = build_hist_outputs(
             model_hist=model_hist,
             hist=hist,
             mask_ratio=mask_ratio,
             random_mask_ratio=random_mask_ratio,
             block_mask_start=block_mask_start,
             device=device,
+            train_hist=False,
         )
         if int(fut_model.fut_k) > 1:
             all_preds = fut_model.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, device, K=fut_model.fut_k)
@@ -209,22 +264,29 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, rank
             pred_fut = all_preds.squeeze(1)
         eval_rmse, eval_ade, eval_fde = compute_batch_metric(pred_fut, fut, op_mask)
         eval_theta_deg, eval_v_mps = compute_batch_kinematic_metrics(pred_fut, fut, op_mask)
+        horizon_sse, horizon_count = compute_horizon_rmse_stats(pred_fut, fut, op_mask, horizon_idx)
         eval_rmse = float(eval_rmse.item())
         eval_ade = float(eval_ade.item())
         eval_fde = float(eval_fde.item())
         eval_theta_deg = float(eval_theta_deg.item())
         eval_v_mps = float(eval_v_mps.item())
+        horizon_sse = float(horizon_sse.item())
+        horizon_count = float(horizon_count.item())
 
         total_rmse += eval_rmse
         total_ade += eval_ade
         total_fde += eval_fde
         total_theta_deg += eval_theta_deg
         total_v_mps += eval_v_mps
+        total_horizon_sse += horizon_sse
+        total_horizon_count += horizon_count
         num_batches += 1
 
         if is_main_process(rank):
+            avg_horizon_rmse = (total_horizon_sse / max(total_horizon_count, 1.0)) ** 0.5
             pbar.set_postfix({
                 "avg_rmse_m": f"{(total_rmse / num_batches):.4f}",
+                f"rmse_{horizon_label}": f"{avg_horizon_rmse:.4f}",
                 "avg_ade_m": f"{(total_ade / num_batches):.4f}",
                 "avg_fde_m": f"{(total_fde / num_batches):.4f}",
                 "avg_theta_deg": f"{(total_theta_deg / num_batches):.4f}",
@@ -232,7 +294,16 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, rank
             })
 
     stats = torch.tensor(
-        [total_rmse, total_ade, total_fde, total_theta_deg, total_v_mps, float(num_batches)],
+        [
+            total_rmse,
+            total_ade,
+            total_fde,
+            total_theta_deg,
+            total_v_mps,
+            total_horizon_sse,
+            total_horizon_count,
+            float(num_batches),
+        ],
         device=device,
         dtype=torch.float64,
     )
@@ -241,9 +312,11 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, rank
         model_fut.train()
     if was_hist_training:
         model_hist.train()
-    denom = max(int(stats[5].item()), 1)
+    denom = max(int(stats[7].item()), 1)
+    horizon_rmse = (float(stats[5].item()) / max(float(stats[6].item()), 1.0)) ** 0.5
     return (
         float(stats[0].item()) / denom,
+        horizon_rmse,
         float(stats[1].item()) / denom,
         float(stats[2].item()) / denom,
         float(stats[3].item()) / denom,
@@ -254,7 +327,7 @@ def evaluate(model_fut, model_hist, dataloader, device, epoch, feature_dim, rank
 def main():
     rank, local_rank, world_size, device = setup_ddp()
     args = get_args_parser().parse_args()
-    dataset_name = str(args.dataset).lower()
+    dataset_name = normalize_dataset_name(args.dataset)
     checkpoint_dir = JOINT_FUT_CHECKPOINT_DIR / dataset_name
     args.checkpoint_dir = str(checkpoint_dir)
 
@@ -295,21 +368,32 @@ def main():
     val_loader = build_distributed_loader(val_dataset, args.batch_size, args.num_workers, val_sampler, drop_last=False)
 
     model_hist = DiffusionPast(args).to(device)
+    train_hist = int(args.joint_train_hist) > 0
     load_hist_checkpoint_for_rank(
         model_hist,
         args.resume_hist,
-        [HIST_CHECKPOINT_DIR, JOINT_HIST_CHECKPOINT_DIR],
+        hist_checkpoint_dirs_for_dataset(dataset_name),
         device,
         rank,
+        trainable=train_hist,
+        dataset_name=dataset_name,
     )
 
     model_fut = DiffusionFut(args).to(device)
     fut_lr = float(args.learning_rate)
-    optimizer = torch.optim.AdamW(model_fut.parameters(), lr=fut_lr, weight_decay=1e-5)
+    optimizer_groups = [{"params": model_fut.parameters(), "lr": fut_lr}]
+    if train_hist:
+        optimizer_groups.append({"params": model_hist.parameters(), "lr": float(args.joint_hist_lr)})
+    optimizer = torch.optim.AdamW(optimizer_groups, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
     start_epoch, best_rmse = load_fut_checkpoint_for_rank(args, model_fut, optimizer, scheduler, device, rank)
 
     if dist.is_initialized():
+        if train_hist:
+            if device.type == "cuda":
+                model_hist = DDP(model_hist, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+            else:
+                model_hist = DDP(model_hist, find_unused_parameters=False)
         if device.type == "cuda":
             model_fut = DDP(model_fut, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
         else:
@@ -318,10 +402,12 @@ def main():
     mask_ratio = max(0.0, min(1.0, float(args.mask_prob)))
     random_mask_ratio = max(0.0, min(1.0, float(args.random_mask_ratio)))
     block_mask_start = int(args.block_mask_start) > 0
+    report_horizon_s, report_horizon_idx, report_horizon_label = get_joint_report_horizon(dataset_name)
 
     if is_main_process(rank):
         print(
-            f"[DDP JointTrain] hist_frozen=1 | lr_fut={fut_lr:.2e}"
+            f"[DDP JointTrain] joint_train_hist={int(train_hist)} | "
+            f"lr_fut={fut_lr:.2e} | lr_hist={float(args.joint_hist_lr):.2e}"
         )
 
     for epoch in range(start_epoch, args.num_epochs):
@@ -340,8 +426,11 @@ def main():
             mask_ratio=mask_ratio,
             random_mask_ratio=random_mask_ratio,
             block_mask_start=block_mask_start,
+            train_hist=train_hist,
+            hist_loss_weight=float(args.joint_hist_loss_weight),
+            fut_loss_weight=float(args.joint_fut_loss_weight),
         )
-        eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps = evaluate(
+        eval_rmse, eval_horizon_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps = evaluate(
             model_fut=model_fut,
             model_hist=model_hist,
             dataloader=val_loader,
@@ -352,13 +441,30 @@ def main():
             mask_ratio=mask_ratio,
             random_mask_ratio=random_mask_ratio,
             block_mask_start=block_mask_start,
+            horizon_idx=report_horizon_idx,
+            horizon_label=report_horizon_label,
         )
 
         if is_main_process(rank):
             current_lr_fut = float(optimizer.param_groups[0]["lr"])
-            write_csv_log(log_csv_path, epoch + 1, train_stats, eval_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps, current_lr_fut)
+            write_csv_log(
+                log_csv_path,
+                epoch + 1,
+                train_stats,
+                eval_rmse,
+                report_horizon_s,
+                eval_horizon_rmse,
+                eval_ade,
+                eval_fde,
+                eval_theta_deg,
+                eval_v_mps,
+                current_lr_fut,
+            )
             writer.add_scalar("Loss/Train", train_stats["loss"], epoch + 1)
+            writer.add_scalar("Loss/TrainFut", train_stats["loss_fut"], epoch + 1)
+            writer.add_scalar("Loss/TrainHist", train_stats["loss_hist"], epoch + 1)
             writer.add_scalar("Eval/RMSE_m", eval_rmse, epoch + 1)
+            writer.add_scalar(f"Eval/RMSE_{report_horizon_label}", eval_horizon_rmse, epoch + 1)
             writer.add_scalar("Eval/ADE_m", eval_ade, epoch + 1)
             writer.add_scalar("Eval/FDE_m", eval_fde, epoch + 1)
             writer.add_scalar("Eval/Theta_deg", eval_theta_deg, epoch + 1)
@@ -367,7 +473,10 @@ def main():
             print(
                 f"Epoch {epoch + 1}/{args.num_epochs} | "
                 f"train={train_stats['loss']:.6f} | "
+                f"fut={train_stats['loss_fut']:.6f} | "
+                f"hist={train_stats['loss_hist']:.6f} | "
                 f"rmse_m={eval_rmse:.4f} | "
+                f"rmse_{report_horizon_label}={eval_horizon_rmse:.4f} | "
                 f"ade_m={eval_ade:.4f} | "
                 f"fde_m={eval_fde:.4f} | "
                 f"theta_deg={eval_theta_deg:.4f} | "
@@ -387,7 +496,11 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "loss": train_stats["loss"],
+                "loss_fut": train_stats["loss_fut"],
+                "loss_hist": train_stats["loss_hist"],
                 "eval_rmse_m": eval_rmse,
+                "eval_horizon_s": report_horizon_s,
+                "eval_horizon_rmse_m": eval_horizon_rmse,
                 "eval_ade_m": eval_ade,
                 "eval_fde_m": eval_fde,
                 "eval_theta_deg": eval_theta_deg,
@@ -396,13 +509,30 @@ def main():
                 "best_score": best_rmse,
                 "best_rmse_m": best_rmse,
                 "resume_hist": args.resume_hist,
+                "joint_train_hist": int(train_hist),
             }
+            if train_hist:
+                hist_state_dict = model_hist.module.state_dict() if hasattr(model_hist, "module") else model_hist.state_dict()
+                fut_state["hist_model_state_dict"] = hist_state_dict
 
             if (epoch + 1) % args.save_interval == 0:
                 torch.save(fut_state, checkpoint_dir / f"epoch_{epoch + 1}.pth")
 
             if is_best:
                 torch.save(fut_state, checkpoint_dir / "best.pth")
+                if train_hist:
+                    hist_checkpoint_dir = JOINT_HIST_CHECKPOINT_DIR / dataset_name
+                    hist_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                    torch.save(
+                        {
+                            "epoch": epoch + 1,
+                            "model_state_dict": hist_state_dict,
+                            "loss": train_stats["loss_hist"],
+                            "best_rmse_m": best_rmse,
+                            "args": vars(args),
+                        },
+                        hist_checkpoint_dir / "checkpoint_best.pth",
+                    )
 
         if dist.is_initialized():
             dist.barrier()

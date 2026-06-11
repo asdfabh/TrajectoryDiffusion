@@ -12,7 +12,6 @@ from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.run.evaluate import (
     HIST_CHECKPOINT_DIR,
-    load_checkpoint as load_hist_checkpoint,
     prepare_input_data as prepare_hist_input_data,
 )
 from method_diffusion.run.evaluate_fut import (
@@ -21,7 +20,12 @@ from method_diffusion.run.evaluate_fut import (
     print_metrics,
 )
 from method_diffusion.run.train_fut import prepare_input_data
-from method_diffusion.run.train_joint import JOINT_FUT_CHECKPOINT_DIR, JOINT_HIST_CHECKPOINT_DIR
+from method_diffusion.run.train_joint import (
+    JOINT_FUT_CHECKPOINT_DIR,
+    JOINT_HIST_CHECKPOINT_DIR,
+    load_hist_checkpoint,
+    normalize_dataset_name,
+)
 from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_closest_prediction
 from method_diffusion.utils.visualization import visualize_scene_prediction
 
@@ -39,8 +43,6 @@ def resolve_hist_checkpoint_dir(resume_hist, dataset_name):
         candidate = base_dir / dataset_name / "checkpoint_best.pth"
         if candidate.exists():
             return candidate.parent
-        if (base_dir / "checkpoint_best.pth").exists():
-            return base_dir
     return HIST_CHECKPOINT_DIR / dataset_name
 
 
@@ -117,7 +119,7 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enab
 def main():
     args = get_eval_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset_name = str(args.dataset).strip().lower()
+    dataset_name = normalize_dataset_name(args.dataset)
     hist_checkpoint_dir = resolve_hist_checkpoint_dir(args.resume_hist, dataset_name)
     fut_checkpoint_dir = JOINT_FUT_CHECKPOINT_DIR / dataset_name
 
@@ -129,7 +131,7 @@ def main():
     test_loader = build_test_loader(args)
     model_hist = DiffusionPast(args).to(device)
     model_fut = DiffusionFut(args).to(device)
-    load_hist_checkpoint(model_hist, args.resume_hist, hist_checkpoint_dir, device, model_name="JointHistEval")
+    load_hist_checkpoint(model_hist, args.resume_hist, [hist_checkpoint_dir], device, trainable=False, dataset_name=dataset_name)
     load_fut_checkpoint(model_fut, args.resume_fut, fut_checkpoint_dir, device)
     evaluate(
         model_hist=model_hist,
