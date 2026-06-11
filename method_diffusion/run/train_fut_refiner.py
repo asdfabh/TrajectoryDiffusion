@@ -23,7 +23,7 @@ REFINER_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut_refiner"
 
 
 def get_refiner_checkpoint_dir(dataset_name):
-    return REFINER_CHECKPOINT_DIR / str(dataset_name).strip().lower() / "temporal_basis"
+    return REFINER_CHECKPOINT_DIR / str(dataset_name).strip().lower()
 
 
 def resolve_checkpoint_path(resume_arg, checkpoint_dir):

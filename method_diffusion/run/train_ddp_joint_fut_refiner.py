@@ -22,10 +22,16 @@ from method_diffusion.run.train_ddp_fut import (
     setup_ddp,
 )
 from method_diffusion.run.train_fut import prepare_input_data
-from method_diffusion.run.train_fut_refiner import compute_refiner_loss
+from method_diffusion.run.train_fut_refiner import (
+    FUT_CHECKPOINT_DIR,
+    compute_refiner_loss,
+    get_refiner_checkpoint_dir,
+)
 from method_diffusion.run.train_joint_fut_refiner import (
-    get_joint_checkpoint_dir,
+    build_fut_state,
+    build_refiner_state,
     load_trainable_fut_model,
+    save_component_checkpoints,
     write_csv_row,
 )
 from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_closest_prediction
@@ -224,14 +230,17 @@ def main():
     rank, local_rank, world_size, device = setup_ddp()
     args = get_args_parser().parse_args()
     dataset_name = str(args.dataset).strip().lower()
-    checkpoint_dir = get_joint_checkpoint_dir(dataset_name)
-    csv_path = checkpoint_dir / "train_log.csv"
+    refiner_checkpoint_dir = get_refiner_checkpoint_dir(dataset_name)
+    fut_checkpoint_dir = FUT_CHECKPOINT_DIR / dataset_name
+    csv_path = refiner_checkpoint_dir / "train_log.csv"
 
     if is_main_process(rank):
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        refiner_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        fut_checkpoint_dir.mkdir(parents=True, exist_ok=True)
         print(f"[DDP JointRefinerTrain] Dataset: {dataset_name}")
         print(f"[DDP JointRefinerTrain] World size: {world_size}")
-        print(f"[DDP JointRefinerTrain] Checkpoint dir: {checkpoint_dir}")
+        print(f"[DDP JointRefinerTrain] Refiner checkpoint dir: {refiner_checkpoint_dir}")
+        print(f"[DDP JointRefinerTrain] Fut checkpoint dir: {fut_checkpoint_dir}")
         print("[DDP JointRefinerTrain] Refiner: TABR-temporal-basis")
 
     train_path = str(get_split_path(args, dataset_name, "Train"))
@@ -348,20 +357,16 @@ def main():
 
         if is_main_process(rank):
             joint = unwrap_model(joint_model)
-            state = {
-                "epoch": epoch,
-                "model_state_dict": joint.refiner.state_dict(),
-                "fut_model_state_dict": joint.fut_model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "best_rmse_m": best_rmse,
-                "refiner_type": "temporal_basis_joint",
-                "args": vars(args),
-            }
-            if epoch % int(args.save_interval) == 0:
-                torch.save(state, checkpoint_dir / f"epoch_{epoch}.pth")
-            if is_best:
-                torch.save(state, checkpoint_dir / "best.pth")
+            save_component_checkpoints(
+                epoch=epoch,
+                is_best=is_best,
+                train_fut=train_fut,
+                refiner_checkpoint_dir=refiner_checkpoint_dir,
+                fut_checkpoint_dir=fut_checkpoint_dir,
+                refiner_state=build_refiner_state(epoch, joint.refiner, optimizer, scheduler, best_rmse, args),
+                fut_state=build_fut_state(epoch, joint.fut_model, best_rmse, args) if train_fut else None,
+                save_interval=args.save_interval,
+            )
 
         if dist.is_initialized():
             dist.barrier()

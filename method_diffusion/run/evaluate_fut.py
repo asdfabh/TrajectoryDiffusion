@@ -29,7 +29,7 @@ REFINER_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut_refiner"
 
 
 def get_refiner_checkpoint_dir(dataset_name):
-    return REFINER_CHECKPOINT_DIR / str(dataset_name).strip().lower() / "temporal_basis"
+    return REFINER_CHECKPOINT_DIR / str(dataset_name).strip().lower()
 
 
 # 解析 fut checkpoint 标识并返回实际文件路径。

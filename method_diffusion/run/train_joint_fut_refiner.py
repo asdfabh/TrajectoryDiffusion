@@ -1,7 +1,6 @@
 import csv
 import os
 import sys
-from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
@@ -16,15 +15,11 @@ from method_diffusion.models.trajectory_refiner import build_trajectory_refiner
 from method_diffusion.run.train_fut import prepare_input_data
 from method_diffusion.run.train_fut_refiner import (
     FUT_CHECKPOINT_DIR,
-    REFINER_CHECKPOINT_DIR,
     compute_refiner_loss,
+    get_refiner_checkpoint_dir,
     resolve_checkpoint_path,
 )
 from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_closest_prediction
-
-
-def get_joint_checkpoint_dir(dataset_name):
-    return REFINER_CHECKPOINT_DIR / str(dataset_name).strip().lower() / "temporal_basis_joint"
 
 
 def load_trainable_fut_model(args, device):
@@ -168,17 +163,61 @@ def write_csv_row(csv_path, epoch, train_stats, baseline_summary, refined_summar
         writer.writerow(row)
 
 
+def build_refiner_state(epoch, refiner, optimizer, scheduler, best_rmse, args):
+    return {
+        "epoch": epoch,
+        "model_state_dict": refiner.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "best_rmse_m": best_rmse,
+        "refiner_type": "temporal_basis",
+        "args": vars(args),
+    }
+
+
+def build_fut_state(epoch, fut_model, best_rmse, args):
+    return {
+        "epoch": epoch,
+        "model_state_dict": fut_model.state_dict(),
+        "best_rmse_m": best_rmse,
+        "args": vars(args),
+    }
+
+
+def save_component_checkpoints(
+    epoch,
+    is_best,
+    train_fut,
+    refiner_checkpoint_dir,
+    fut_checkpoint_dir,
+    refiner_state,
+    fut_state,
+    save_interval,
+):
+    if epoch % int(save_interval) == 0:
+        torch.save(refiner_state, refiner_checkpoint_dir / f"epoch_{epoch}.pth")
+        if train_fut:
+            torch.save(fut_state, fut_checkpoint_dir / f"epoch_{epoch}.pth")
+    if is_best:
+        torch.save(refiner_state, refiner_checkpoint_dir / "best.pth")
+        if train_fut:
+            torch.save(fut_state, fut_checkpoint_dir / "best.pth")
+
+
 def main():
     args = get_args_parser().parse_args()
     dataset_name = str(args.dataset).strip().lower()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint_dir = get_joint_checkpoint_dir(dataset_name)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = checkpoint_dir / "train_log.csv"
+    refiner_checkpoint_dir = get_refiner_checkpoint_dir(dataset_name)
+    fut_checkpoint_dir = FUT_CHECKPOINT_DIR / dataset_name
+    refiner_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    fut_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = refiner_checkpoint_dir / "train_log.csv"
 
     print(f"[JointRefinerTrain] Dataset: {dataset_name}")
     print(f"[JointRefinerTrain] Device: {device}")
-    print(f"[JointRefinerTrain] Checkpoint dir: {checkpoint_dir}")
+    print(f"[JointRefinerTrain] Refiner checkpoint dir: {refiner_checkpoint_dir}")
+    print(f"[JointRefinerTrain] Fut checkpoint dir: {fut_checkpoint_dir}")
     print("[JointRefinerTrain] Refiner: TABR-temporal-basis")
 
     train_loader = build_loader(args, dataset_name, "Train", shuffle=True, drop_last=True)
@@ -238,20 +277,16 @@ def main():
         is_best = selection_score < best_rmse
         if is_best:
             best_rmse = selection_score
-        state = {
-            "epoch": epoch,
-            "model_state_dict": refiner.state_dict(),
-            "fut_model_state_dict": fut_model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "best_rmse_m": best_rmse,
-            "refiner_type": "temporal_basis_joint",
-            "args": vars(args),
-        }
-        if epoch % int(args.save_interval) == 0:
-            torch.save(state, checkpoint_dir / f"epoch_{epoch}.pth")
-        if is_best:
-            torch.save(state, checkpoint_dir / "best.pth")
+        save_component_checkpoints(
+            epoch=epoch,
+            is_best=is_best,
+            train_fut=train_fut,
+            refiner_checkpoint_dir=refiner_checkpoint_dir,
+            fut_checkpoint_dir=fut_checkpoint_dir,
+            refiner_state=build_refiner_state(epoch, refiner, optimizer, scheduler, best_rmse, args),
+            fut_state=build_fut_state(epoch, fut_model, best_rmse, args) if train_fut else None,
+            save_interval=args.save_interval,
+        )
 
 
 if __name__ == "__main__":
