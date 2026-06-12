@@ -4,7 +4,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser("Set diffusion predicter", add_help=False)
 
     # Data
-    parser.add_argument("--dataset", default="ngsim", type=str, choices=["ngsim", "highd", "round"])
+    parser.add_argument("--dataset", default="round", type=str, choices=["ngsim", "highd", "round"])
     parser.add_argument("--data_root_ngsim", default="/mnt/datasets/ngsimdata", type=str)
     parser.add_argument("--data_root_highd", default="/mnt/datasets/highDdata", type=str)
     parser.add_argument("--data_root_round", default="/mnt/datasets/round", type=str)
@@ -27,6 +27,7 @@ def get_args_parser():
     parser.add_argument("--joint_fut_loss_weight", default=1.0, type=float)
     parser.add_argument("--joint_train_fut", default=0, type=int)
     parser.add_argument("--joint_fut_lr", default=1e-5, type=float)
+    parser.add_argument("--enable_past_fut_latent_bridge", default=1, type=int)
 
     # Hist diffusion model
     parser.add_argument("--input_dim", default=128, type=int)

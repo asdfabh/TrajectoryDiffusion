@@ -54,6 +54,13 @@ class DiffusionFut(nn.Module):
         self.input_embedding = nn.Linear(self.input_dim, self.hidden_dim)
         self.pos_embedding = SequentialPositionalEncoding(self.hidden_dim)
         self.hist_encoder = HistEncoder(args)
+        self.enable_past_fut_latent_bridge = int(getattr(args, "enable_past_fut_latent_bridge", 0)) > 0
+        if self.enable_past_fut_latent_bridge:
+            self.past_token_projection = nn.Linear(int(args.input_dim), self.hidden_dim)
+            self.past_token_norm = nn.LayerNorm(self.hidden_dim)
+        else:
+            self.past_token_projection = None
+            self.past_token_norm = None
 
         # DiT 主干与扩散调度器。
         self.timestep_embedder = dit.TimestepEmbedder(self.hidden_dim, self.time_embedding_size)
@@ -161,7 +168,18 @@ class DiffusionFut(nn.Module):
         return total_loss, final_logs
 
     # 训练入口：Index 与 WTA score 在米制 xy 空间计算，损失也在米制物理坐标系计算。
-    def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
+    def build_context_tokens(self, hist, hist_nbrs, mask, temporal_mask, past_latent_tokens=None):
+        context_tokens = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
+        if not self.enable_past_fut_latent_bridge:
+            return context_tokens
+        if past_latent_tokens is None:
+            raise ValueError("past_latent_tokens is required when enable_past_fut_latent_bridge=1.")
+        past_context = self.past_token_projection(past_latent_tokens)
+        past_context = self.past_token_norm(past_context)
+        context_tokens = torch.cat([context_tokens, past_context], dim=1)
+        return context_tokens
+
+    def forwardTrain(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, past_latent_tokens=None):
         bsz, t_len, _ = future.shape
         valid_mask = (op_mask[..., 0] > 0.5).float().to(device) # [B,T]
 
@@ -178,7 +196,7 @@ class DiffusionFut(nn.Module):
             noise.reshape(bsz * k, t_len, self.output_dim),
             timesteps_all,
         ).float()
-        context_tokens = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
+        context_tokens = self.build_context_tokens(hist, hist_nbrs, mask, temporal_mask, past_latent_tokens=past_latent_tokens)
         context_tokens_all = context_tokens.repeat_interleave(k, dim=0)
         pred_x0_levels = self.forwardDenoiseCascade(x_t, timesteps_all, context_tokens_all, stage="train")
         pred_x0_all = pred_x0_levels[-1].view(bsz, k, t_len, self.output_dim)
@@ -200,13 +218,13 @@ class DiffusionFut(nn.Module):
         loss_logs["assign_max_win_ratio"] = max_win_ratio.detach()
         return loss, loss_logs
 
-    def forward_eval_multi(self, hist, hist_nbrs, mask, temporal_mask, device, K=None, t_len=None, stage="eval"):
+    def forward_eval_multi(self, hist, hist_nbrs, mask, temporal_mask, device, K=None, t_len=None, stage="eval", past_latent_tokens=None):
         self._validate_denoise_stage(stage)
         bsz = hist.size(0)
         t_len = self.T
         k = self.fut_k if K is None else max(1, int(K))
 
-        context_tokens = self.hist_encoder(hist, hist_nbrs, mask, temporal_mask)
+        context_tokens = self.build_context_tokens(hist, hist_nbrs, mask, temporal_mask, past_latent_tokens=past_latent_tokens)
         context_tokens = context_tokens.repeat_interleave(k, dim=0)
 
         diffusion_scheduler = DDIMScheduler.from_config(self.diffusion_scheduler.config)
@@ -226,12 +244,12 @@ class DiffusionFut(nn.Module):
         return pred_phys
 
     @torch.no_grad()
-    def forwardEvalMulti(self, hist, hist_nbrs, mask, temporal_mask, device, K=None, t_len=None):
-        return self.forward_eval_multi(hist, hist_nbrs, mask, temporal_mask, device, K=K, t_len=t_len, stage="eval")
+    def forwardEvalMulti(self, hist, hist_nbrs, mask, temporal_mask, device, K=None, t_len=None, past_latent_tokens=None):
+        return self.forward_eval_multi(hist, hist_nbrs, mask, temporal_mask, device, K=K, t_len=t_len, stage="eval", past_latent_tokens=past_latent_tokens)
 
     # 统一前向入口，默认复用训练路径。
-    def forward(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device):
-        return self.forwardTrain(hist, hist_nbrs, mask, temporal_mask, future, op_mask, device)
+    def forward(self, hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, past_latent_tokens=None):
+        return self.forwardTrain(hist, hist_nbrs, mask, temporal_mask, future, op_mask, device, past_latent_tokens=past_latent_tokens)
 
     # 归一化与反归一化，处理 future [x, y, theta, v]。
     def norm(self, x):

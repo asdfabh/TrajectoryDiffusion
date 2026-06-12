@@ -221,7 +221,7 @@ class DiffusionPast(nn.Module):
 
         return loss, pred, loss_parts
 
-    def forward_completion(self, hist, hist_masked, device, hard_discrete=False, stage="eval"):
+    def forward_completion(self, hist, hist_masked, device, hard_discrete=False, stage="eval", return_tokens=False):
         B, T, _ = hist_masked.shape
 
         hist_mask = hist_masked[..., -1:].float()
@@ -245,7 +245,10 @@ class DiffusionPast(nn.Module):
             model_input = torch.cat((x_t, cond), dim=-1)
             input_embedded = self.input_embedding(model_input) + self.pos_embedding(model_input)
             t_cond = self.timestep_embedder(t_batch)
-            pred_x0_norm = self.dit(input_embedded, t_cond)
+            if return_tokens:
+                pred_x0_norm, past_latent_tokens = self.dit(input_embedded, t_cond, return_hidden=True)
+            else:
+                pred_x0_norm = self.dit(input_embedded, t_cond)
 
             # 采样阶段强约束已观测轨迹，模型重点修复缺失段
             pred_x0_norm = hist_mask * known_x0 + mask_unknown * pred_x0_norm
@@ -275,16 +278,18 @@ class DiffusionPast(nn.Module):
             enable_eval_vis=int(getattr(self.args, "hist_enable_eval_vis", 0)) > 0,
         )
 
+        if return_tokens:
+            return loss, final_pred, past_latent_tokens
         return loss, final_pred
 
     @torch.no_grad()
-    def forward_eval(self, hist, hist_masked, device):
-        return self.forward_completion(hist, hist_masked, device, hard_discrete=True, stage="eval")
+    def forward_eval(self, hist, hist_masked, device, return_tokens=False):
+        return self.forward_completion(hist, hist_masked, device, hard_discrete=True, stage="eval", return_tokens=return_tokens)
 
-    def forward(self, hist, hist_masked, device, completion=False, hard_discrete=False, stage="train"):
+    def forward(self, hist, hist_masked, device, completion=False, hard_discrete=False, stage="train", return_tokens=False):
         """兼容 DDP 的标准 forward 入口"""
         if completion:
-            return self.forward_completion(hist, hist_masked, device, hard_discrete=hard_discrete, stage=stage)
+            return self.forward_completion(hist, hist_masked, device, hard_discrete=hard_discrete, stage=stage, return_tokens=return_tokens)
         return self.forward_train(hist, hist_masked, device)
 
     # hist = [B, T, dim], nbrs = [N_total, T, dim]. dim = x, y, v, a, laneID, class

@@ -128,6 +128,7 @@ def train_epoch(
     train_hist,
     hist_loss_weight,
     fut_loss_weight,
+    enable_latent_bridge,
 ):
     model_fut.train()
     model_hist.eval()
@@ -141,7 +142,7 @@ def train_epoch(
 
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        hist_loss, pred_hist = build_hist_outputs(
+        hist_loss, pred_hist, past_latent_tokens = build_hist_outputs(
             model_hist=model_hist,
             hist=hist,
             mask_ratio=mask_ratio,
@@ -149,8 +150,9 @@ def train_epoch(
             block_mask_start=block_mask_start,
             device=device,
             train_hist=train_hist,
+            return_tokens=enable_latent_bridge,
         )
-        fut_loss, _ = model_fut(pred_hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device)
+        fut_loss, _ = model_fut(pred_hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, past_latent_tokens=past_latent_tokens)
         loss = float(fut_loss_weight) * fut_loss
         if train_hist:
             loss = loss + float(hist_loss_weight) * hist_loss
@@ -210,6 +212,7 @@ def evaluate(
     block_mask_start,
     horizon_idx,
     horizon_label,
+    enable_latent_bridge,
 ):
     was_fut_training = model_fut.training
     was_hist_training = model_hist.training
@@ -247,7 +250,7 @@ def evaluate(
             feature_dim,
             device=device,
         )
-        _, pred_hist = build_hist_outputs(
+        _, pred_hist, past_latent_tokens = build_hist_outputs(
             model_hist=model_hist,
             hist=hist,
             mask_ratio=mask_ratio,
@@ -255,12 +258,13 @@ def evaluate(
             block_mask_start=block_mask_start,
             device=device,
             train_hist=False,
+            return_tokens=enable_latent_bridge,
         )
         if int(fut_model.fut_k) > 1:
-            all_preds = fut_model.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, device, K=fut_model.fut_k)
+            all_preds = fut_model.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, device, K=fut_model.fut_k, past_latent_tokens=past_latent_tokens)
             pred_fut, _, _ = select_closest_prediction(all_preds, fut, op_mask)
         else:
-            all_preds = fut_model.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, device, K=1)
+            all_preds = fut_model.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, device, K=1, past_latent_tokens=past_latent_tokens)
             pred_fut = all_preds.squeeze(1)
         eval_rmse, eval_ade, eval_fde = compute_batch_metric(pred_fut, fut, op_mask)
         eval_theta_deg, eval_v_mps = compute_batch_kinematic_metrics(pred_fut, fut, op_mask)
@@ -403,10 +407,12 @@ def main():
     random_mask_ratio = max(0.0, min(1.0, float(args.random_mask_ratio)))
     block_mask_start = int(args.block_mask_start) > 0
     report_horizon_s, report_horizon_idx, report_horizon_label = get_joint_report_horizon(dataset_name)
+    enable_latent_bridge = int(args.enable_past_fut_latent_bridge) > 0
 
     if is_main_process(rank):
         print(
             f"[DDP JointTrain] joint_train_hist={int(train_hist)} | "
+            f"latent_bridge={int(enable_latent_bridge)} | "
             f"lr_fut={fut_lr:.2e} | lr_hist={float(args.joint_hist_lr):.2e}"
         )
 
@@ -429,6 +435,7 @@ def main():
             train_hist=train_hist,
             hist_loss_weight=float(args.joint_hist_loss_weight),
             fut_loss_weight=float(args.joint_fut_loss_weight),
+            enable_latent_bridge=enable_latent_bridge,
         )
         eval_rmse, eval_horizon_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps = evaluate(
             model_fut=model_fut,
@@ -443,6 +450,7 @@ def main():
             block_mask_start=block_mask_start,
             horizon_idx=report_horizon_idx,
             horizon_label=report_horizon_label,
+            enable_latent_bridge=enable_latent_bridge,
         )
 
         if is_main_process(rank):
@@ -510,6 +518,7 @@ def main():
                 "best_rmse_m": best_rmse,
                 "resume_hist": args.resume_hist,
                 "joint_train_hist": int(train_hist),
+                "enable_past_fut_latent_bridge": int(enable_latent_bridge),
             }
             if train_hist:
                 hist_state_dict = model_hist.module.state_dict() if hasattr(model_hist, "module") else model_hist.state_dict()

@@ -47,7 +47,7 @@ def resolve_hist_checkpoint_dir(resume_hist, dataset_name):
 
 
 @torch.no_grad()
-def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enable_eval_vis, mask_ratio, random_mask_ratio, block_mask_start, dataset_name=None):
+def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enable_eval_vis, mask_ratio, random_mask_ratio, block_mask_start, dataset_name=None, enable_latent_bridge=False):
     model_hist.eval()
     model_fut.eval()
     metrics = TrajectoryMetrics(model_fut.T)
@@ -69,13 +69,18 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enab
             block_mask_start=block_mask_start,
             device=device,
         )
-        _, pred_hist = model_hist.forward_eval(hist, hist_masked, device)
+        hist_outputs = model_hist.forward_eval(hist, hist_masked, device, return_tokens=enable_latent_bridge)
+        if enable_latent_bridge:
+            _, pred_hist, past_latent_tokens = hist_outputs
+        else:
+            _, pred_hist = hist_outputs
+            past_latent_tokens = None
 
         if k_samples > 1:
-            all_preds = model_fut.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, device, K=k_samples)
+            all_preds = model_fut.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, device, K=k_samples, past_latent_tokens=past_latent_tokens)
             pred_fut, best_idx, _ = select_closest_prediction(all_preds, fut, op_mask)
         else:
-            all_preds = model_fut.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, device, K=1)
+            all_preds = model_fut.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, device, K=1, past_latent_tokens=past_latent_tokens)
             pred_fut = all_preds.squeeze(1)
             best_idx = None
 
@@ -126,7 +131,10 @@ def main():
     print(f"[JointEval] Device: {device}")
     print(f"[JointEval] Hist checkpoint dir: {hist_checkpoint_dir}")
     print(f"[JointEval] Fut checkpoint dir: {fut_checkpoint_dir}")
-    print(f"[JointEval] fut_k={args.fut_k}, num_inference_steps={args.num_inference_steps}")
+    print(
+        f"[JointEval] fut_k={args.fut_k}, num_inference_steps={args.num_inference_steps}, "
+        f"latent_bridge={int(int(args.enable_past_fut_latent_bridge) > 0)}"
+    )
 
     test_loader = build_test_loader(args)
     model_hist = DiffusionPast(args).to(device)
@@ -145,6 +153,7 @@ def main():
         random_mask_ratio=max(0.0, min(1.0, float(args.random_mask_ratio))),
         block_mask_start=int(args.block_mask_start) > 0,
         dataset_name=args.dataset,
+        enable_latent_bridge=int(args.enable_past_fut_latent_bridge) > 0,
     )
 
 

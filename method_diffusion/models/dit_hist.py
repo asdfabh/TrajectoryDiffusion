@@ -87,12 +87,14 @@ class DiT(nn.Module):
         self.blocks = nn.ModuleList([copy.deepcopy(dit_block) for _ in range(depth)])
         self.final_layer = final_layer
 
-    def forward(self, x, t_cond):
+    def forward(self, x, t_cond, return_hidden=False):
         for block in self.blocks:
             x = block(x, t_cond)
+        hidden = x
         x = self.final_layer(x)
+        if return_hidden:
+            return x, hidden
         return x
-
 
 
 
