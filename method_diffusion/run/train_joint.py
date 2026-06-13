@@ -28,7 +28,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 HIST_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "hist"
 JOINT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "joint"
 JOINT_FUT_CHECKPOINT_DIR = JOINT_CHECKPOINT_DIR / "fut"
-JOINT_HIST_CHECKPOINT_DIR = JOINT_CHECKPOINT_DIR / "hist"
 
 
 def normalize_dataset_name(dataset):
@@ -39,7 +38,6 @@ def hist_checkpoint_dirs_for_dataset(dataset_name):
     dataset_name = normalize_dataset_name(dataset_name)
     return [
         HIST_CHECKPOINT_DIR / dataset_name,
-        JOINT_HIST_CHECKPOINT_DIR / dataset_name,
     ]
 
 
@@ -188,7 +186,6 @@ def init_csv_log(csv_path):
         "epoch",
         "train_loss",
         "train_loss_fut",
-        "train_loss_hist",
         "val_rmse_m",
         "val_horizon_s",
         "val_horizon_rmse_m",
@@ -220,7 +217,6 @@ def write_csv_log(
         "epoch": epoch,
         "train_loss": train_stats["loss"],
         "train_loss_fut": train_stats["loss_fut"],
-        "train_loss_hist": train_stats["loss_hist"],
         "val_rmse_m": eval_rmse,
         "val_horizon_s": eval_horizon_s,
         "val_horizon_rmse_m": eval_horizon_rmse,
@@ -235,37 +231,21 @@ def write_csv_log(
         writer.writerow(row)
 
 
-def build_hist_outputs(model_hist, hist, mask_ratio, random_mask_ratio, block_mask_start, device, train_hist=False, return_tokens=False):
+def build_hist_outputs(model_hist, hist, mask_ratio, random_mask_ratio, block_mask_start, device, return_tokens=False):
     hist_masked = build_hist_masked(
         hist,
         mask_ratio=mask_ratio,
         random_mask_ratio=random_mask_ratio,
         block_mask_start=block_mask_start,
     )
-    if train_hist:
-        hist_outputs = model_hist(
-            hist,
-            hist_masked,
-            device,
-            completion=True,
-            hard_discrete=False,
-            stage="joint_train",
-            return_tokens=return_tokens,
-        )
-        if return_tokens:
-            hist_loss, pred_hist, past_latent_tokens = hist_outputs
-            return hist_loss, pred_hist, past_latent_tokens
-        hist_loss, pred_hist = hist_outputs
-        return hist_loss, pred_hist, None
-
     hist_model = model_hist.module if hasattr(model_hist, "module") else model_hist
     with torch.no_grad():
         hist_outputs = hist_model.forward_eval(hist, hist_masked, device, return_tokens=return_tokens)
     if return_tokens:
-        hist_loss, pred_hist, past_latent_tokens = hist_outputs
-        return hist_loss.detach(), pred_hist, past_latent_tokens
-    hist_loss, pred_hist = hist_outputs
-    return hist_loss.detach(), pred_hist, None
+        _, pred_hist, past_latent_tokens = hist_outputs
+        return pred_hist, past_latent_tokens
+    _, pred_hist = hist_outputs
+    return pred_hist, None
 
 
 def train_epoch(
@@ -279,9 +259,6 @@ def train_epoch(
     mask_ratio,
     random_mask_ratio,
     block_mask_start,
-    train_hist,
-    hist_loss_weight,
-    fut_loss_weight,
     enable_latent_bridge,
 ):
     model_fut.train()
@@ -289,43 +266,34 @@ def train_epoch(
 
     total_loss = 0.0
     total_fut_loss = 0.0
-    total_hist_loss = 0.0
     num_batches = 0
 
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Train", ncols=140)
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        hist_loss, pred_hist, past_latent_tokens = build_hist_outputs(
+        pred_hist, past_latent_tokens = build_hist_outputs(
             model_hist=model_hist,
             hist=hist,
             mask_ratio=mask_ratio,
             random_mask_ratio=random_mask_ratio,
             block_mask_start=block_mask_start,
             device=device,
-            train_hist=train_hist,
             return_tokens=enable_latent_bridge,
         )
         fut_loss, _ = model_fut.forwardTrain(pred_hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, past_latent_tokens=past_latent_tokens)
-        loss = float(fut_loss_weight) * fut_loss
-        if train_hist:
-            loss = loss + float(hist_loss_weight) * hist_loss
+        loss = fut_loss
 
         optimizer.zero_grad()
         loss.backward()
-        grad_params = list(model_fut.parameters())
-        if train_hist:
-            grad_params += list(model_hist.parameters())
-        torch.nn.utils.clip_grad_norm_(grad_params, max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model_fut.parameters(), max_norm=1.0)
         optimizer.step()
 
         total_loss += float(loss.item())
         total_fut_loss += float(fut_loss.item())
-        total_hist_loss += float(hist_loss.item())
         num_batches += 1
         pbar.set_postfix({
             "loss": f"{loss.item():.6f}",
             "fut": f"{fut_loss.item():.6f}",
-            "hist": f"{hist_loss.item():.6f}",
             "avg": f"{(total_loss / num_batches):.6f}",
         })
 
@@ -333,7 +301,6 @@ def train_epoch(
     return {
         "loss": total_loss / denom,
         "loss_fut": total_fut_loss / denom,
-        "loss_hist": total_hist_loss / denom,
     }
 
 
@@ -375,14 +342,13 @@ def evaluate(
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Val", ncols=120)
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        _, pred_hist, past_latent_tokens = build_hist_outputs(
+        pred_hist, past_latent_tokens = build_hist_outputs(
             model_hist=model_hist,
             hist=hist,
             mask_ratio=mask_ratio,
             random_mask_ratio=random_mask_ratio,
             block_mask_start=block_mask_start,
             device=device,
-            train_hist=False,
             return_tokens=enable_latent_bridge,
         )
         if int(model_fut.fut_k) > 1:
@@ -491,22 +457,18 @@ def main():
     )
 
     model_hist = DiffusionPast(args).to(device)
-    train_hist = int(args.joint_train_hist) > 0
     load_hist_checkpoint(
         model_hist,
         args.resume_hist,
         hist_checkpoint_dirs_for_dataset(dataset_name),
         device,
-        trainable=train_hist,
+        trainable=False,
         dataset_name=dataset_name,
     )
 
     model_fut = DiffusionFut(args).to(device)
     fut_lr = float(args.learning_rate)
-    optimizer_groups = [{"params": model_fut.parameters(), "lr": fut_lr}]
-    if train_hist:
-        optimizer_groups.append({"params": model_hist.parameters(), "lr": float(args.joint_hist_lr)})
-    optimizer = torch.optim.AdamW(optimizer_groups, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model_fut.parameters(), lr=fut_lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
     start_epoch, best_rmse = load_fut_checkpoint(args, model_fut, optimizer, scheduler, device)
     mask_ratio = max(0.0, min(1.0, float(args.mask_prob)))
@@ -516,9 +478,8 @@ def main():
     enable_latent_bridge = int(args.enable_past_fut_latent_bridge) > 0
 
     print(
-        f"[JointTrain] joint_train_hist={int(train_hist)} | "
-        f"latent_bridge={int(enable_latent_bridge)} | "
-        f"lr_fut={fut_lr:.2e} | lr_hist={float(args.joint_hist_lr):.2e}"
+        f"[JointTrain] hist=frozen | latent_bridge={int(enable_latent_bridge)} | "
+        f"lr_fut={fut_lr:.2e}"
     )
 
     for epoch in range(start_epoch, args.num_epochs):
@@ -533,9 +494,6 @@ def main():
             mask_ratio=mask_ratio,
             random_mask_ratio=random_mask_ratio,
             block_mask_start=block_mask_start,
-            train_hist=train_hist,
-            hist_loss_weight=float(args.joint_hist_loss_weight),
-            fut_loss_weight=float(args.joint_fut_loss_weight),
             enable_latent_bridge=enable_latent_bridge,
         )
         eval_rmse, eval_horizon_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps = evaluate(
@@ -569,7 +527,6 @@ def main():
         )
         writer.add_scalar("Loss/Train", train_stats["loss"], epoch + 1)
         writer.add_scalar("Loss/TrainFut", train_stats["loss_fut"], epoch + 1)
-        writer.add_scalar("Loss/TrainHist", train_stats["loss_hist"], epoch + 1)
         writer.add_scalar("Eval/RMSE_m", eval_rmse, epoch + 1)
         writer.add_scalar(f"Eval/RMSE_{report_horizon_label}", eval_horizon_rmse, epoch + 1)
         writer.add_scalar("Eval/ADE_m", eval_ade, epoch + 1)
@@ -582,7 +539,6 @@ def main():
             f"Epoch {epoch + 1}/{args.num_epochs} | "
             f"train={train_stats['loss']:.6f} | "
             f"fut={train_stats['loss_fut']:.6f} | "
-            f"hist={train_stats['loss_hist']:.6f} | "
             f"rmse_m={eval_rmse:.4f} | "
             f"rmse_{report_horizon_label}={eval_horizon_rmse:.4f} | "
             f"ade_m={eval_ade:.4f} | "
@@ -604,7 +560,6 @@ def main():
             "scheduler_state_dict": scheduler.state_dict(),
             "loss": train_stats["loss"],
             "loss_fut": train_stats["loss_fut"],
-            "loss_hist": train_stats["loss_hist"],
             "eval_rmse_m": eval_rmse,
             "eval_horizon_s": report_horizon_s,
             "eval_horizon_rmse_m": eval_horizon_rmse,
@@ -616,28 +571,12 @@ def main():
             "best_score": best_rmse,
             "best_rmse_m": best_rmse,
             "resume_hist": args.resume_hist,
-            "joint_train_hist": int(train_hist),
             "enable_past_fut_latent_bridge": int(enable_latent_bridge),
         }
-        if train_hist:
-            fut_state["hist_model_state_dict"] = model_hist.state_dict()
         if (epoch + 1) % args.save_interval == 0:
             torch.save(fut_state, Path(args.checkpoint_dir) / f"epoch_{epoch + 1}.pth")
         if is_best:
             torch.save(fut_state, Path(args.checkpoint_dir) / "best.pth")
-            if train_hist:
-                hist_checkpoint_dir = JOINT_HIST_CHECKPOINT_DIR / dataset_name
-                hist_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-                torch.save(
-                    {
-                        "epoch": epoch + 1,
-                        "model_state_dict": model_hist.state_dict(),
-                        "loss": train_stats["loss_hist"],
-                        "best_rmse_m": best_rmse,
-                        "args": vars(args),
-                    },
-                    hist_checkpoint_dir / "checkpoint_best.pth",
-                )
 
     writer.close()
 

@@ -10,6 +10,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 from method_diffusion.config import get_args_parser
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.models.hist_model import DiffusionPast
+from method_diffusion.models.trajectory_refiner import build_trajectory_refiner
 from method_diffusion.run.evaluate import (
     HIST_CHECKPOINT_DIR,
     prepare_input_data as prepare_hist_input_data,
@@ -18,16 +19,18 @@ from method_diffusion.run.evaluate_fut import (
     build_test_loader,
     load_checkpoint as load_fut_checkpoint,
     print_metrics,
+    resolve_checkpoint_path,
 )
 from method_diffusion.run.train_fut import prepare_input_data
 from method_diffusion.run.train_joint import (
     JOINT_FUT_CHECKPOINT_DIR,
-    JOINT_HIST_CHECKPOINT_DIR,
     load_hist_checkpoint,
     normalize_dataset_name,
 )
 from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_closest_prediction
 from method_diffusion.utils.visualization import visualize_scene_prediction
+
+JOINT_REFINER_CHECKPOINT_DIR = Path(__file__).resolve().parent.parent.parent / "checkpoints" / "joint_refine"
 
 
 def get_eval_args():
@@ -39,18 +42,54 @@ def resolve_hist_checkpoint_dir(resume_hist, dataset_name):
     if resume_path.exists():
         return resume_path.parent
 
-    for base_dir in [JOINT_HIST_CHECKPOINT_DIR, HIST_CHECKPOINT_DIR]:
-        candidate = base_dir / dataset_name / "checkpoint_best.pth"
-        if candidate.exists():
-            return candidate.parent
+    candidate = HIST_CHECKPOINT_DIR / dataset_name / "checkpoint_best.pth"
+    if candidate.exists():
+        return candidate.parent
     return HIST_CHECKPOINT_DIR / dataset_name
 
 
+def get_joint_refiner_checkpoint_dir(dataset_name):
+    return JOINT_REFINER_CHECKPOINT_DIR / str(dataset_name).strip().lower()
+
+
+def load_joint_refiner(args, checkpoint_dir, device):
+    ckpt_path = resolve_checkpoint_path(args.joint_refiner_checkpoint, checkpoint_dir)
+    if ckpt_path is None or not ckpt_path.exists():
+        raise FileNotFoundError(
+            f"Joint refiner checkpoint not found: joint_refiner_checkpoint={args.joint_refiner_checkpoint}, "
+            f"dir={checkpoint_dir}. Use 'none', 'best', 'epoch_i' such as 'epoch_10', or an existing path."
+        )
+
+    refiner = build_trajectory_refiner(args).to(device)
+    state = torch.load(ckpt_path, map_location=device)
+    refiner.load_state_dict(state["model_state_dict"], strict=True)
+    refiner.eval()
+    print(f"[JointEval] Loaded joint refiner checkpoint: {ckpt_path}")
+    print("[JointEval] Refiner: TABR-temporal-basis")
+    return refiner
+
+
 @torch.no_grad()
-def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enable_eval_vis, mask_ratio, random_mask_ratio, block_mask_start, dataset_name=None, enable_latent_bridge=False):
+def evaluate(
+    model_hist,
+    model_fut,
+    dataloader,
+    device,
+    feature_dim,
+    fut_k,
+    enable_eval_vis,
+    mask_ratio,
+    random_mask_ratio,
+    block_mask_start,
+    dataset_name=None,
+    enable_latent_bridge=False,
+    residual_refiner=None,
+    fut_vis_enable_refine=0,
+):
     model_hist.eval()
     model_fut.eval()
     metrics = TrajectoryMetrics(model_fut.T)
+    refined_metrics = TrajectoryMetrics(model_fut.T) if residual_refiner is not None else None
     k_samples = max(1, int(fut_k))
     eval_name = f"Joint Fut ClosestGT-RMSE@{k_samples}" if k_samples > 1 else "Joint Fut single-mode"
 
@@ -84,7 +123,15 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enab
             pred_fut = all_preds.squeeze(1)
             best_idx = None
 
+        refined_pred = None
+        refined_all = None
+        refined_best_idx = None
+        if residual_refiner is not None:
+            refined_all, _ = residual_refiner(pred_hist, all_preds, model_fut.fut_dt)
+            refined_pred, refined_best_idx, _ = select_closest_prediction(refined_all, fut, op_mask)
+
         if enable_eval_vis:
+            show_refined_vis = refined_pred is not None and int(fut_vis_enable_refine) > 0
             visualize_scene_prediction(
                 hist=hist,
                 hist_nbrs=hist_nbrs,
@@ -94,6 +141,9 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enab
                 valid_mask=(op_mask[..., 0] > 0.5).float(),
                 pred_all=all_preds,
                 pred_best_idx=best_idx,
+                refined_pred=refined_pred if show_refined_vis else None,
+                refined_pred_all=refined_all if show_refined_vis else None,
+                refined_pred_best_idx=refined_best_idx if show_refined_vis else None,
                 title="Joint Hist Reconstruction + Future Prediction",
                 highlight_label="Best",
                 hist_masked=hist_masked,
@@ -102,7 +152,11 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enab
             )
 
         metrics.update(pred_fut, fut, op_mask)
-        summary = metrics.summary()
+        if residual_refiner is not None:
+            refined_metrics.update(refined_pred, fut, op_mask)
+            summary = refined_metrics.summary()
+        else:
+            summary = metrics.summary()
         last_idx = min(model_fut.T, len(summary["rmse_per_step_m"])) - 1
         last_sec = int(model_fut.T * 0.2)
         pbar.set_postfix({
@@ -114,10 +168,16 @@ def evaluate(model_hist, model_fut, dataloader, device, feature_dim, fut_k, enab
         })
 
         if batch_idx % 100 == 0:
-            print_metrics(summary, f"Joint Test Iteration {batch_idx}")
+            print_metrics(metrics.summary(), f"Joint Test Iteration {batch_idx}")
+            if residual_refiner is not None:
+                print_metrics(refined_metrics.summary(), f"Joint + TABR Test Iteration {batch_idx}")
 
     final_metrics = metrics.summary()
     print_metrics(final_metrics, "Joint Final Test Result")
+    if residual_refiner is not None:
+        refined_final_metrics = refined_metrics.summary()
+        print_metrics(refined_final_metrics, "Joint + TABR Final Test Result")
+        return refined_final_metrics
     return final_metrics
 
 
@@ -141,6 +201,9 @@ def main():
     model_fut = DiffusionFut(args).to(device)
     load_hist_checkpoint(model_hist, args.resume_hist, [hist_checkpoint_dir], device, trainable=False, dataset_name=dataset_name)
     load_fut_checkpoint(model_fut, args.resume_fut, fut_checkpoint_dir, device)
+    residual_refiner = None
+    if int(args.enable_joint_refine) > 0:
+        residual_refiner = load_joint_refiner(args, get_joint_refiner_checkpoint_dir(args.dataset), device)
     evaluate(
         model_hist=model_hist,
         model_fut=model_fut,
@@ -154,6 +217,8 @@ def main():
         block_mask_start=int(args.block_mask_start) > 0,
         dataset_name=args.dataset,
         enable_latent_bridge=int(args.enable_past_fut_latent_bridge) > 0,
+        residual_refiner=residual_refiner,
+        fut_vis_enable_refine=args.fut_vis_enable_refine,
     )
 
 

@@ -21,13 +21,10 @@ def get_args_parser():
     parser.add_argument("--checkpoint_dir", default="./checkpoints", type=str)
     parser.add_argument("--resume_fut", default="none", type=str)
     parser.add_argument("--resume_hist", default="none", type=str)
-    parser.add_argument("--joint_train_hist", default=0, type=int)
-    parser.add_argument("--joint_hist_lr", default=1e-5, type=float)
-    parser.add_argument("--joint_hist_loss_weight", default=0.2, type=float)
-    parser.add_argument("--joint_fut_loss_weight", default=1.0, type=float)
-    parser.add_argument("--joint_train_fut", default=0, type=int)
-    parser.add_argument("--joint_fut_lr", default=1e-5, type=float)
     parser.add_argument("--enable_past_fut_latent_bridge", default=1, type=int)
+    parser.add_argument("--enable_refine", default=1, type=int)
+    parser.add_argument("--enable_joint_refine", default=0, type=int)
+    parser.add_argument("--joint_refiner_checkpoint", default="none", type=str)
 
     # Hist diffusion model
     parser.add_argument("--input_dim", default=128, type=int)

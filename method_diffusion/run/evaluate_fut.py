@@ -25,7 +25,7 @@ from method_diffusion.utils.visualization import visualize_scene_prediction
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
-REFINER_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut_refiner"
+REFINER_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "refine"
 
 
 def get_refiner_checkpoint_dir(dataset_name):
@@ -37,11 +37,13 @@ def resolve_checkpoint_path(resume_arg, checkpoint_dir):
     checkpoint_dir = Path(checkpoint_dir)
     if resume_arg in ("none", "", None):
         resume_arg = "best"
-    if Path(str(resume_arg)).exists():
-        return Path(str(resume_arg))
+    resume_arg = str(resume_arg)
+    resume_path = Path(resume_arg)
+    if resume_path.exists():
+        return resume_path
     if resume_arg == "best":
         return checkpoint_dir / "best.pth"
-    if re.fullmatch(r"epoch_\d+", str(resume_arg)):
+    if re.fullmatch(r"epoch_\d+", resume_arg):
         return checkpoint_dir / f"{resume_arg}.pth"
     return None
 
@@ -50,7 +52,10 @@ def resolve_checkpoint_path(resume_arg, checkpoint_dir):
 def load_checkpoint(model, resume_arg, checkpoint_dir, device):
     ckpt_path = resolve_checkpoint_path(resume_arg, checkpoint_dir)
     if ckpt_path is None or not ckpt_path.exists():
-        raise FileNotFoundError(f"Fut checkpoint not found: resume_fut={resume_arg}, dir={checkpoint_dir}")
+        raise FileNotFoundError(
+            f"Fut checkpoint not found: resume_fut={resume_arg}, dir={checkpoint_dir}. "
+            "Use 'none', 'best', 'epoch_i' such as 'epoch_10', or an existing path."
+        )
 
     state = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(state["model_state_dict"], strict=False)
@@ -62,7 +67,10 @@ def load_checkpoint(model, resume_arg, checkpoint_dir, device):
 def load_residual_refiner(args, checkpoint_dir, device):
     ckpt_path = resolve_checkpoint_path(args.fut_refiner_checkpoint, checkpoint_dir)
     if ckpt_path is None or not ckpt_path.exists():
-        raise FileNotFoundError(f"Residual refiner checkpoint not found: {ckpt_path}")
+        raise FileNotFoundError(
+            f"Residual refiner checkpoint not found: fut_refiner_checkpoint={args.fut_refiner_checkpoint}, "
+            f"dir={checkpoint_dir}. Use 'none', 'best', 'epoch_i' such as 'epoch_10', or an existing path."
+        )
 
     refiner = build_trajectory_refiner(args).to(device)
     state = torch.load(ckpt_path, map_location=device)
@@ -138,15 +146,15 @@ def build_test_loader(args):
 def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis, fut_vis_enable_refine, dataset_name, residual_refiner):
     model.eval()
     baseline_metrics = TrajectoryMetrics(model.T)
-    refined_metrics = TrajectoryMetrics(model.T)
+    refined_metrics = TrajectoryMetrics(model.T) if residual_refiner is not None else None
     k_samples = max(1, int(fut_k))
     _, _, d_s, _ = get_time_params(dataset_name)
     fut_dt = get_raw_dt(dataset_name) * int(d_s)
     baseline_physics = PhysicalDiagnostics(fut_dt)
-    refined_physics = PhysicalDiagnostics(fut_dt)
-    sample_stats = SampleImprovementStats()
+    refined_physics = PhysicalDiagnostics(fut_dt) if residual_refiner is not None else None
+    sample_stats = SampleImprovementStats() if residual_refiner is not None else None
     eval_name = f"Fut ClosestGT-RMSE@{k_samples}" if k_samples > 1 else "Fut single-mode"
-    print(f"[FutEval] TABR residual refiner enabled, dt={fut_dt:.3f}s")
+    print(f"[FutEval] dt={fut_dt:.3f}s | refine={int(residual_refiner is not None)}")
 
     pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc=eval_name, ncols=120)
     for batch_idx, batch in pbar:
@@ -155,11 +163,15 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis, fut
         if k_samples > 1:
             all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, device=device, K=k_samples)
             pred_fut, best_idx, _ = select_closest_prediction(all_preds, fut, op_mask)
-            refined_all_preds, _ = residual_refiner(hist, all_preds, fut_dt)
-            refined_pred_fut, refined_best_idx, _ = select_closest_prediction(refined_all_preds, fut, op_mask)
+            refined_all_preds = None
+            refined_pred_fut = None
+            refined_best_idx = None
+            if residual_refiner is not None:
+                refined_all_preds, _ = residual_refiner(hist, all_preds, fut_dt)
+                refined_pred_fut, refined_best_idx, _ = select_closest_prediction(refined_all_preds, fut, op_mask)
             if enable_eval_vis:
                 # 旧的 diffusion 过程可视化已停用，这里仅保留最终预测结果可视化。
-                show_refined_vis = int(fut_vis_enable_refine) > 0
+                show_refined_vis = int(fut_vis_enable_refine) > 0 and refined_pred_fut is not None
                 visualize_scene_prediction(
                     hist=hist,
                     hist_nbrs=hist_nbrs,
@@ -180,14 +192,19 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis, fut
         else:
             all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, device=device, K=1)
             pred_fut = all_preds.squeeze(1)
-            refined_pred_fut, _ = residual_refiner(hist, pred_fut, fut_dt)
+            refined_pred_fut = None
+            if residual_refiner is not None:
+                refined_pred_fut, _ = residual_refiner(hist, pred_fut, fut_dt)
 
         baseline_metrics.update(pred_fut, fut, op_mask)
-        refined_metrics.update(refined_pred_fut, fut, op_mask)
         baseline_physics.update(pred_fut, op_mask)
-        refined_physics.update(refined_pred_fut, op_mask)
-        sample_stats.update(pred_fut, refined_pred_fut, fut, op_mask)
-        summary = refined_metrics.summary()
+        if residual_refiner is not None:
+            refined_metrics.update(refined_pred_fut, fut, op_mask)
+            refined_physics.update(refined_pred_fut, op_mask)
+            sample_stats.update(pred_fut, refined_pred_fut, fut, op_mask)
+            summary = refined_metrics.summary()
+        else:
+            summary = baseline_metrics.summary()
         last_idx = min(model.T, len(summary["rmse_per_step_m"])) - 1
         last_sec = int(model.T * 0.2)
         pbar.set_postfix({
@@ -200,13 +217,16 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis, fut
 
         if batch_idx % 100 == 0:
             print_metrics(baseline_metrics.summary(), f"Baseline Test Iteration {batch_idx}")
-            print_metrics(refined_metrics.summary(), f"TABR-temporal-basis-refiner Test Iteration {batch_idx}")
+            if residual_refiner is not None:
+                print_metrics(refined_metrics.summary(), f"TABR-temporal-basis-refiner Test Iteration {batch_idx}")
     baseline_final_metrics = baseline_metrics.summary()
     print_metrics(baseline_final_metrics, "Baseline Final Test Result")
+    print_kinematic_diagnostics(baseline_physics.summary(), "Baseline Physical Diagnostics")
+    if residual_refiner is None:
+        return baseline_final_metrics
     refined_final_metrics = refined_metrics.summary()
     postprocess_title = "TABR-temporal-basis-refiner"
     print_metrics(refined_final_metrics, f"{postprocess_title} Final Test Result")
-    print_kinematic_diagnostics(baseline_physics.summary(), "Baseline Physical Diagnostics")
     print_kinematic_diagnostics(refined_physics.summary(), f"{postprocess_title} Physical Diagnostics")
     print_sample_improvement(sample_stats.summary(), f"{postprocess_title} Sample Improvement")
     return refined_final_metrics
@@ -225,7 +245,9 @@ def main():
     test_loader = build_test_loader(args)
     model = DiffusionFut(args).to(device)
     load_checkpoint(model, args.resume_fut, args.checkpoint_dir, device)
-    residual_refiner = load_residual_refiner(args, get_refiner_checkpoint_dir(args.dataset), device)
+    residual_refiner = None
+    if int(args.enable_refine) > 0:
+        residual_refiner = load_residual_refiner(args, get_refiner_checkpoint_dir(args.dataset), device)
     evaluate(model, test_loader, device, args.feature_dim, args.fut_k, enable_eval_vis=int(args.fut_enable_eval_vis) > 0,
         fut_vis_enable_refine=args.fut_vis_enable_refine, dataset_name=args.dataset, residual_refiner=residual_refiner)
 

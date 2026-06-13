@@ -19,7 +19,6 @@ from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.run.train_fut import prepare_input_data
 from method_diffusion.run.train_joint import (
     JOINT_FUT_CHECKPOINT_DIR,
-    JOINT_HIST_CHECKPOINT_DIR,
     build_hist_outputs,
     compute_horizon_rmse_stats,
     get_joint_report_horizon,
@@ -125,9 +124,6 @@ def train_epoch(
     mask_ratio,
     random_mask_ratio,
     block_mask_start,
-    train_hist,
-    hist_loss_weight,
-    fut_loss_weight,
     enable_latent_bridge,
 ):
     model_fut.train()
@@ -135,46 +131,37 @@ def train_epoch(
 
     total_loss = 0.0
     total_fut_loss = 0.0
-    total_hist_loss = 0.0
     num_batches = 0
 
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Train", ncols=140, disable=not is_main_process(rank))
 
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        hist_loss, pred_hist, past_latent_tokens = build_hist_outputs(
+        pred_hist, past_latent_tokens = build_hist_outputs(
             model_hist=model_hist,
             hist=hist,
             mask_ratio=mask_ratio,
             random_mask_ratio=random_mask_ratio,
             block_mask_start=block_mask_start,
             device=device,
-            train_hist=train_hist,
             return_tokens=enable_latent_bridge,
         )
         fut_loss, _ = model_fut(pred_hist, hist_nbrs, mask, temporal_mask, fut, op_mask, device, past_latent_tokens=past_latent_tokens)
-        loss = float(fut_loss_weight) * fut_loss
-        if train_hist:
-            loss = loss + float(hist_loss_weight) * hist_loss
+        loss = fut_loss
 
         optimizer.zero_grad()
         loss.backward()
-        grad_params = list(model_fut.parameters())
-        if train_hist:
-            grad_params += list(model_hist.parameters())
-        torch.nn.utils.clip_grad_norm_(grad_params, max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model_fut.parameters(), max_norm=1.0)
         optimizer.step()
 
         total_loss += float(loss.item())
         total_fut_loss += float(fut_loss.item())
-        total_hist_loss += float(hist_loss.item())
         num_batches += 1
 
         if is_main_process(rank):
             pbar.set_postfix({
                 "loss": f"{loss.item():.6f}",
                 "fut": f"{fut_loss.item():.6f}",
-                "hist": f"{hist_loss.item():.6f}",
                 "avg": f"{(total_loss / num_batches):.6f}",
             })
 
@@ -182,19 +169,17 @@ def train_epoch(
         [
             total_loss,
             total_fut_loss,
-            total_hist_loss,
             float(num_batches),
         ],
         device=device,
         dtype=torch.float64,
     )
     stats = reduce_tensor(stats)
-    denom = max(int(stats[3].item()), 1)
+    denom = max(int(stats[2].item()), 1)
 
     return {
         "loss": float(stats[0].item()) / denom,
         "loss_fut": float(stats[1].item()) / denom,
-        "loss_hist": float(stats[2].item()) / denom,
     }
 
 
@@ -250,14 +235,13 @@ def evaluate(
             feature_dim,
             device=device,
         )
-        _, pred_hist, past_latent_tokens = build_hist_outputs(
+        pred_hist, past_latent_tokens = build_hist_outputs(
             model_hist=model_hist,
             hist=hist,
             mask_ratio=mask_ratio,
             random_mask_ratio=random_mask_ratio,
             block_mask_start=block_mask_start,
             device=device,
-            train_hist=False,
             return_tokens=enable_latent_bridge,
         )
         if int(fut_model.fut_k) > 1:
@@ -372,32 +356,23 @@ def main():
     val_loader = build_distributed_loader(val_dataset, args.batch_size, args.num_workers, val_sampler, drop_last=False)
 
     model_hist = DiffusionPast(args).to(device)
-    train_hist = int(args.joint_train_hist) > 0
     load_hist_checkpoint_for_rank(
         model_hist,
         args.resume_hist,
         hist_checkpoint_dirs_for_dataset(dataset_name),
         device,
         rank,
-        trainable=train_hist,
+        trainable=False,
         dataset_name=dataset_name,
     )
 
     model_fut = DiffusionFut(args).to(device)
     fut_lr = float(args.learning_rate)
-    optimizer_groups = [{"params": model_fut.parameters(), "lr": fut_lr}]
-    if train_hist:
-        optimizer_groups.append({"params": model_hist.parameters(), "lr": float(args.joint_hist_lr)})
-    optimizer = torch.optim.AdamW(optimizer_groups, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model_fut.parameters(), lr=fut_lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
     start_epoch, best_rmse = load_fut_checkpoint_for_rank(args, model_fut, optimizer, scheduler, device, rank)
 
     if dist.is_initialized():
-        if train_hist:
-            if device.type == "cuda":
-                model_hist = DDP(model_hist, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
-            else:
-                model_hist = DDP(model_hist, find_unused_parameters=False)
         if device.type == "cuda":
             model_fut = DDP(model_fut, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
         else:
@@ -411,9 +386,8 @@ def main():
 
     if is_main_process(rank):
         print(
-            f"[DDP JointTrain] joint_train_hist={int(train_hist)} | "
-            f"latent_bridge={int(enable_latent_bridge)} | "
-            f"lr_fut={fut_lr:.2e} | lr_hist={float(args.joint_hist_lr):.2e}"
+            f"[DDP JointTrain] hist=frozen | latent_bridge={int(enable_latent_bridge)} | "
+            f"lr_fut={fut_lr:.2e}"
         )
 
     for epoch in range(start_epoch, args.num_epochs):
@@ -432,9 +406,6 @@ def main():
             mask_ratio=mask_ratio,
             random_mask_ratio=random_mask_ratio,
             block_mask_start=block_mask_start,
-            train_hist=train_hist,
-            hist_loss_weight=float(args.joint_hist_loss_weight),
-            fut_loss_weight=float(args.joint_fut_loss_weight),
             enable_latent_bridge=enable_latent_bridge,
         )
         eval_rmse, eval_horizon_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps = evaluate(
@@ -470,7 +441,6 @@ def main():
             )
             writer.add_scalar("Loss/Train", train_stats["loss"], epoch + 1)
             writer.add_scalar("Loss/TrainFut", train_stats["loss_fut"], epoch + 1)
-            writer.add_scalar("Loss/TrainHist", train_stats["loss_hist"], epoch + 1)
             writer.add_scalar("Eval/RMSE_m", eval_rmse, epoch + 1)
             writer.add_scalar(f"Eval/RMSE_{report_horizon_label}", eval_horizon_rmse, epoch + 1)
             writer.add_scalar("Eval/ADE_m", eval_ade, epoch + 1)
@@ -482,7 +452,6 @@ def main():
                 f"Epoch {epoch + 1}/{args.num_epochs} | "
                 f"train={train_stats['loss']:.6f} | "
                 f"fut={train_stats['loss_fut']:.6f} | "
-                f"hist={train_stats['loss_hist']:.6f} | "
                 f"rmse_m={eval_rmse:.4f} | "
                 f"rmse_{report_horizon_label}={eval_horizon_rmse:.4f} | "
                 f"ade_m={eval_ade:.4f} | "
@@ -505,7 +474,6 @@ def main():
                 "scheduler_state_dict": scheduler.state_dict(),
                 "loss": train_stats["loss"],
                 "loss_fut": train_stats["loss_fut"],
-                "loss_hist": train_stats["loss_hist"],
                 "eval_rmse_m": eval_rmse,
                 "eval_horizon_s": report_horizon_s,
                 "eval_horizon_rmse_m": eval_horizon_rmse,
@@ -517,31 +485,14 @@ def main():
                 "best_score": best_rmse,
                 "best_rmse_m": best_rmse,
                 "resume_hist": args.resume_hist,
-                "joint_train_hist": int(train_hist),
                 "enable_past_fut_latent_bridge": int(enable_latent_bridge),
             }
-            if train_hist:
-                hist_state_dict = model_hist.module.state_dict() if hasattr(model_hist, "module") else model_hist.state_dict()
-                fut_state["hist_model_state_dict"] = hist_state_dict
 
             if (epoch + 1) % args.save_interval == 0:
                 torch.save(fut_state, checkpoint_dir / f"epoch_{epoch + 1}.pth")
 
             if is_best:
                 torch.save(fut_state, checkpoint_dir / "best.pth")
-                if train_hist:
-                    hist_checkpoint_dir = JOINT_HIST_CHECKPOINT_DIR / dataset_name
-                    hist_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-                    torch.save(
-                        {
-                            "epoch": epoch + 1,
-                            "model_state_dict": hist_state_dict,
-                            "loss": train_stats["loss_hist"],
-                            "best_rmse_m": best_rmse,
-                            "args": vars(args),
-                        },
-                        hist_checkpoint_dir / "checkpoint_best.pth",
-                    )
 
         if dist.is_initialized():
             dist.barrier()

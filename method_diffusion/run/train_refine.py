@@ -19,7 +19,7 @@ from method_diffusion.utils.fut_utils import TrajectoryMetrics, normalize_traj_v
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
-REFINER_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut_refiner"
+REFINER_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "refine"
 
 
 def get_refiner_checkpoint_dir(dataset_name):
@@ -51,14 +51,14 @@ def load_frozen_fut_model(args, device):
     model.eval()
     for param in model.parameters():
         param.requires_grad_(False)
-    print(f"[RefinerTrain] Loaded frozen fut checkpoint: {ckpt_path}")
+    print(f"[RefineTrain] Loaded frozen fut checkpoint: {ckpt_path}")
     return model
 
 
 def build_loader(args, dataset_name, split, shuffle, drop_last):
     split_path = str(get_split_path(args, dataset_name, split))
     dataset = build_trajectory_dataset(split_path, dataset_name, enc_size=args.encoder_input_dim, feature_dim=args.feature_dim)
-    print(f"[RefinerTrain] {split} path: {split_path}")
+    print(f"[RefineTrain] {split} path: {split_path}")
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -129,7 +129,7 @@ def train_epoch(args, fut_model, refiner, dataloader, optimizer, device, epoch):
         "gate": 0.0,
     }
     num_batches = 0
-    pbar = tqdm(dataloader, total=len(dataloader), desc=f"E6 Ep{epoch} Train", dynamic_ncols=True)
+    pbar = tqdm(dataloader, total=len(dataloader), desc=f"Refine Ep{epoch} Train", dynamic_ncols=True)
 
     for batch_idx, batch in enumerate(pbar, start=1):
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, args.feature_dim, device=device)
@@ -166,7 +166,7 @@ def evaluate(args, fut_model, refiner, dataloader, device, epoch):
     refiner.eval()
     baseline_metrics = TrajectoryMetrics(fut_model.T)
     refined_metrics = TrajectoryMetrics(fut_model.T)
-    pbar = tqdm(dataloader, total=len(dataloader), desc=f"E6 Ep{epoch} Val", dynamic_ncols=True)
+    pbar = tqdm(dataloader, total=len(dataloader), desc=f"Refine Ep{epoch} Val", dynamic_ncols=True)
 
     for batch_idx, batch in enumerate(pbar, start=1):
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, args.feature_dim, device=device)
@@ -220,15 +220,15 @@ def main():
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     csv_path = checkpoint_dir / "train_log.csv"
 
-    print(f"[RefinerTrain] Dataset: {dataset_name}")
-    print(f"[RefinerTrain] Device: {device}")
-    print(f"[RefinerTrain] Checkpoint dir: {checkpoint_dir}")
+    print(f"[RefineTrain] Dataset: {dataset_name}")
+    print(f"[RefineTrain] Device: {device}")
+    print(f"[RefineTrain] Checkpoint dir: {checkpoint_dir}")
     train_loader = build_loader(args, dataset_name, "Train", shuffle=True, drop_last=True)
     val_loader = build_loader(args, dataset_name, "Val", shuffle=False, drop_last=False)
 
     fut_model = load_frozen_fut_model(args, device)
     refiner = build_trajectory_refiner(args).to(device)
-    print("[RefinerTrain] Refiner: TABR-temporal-basis")
+    print("[RefineTrain] Refiner: TABR-temporal-basis")
     optimizer = torch.optim.AdamW(refiner.parameters(), lr=args.fut_refiner_lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(int(args.num_epochs), 1))
 
