@@ -4,7 +4,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser("Set diffusion predicter", add_help=False)
 
     # Data
-    parser.add_argument("--dataset", default="ngsim", type=str, choices=["ngsim", "highd", "round"])
+    parser.add_argument("--dataset", default="round", type=str, choices=["ngsim", "highd", "round"])
     parser.add_argument("--data_root_ngsim", default="/mnt/datasets/ngsimdata", type=str)
     parser.add_argument("--data_root_highd", default="/mnt/datasets/highDdata", type=str)
     parser.add_argument("--data_root_round", default="/mnt/datasets/round", type=str)
@@ -23,7 +23,7 @@ def get_args_parser():
     parser.add_argument("--resume_hist", default="none", type=str)
     parser.add_argument("--enable_past_fut_latent_bridge", default=1, type=int)
     parser.add_argument("--enable_refine", default=1, type=int)
-    parser.add_argument("--enable_joint_refine", default=0, type=int)
+    parser.add_argument("--enable_joint_refine", default=1, type=int)
     parser.add_argument("--joint_refiner_checkpoint", default="none", type=str)
 
     # Hist diffusion model
@@ -72,7 +72,7 @@ def get_args_parser():
     parser.add_argument("--fut_cascade_final_weight", default=1.0, type=float)
 
     # Fut trajectory refiner (TABR)
-    parser.add_argument("--fut_refiner_checkpoint", default="best", type=str)
+    parser.add_argument("--fut_refiner_checkpoint", default="none", type=str)
     parser.add_argument("--fut_refiner_hidden_dim", default=128, type=int)
     parser.add_argument("--fut_refiner_max_delta", default=5.0, type=float)
     parser.add_argument("--fut_refiner_time_power", default=2.0, type=float)
@@ -81,6 +81,13 @@ def get_args_parser():
     parser.add_argument("--fut_refiner_fde_weight", default=2.0, type=float)
     parser.add_argument("--fut_refiner_delta_weight", default=0.01, type=float)
     parser.add_argument("--fut_refiner_gate_weight", default=0.001, type=float)
+    # Full-state refiner parameters
+    parser.add_argument("--fut_refiner_state_dim", default=4, type=int, help="Refiner state dimension: 2=XY only, 4=full state (x,y,theta,v)")
+    parser.add_argument("--fut_refiner_max_delta_theta", default=0.35, type=float, help="Max theta residual in radians")
+    parser.add_argument("--fut_refiner_max_delta_v", default=3.0, type=float, help="Max v residual in m/s")
+    parser.add_argument("--fut_refiner_theta_weight", default=0.1, type=float, help="Weight for theta loss in refiner")
+    parser.add_argument("--fut_refiner_v_weight", default=0.1, type=float, help="Weight for v loss in refiner")
+    parser.add_argument("--fut_refiner_kin_weight", default=0.1, type=float, help="Weight for kinematic consistency loss in refiner")
 
     # Fut visualization
     parser.add_argument("--fut_enable_eval_vis", default=0, type=int)

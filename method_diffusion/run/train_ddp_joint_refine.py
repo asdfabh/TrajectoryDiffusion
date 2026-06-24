@@ -25,7 +25,16 @@ from method_diffusion.run.train_joint_refine import (
 from method_diffusion.run.train_refine import compute_refiner_loss
 from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_closest_prediction
 
-LOSS_KEYS = ["loss", "xy_loss", "fde_loss", "delta_norm", "gate"]
+LOSS_KEYS = [
+    "loss",
+    "xy_loss",
+    "fde_loss",
+    "theta_loss",
+    "v_loss",
+    "kin_loss",
+    "delta_norm",
+    "gate",
+]
 
 
 def build_distributed_loader(dataset, batch_size, num_workers, sampler, drop_last):
@@ -104,8 +113,13 @@ def train_epoch(args, hist_model, fut_model, refiner, dataloader, optimizer, dev
             op_mask,
             aux,
             args.fut_refiner_fde_weight,
+            getattr(args, "fut_refiner_theta_weight", 0.0),
+            getattr(args, "fut_refiner_v_weight", 0.0),
+            getattr(args, "fut_refiner_kin_weight", 0.0),
             args.fut_refiner_delta_weight,
             args.fut_refiner_gate_weight,
+            fut_model.fut_dt,
+            fut_model.fut_std[3] if hasattr(fut_model, "fut_std") else 1.0,
         )
 
         optimizer.zero_grad()
@@ -114,12 +128,18 @@ def train_epoch(args, hist_model, fut_model, refiner, dataloader, optimizer, dev
         optimizer.step()
 
         totals["loss"] += float(loss.item())
-        for key, value in logs.items():
-            totals[key] += float(value.item())
+        for key in LOSS_KEYS:
+            if key == "loss":
+                continue
+            totals[key] += float(logs[key].item())
         num_batches += 1
 
         if is_main_process(rank):
-            pbar.set_postfix({"loss": f"{loss.item():.5f}", "gate": f"{logs['gate'].item():.3f}"})
+            pbar.set_postfix({
+                "loss": f"{loss.item():.5f}",
+                "kin": f"{logs['kin_loss'].item():.5f}",
+                "gate": f"{logs['gate'].item():.3f}",
+            })
 
     stats = torch.tensor([totals[key] for key in LOSS_KEYS] + [float(num_batches)], device=device, dtype=torch.float64)
     stats = reduce_tensor(stats)
@@ -224,7 +244,13 @@ def main():
                 refiner = DDP(refiner, find_unused_parameters=False)
 
         if is_main_process(rank):
-            print("[DDP JointRefineTrain] Refiner: TABR-temporal-basis")
+            print(
+                "[DDP JointRefineTrain] Refiner: TABR-temporal-basis | "
+                f"state_dim={int(getattr(args, 'fut_refiner_state_dim', 4))} | "
+                f"theta_w={float(getattr(args, 'fut_refiner_theta_weight', 0.0)):.4f} | "
+                f"v_w={float(getattr(args, 'fut_refiner_v_weight', 0.0)):.4f} | "
+                f"kin_w={float(getattr(args, 'fut_refiner_kin_weight', 0.0)):.4f}"
+            )
 
         best_rmse = float("inf")
         for epoch in range(1, int(args.num_epochs) + 1):

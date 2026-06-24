@@ -12,14 +12,23 @@ MODE_CONTEXT_FEATURE_DIM = 12
 
 
 class TemporalBasisResidualRefiner(nn.Module):
-    """TABR: 编码 history / candidate 序列，预测 temporal-basis XY 残差。"""
+    """TABR: 编码 history / candidate 序列，预测 temporal-basis 轨迹残差。
 
-    def __init__(self, hidden_dim=128, max_delta=5.0, time_power=2.0, num_basis=4):
+    支持两种模式：
+    - state_dim=2: 仅预测 XY 残差（原有模式）
+    - state_dim=4: 预测全状态残差 (x, y, theta, v)
+    """
+
+    def __init__(self, hidden_dim=128, max_delta=5.0, time_power=2.0, num_basis=4,
+                 state_dim=4, max_delta_theta=0.35, max_delta_v=3.0):
         super().__init__()
         hidden = int(hidden_dim)
         self.max_delta = float(max_delta)
         self.time_power = float(time_power)
         self.num_basis = max(int(num_basis), 2)
+        self.state_dim = int(state_dim)
+        self.max_delta_theta = float(max_delta_theta)
+        self.max_delta_v = float(max_delta_v)
 
         self.hist_encoder = nn.GRU(
             input_size=HIST_SEQUENCE_FEATURE_DIM,
@@ -39,13 +48,20 @@ class TemporalBasisResidualRefiner(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden, hidden),
         )
+        if self.state_dim == 2:
+            head_out_dim = self.num_basis * 2 + 1  # XY control + shared gate
+        elif self.state_dim == 4:
+            head_out_dim = self.num_basis * 4 + 4  # Full-state control + per-dim gate
+        else:
+            raise ValueError(f"Unsupported state_dim: {self.state_dim}. Must be 2 or 4.")
+
         self.head = nn.Sequential(
             nn.LayerNorm(hidden * 3),
             nn.Linear(hidden * 3, hidden),
             nn.ReLU(inplace=True),
             nn.Linear(hidden, hidden),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden, self.num_basis * 2 + 1),
+            nn.Linear(hidden, head_out_dim),
         )
 
     @staticmethod
@@ -156,19 +172,49 @@ class TemporalBasisResidualRefiner(nn.Module):
 
         mode_embed = self.mode_context(self.mode_context_features(traj))
         features = torch.cat([hist_embed, traj_embed, mode_embed], dim=-1)
-        raw = self.head(features.reshape(bsz * k_size, -1)).view(bsz, k_size, self.num_basis * 2 + 1)
 
-        control = torch.tanh(raw[..., :self.num_basis * 2]).view(bsz, k_size, self.num_basis, 2)
-        control = control * self.max_delta
-        gate = torch.sigmoid(raw[..., -1:])
-        basis = self.temporal_basis(t_len, traj.device, traj.dtype)
-        delta_xy = torch.einsum("tc,bkcd->bktd", basis, control)
-        delta_xy = gate.unsqueeze(2) * delta_xy
+        if self.state_dim == 2:
+            # XY-only mode (legacy)
+            raw = self.head(features.reshape(bsz * k_size, -1)).view(bsz, k_size, self.num_basis * 2 + 1)
+            control = torch.tanh(raw[..., :self.num_basis * 2]).view(bsz, k_size, self.num_basis, 2)
+            control = control * self.max_delta
+            gate = torch.sigmoid(raw[..., -1:])
+            basis = self.temporal_basis(t_len, traj.device, traj.dtype)
+            delta_xy = torch.einsum("tc,bkcd->bktd", basis, control)
+            delta_xy = gate.unsqueeze(2) * delta_xy
+            refined_xy = traj[..., :2] + delta_xy
+            refined = torch.cat([refined_xy, traj[..., 2:]], dim=-1)
+            refined = recompute_theta_v_from_xy(refined, dt)
+            delta_end = delta_xy[:, :, -1]
+        else:
+            # Full-state mode: refine x, y, theta, v with per-dimension gate
+            raw = self.head(features.reshape(bsz * k_size, -1)).view(
+                bsz, k_size, self.num_basis * self.state_dim + self.state_dim
+            )
+            control_raw = torch.tanh(raw[..., :self.num_basis * self.state_dim]).view(
+                bsz, k_size, self.num_basis, self.state_dim
+            )
+            # Scale each dimension separately (avoid inplace)
+            scale = torch.ones_like(control_raw)
+            scale[..., :2] = self.max_delta
+            scale[..., 2] = self.max_delta_theta
+            scale[..., 3] = self.max_delta_v
+            control = control_raw * scale
 
-        refined_xy = traj[..., :2] + delta_xy
-        refined = torch.cat([refined_xy, traj[..., 2:]], dim=-1)
-        refined = recompute_theta_v_from_xy(refined, dt)
-        delta_end = delta_xy[:, :, -1]
+            gate = torch.sigmoid(raw[..., self.num_basis * self.state_dim:])  # [B, K, state_dim]
+            basis = self.temporal_basis(t_len, traj.device, traj.dtype)
+            delta = torch.einsum("tc,bkcd->bktd", basis, control)  # [B, K, T, 4]
+            delta = gate.unsqueeze(2) * delta  # [B, K, T, 4] * [B, K, 1, 4] -> [B, K, T, 4]
+
+            refined = traj + delta
+            # Normalize theta to [-pi, pi] (avoid inplace)
+            theta_normalized = torch.atan2(torch.sin(refined[..., 2]), torch.cos(refined[..., 2]))
+            # Ensure v is non-negative (avoid inplace)
+            v_clamped = refined[..., 3].clamp(min=0.0)
+            # Create new tensor instead of inplace modification
+            refined = torch.stack([refined[..., 0], refined[..., 1], theta_normalized, v_clamped], dim=-1)
+            delta_end = delta[:, :, -1]
+
         if squeeze_candidate:
             refined = refined.squeeze(1)
             delta_end = delta_end.squeeze(1)
@@ -189,4 +235,7 @@ def build_trajectory_refiner(args):
         max_delta=args.fut_refiner_max_delta,
         time_power=args.fut_refiner_time_power,
         num_basis=args.fut_refiner_num_basis,
+        state_dim=getattr(args, "fut_refiner_state_dim", 4),
+        max_delta_theta=getattr(args, "fut_refiner_max_delta_theta", 0.35),
+        max_delta_v=getattr(args, "fut_refiner_max_delta_v", 3.0),
     )

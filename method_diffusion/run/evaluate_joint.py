@@ -28,6 +28,7 @@ from method_diffusion.run.train_joint import (
     normalize_dataset_name,
 )
 from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_closest_prediction
+from method_diffusion.utils.trajectory_kinematics import PhysicalDiagnostics, print_kinematic_diagnostics
 from method_diffusion.utils.visualization import visualize_scene_prediction
 
 JOINT_REFINER_CHECKPOINT_DIR = Path(__file__).resolve().parent.parent.parent / "checkpoints" / "joint_refine"
@@ -90,8 +91,11 @@ def evaluate(
     model_fut.eval()
     metrics = TrajectoryMetrics(model_fut.T)
     refined_metrics = TrajectoryMetrics(model_fut.T) if residual_refiner is not None else None
+    baseline_physics = PhysicalDiagnostics(model_fut.fut_dt)
+    refined_physics = PhysicalDiagnostics(model_fut.fut_dt) if residual_refiner is not None else None
     k_samples = max(1, int(fut_k))
     eval_name = f"Joint Fut ClosestGT-RMSE@{k_samples}" if k_samples > 1 else "Joint Fut single-mode"
+    print(f"[JointEval] dt={model_fut.fut_dt:.3f}s | refine={int(residual_refiner is not None)}")
 
     pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc=eval_name, ncols=140)
     for batch_idx, batch in pbar:
@@ -152,8 +156,10 @@ def evaluate(
             )
 
         metrics.update(pred_fut, fut, op_mask)
+        baseline_physics.update(pred_fut, op_mask)
         if residual_refiner is not None:
             refined_metrics.update(refined_pred, fut, op_mask)
+            refined_physics.update(refined_pred, op_mask)
             summary = refined_metrics.summary()
         else:
             summary = metrics.summary()
@@ -174,9 +180,11 @@ def evaluate(
 
     final_metrics = metrics.summary()
     print_metrics(final_metrics, "Joint Final Test Result")
+    print_kinematic_diagnostics(baseline_physics.summary(), "Joint Physical Diagnostics")
     if residual_refiner is not None:
         refined_final_metrics = refined_metrics.summary()
         print_metrics(refined_final_metrics, "Joint + TABR Final Test Result")
+        print_kinematic_diagnostics(refined_physics.summary(), "Joint + TABR Physical Diagnostics")
         return refined_final_metrics
     return final_metrics
 

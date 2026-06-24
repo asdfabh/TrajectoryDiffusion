@@ -18,6 +18,41 @@ def recompute_theta_v_from_xy(traj, dt):
     return torch.cat([xy, theta, speed], dim=-1)
 
 
+def compute_kinematic_residual(traj, dt):
+    """计算轨迹的运动学残差 (xy与theta/v的一致性)。
+
+    对于轨迹 [x, y, theta, v]，计算：
+        xy_kin[t] = xy[t-1] + v[t] * [cos(theta[t]), sin(theta[t])] * dt
+        residual[t] = xy[t] - xy_kin[t]
+
+    Args:
+        traj: [..., T, 4] 轨迹 (x, y, theta, v)，支持 [B,T,4] 或 [B,K,T,4]
+        dt: 时间步长 (秒)
+
+    Returns:
+        residual: 与traj相同shape的运动学残差 [..., T, 2]
+    """
+    if traj.size(-1) != 4:
+        raise ValueError(f"Expected trajectory feature dim 4, got {traj.size(-1)}")
+
+    step_dt = max(float(dt), 1e-6)
+    xy = traj[..., :2]
+    theta = traj[..., 2]
+    v = traj[..., 3]
+
+    # xy_prev: [origin, xy[0], xy[1], ..., xy[T-2]]
+    origin = xy.new_zeros(*xy.shape[:-2], 1, 2)
+    xy_prev = torch.cat([origin, xy[..., :-1, :]], dim=-2)
+
+    # 从theta/v积分得到的xy
+    xy_kin = xy_prev + torch.stack([
+        v * torch.cos(theta) * step_dt,
+        v * torch.sin(theta) * step_dt,
+    ], dim=-1)
+
+    return xy - xy_kin
+
+
 class PhysicalDiagnostics:
     """累计基于 xy 的物理诊断指标。"""
 

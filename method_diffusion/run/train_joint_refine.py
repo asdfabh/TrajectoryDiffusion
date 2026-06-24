@@ -116,6 +116,9 @@ def train_epoch(args, hist_model, fut_model, refiner, dataloader, optimizer, dev
         "loss": 0.0,
         "xy_loss": 0.0,
         "fde_loss": 0.0,
+        "theta_loss": 0.0,
+        "v_loss": 0.0,
+        "kin_loss": 0.0,
         "delta_norm": 0.0,
         "gate": 0.0,
     }
@@ -139,8 +142,13 @@ def train_epoch(args, hist_model, fut_model, refiner, dataloader, optimizer, dev
             op_mask,
             aux,
             args.fut_refiner_fde_weight,
+            getattr(args, "fut_refiner_theta_weight", 0.0),
+            getattr(args, "fut_refiner_v_weight", 0.0),
+            getattr(args, "fut_refiner_kin_weight", 0.0),
             args.fut_refiner_delta_weight,
             args.fut_refiner_gate_weight,
+            fut_model.fut_dt,
+            fut_model.fut_std[3] if hasattr(fut_model, 'fut_std') else 1.0,
         )
 
         optimizer.zero_grad()
@@ -198,6 +206,9 @@ def write_csv_row(csv_path, epoch, train_stats, baseline_summary, refined_summar
         "train_loss": train_stats["loss"],
         "train_xy_loss": train_stats["xy_loss"],
         "train_fde_loss": train_stats["fde_loss"],
+        "train_theta_loss": train_stats.get("theta_loss", 0.0),
+        "train_v_loss": train_stats.get("v_loss", 0.0),
+        "train_kin_loss": train_stats.get("kin_loss", 0.0),
         "train_delta_norm": train_stats["delta_norm"],
         "train_gate": train_stats["gate"],
         "baseline_rmse": baseline_summary["rmse_per_step_m"][last_idx].item(),

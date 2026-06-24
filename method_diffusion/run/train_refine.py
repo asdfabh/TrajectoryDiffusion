@@ -77,14 +77,37 @@ def compute_refiner_loss(
     op_mask,
     aux,
     fde_weight,
+    theta_weight,
+    v_weight,
+    kin_weight,
     delta_weight,
     gate_weight,
+    fut_dt,
+    v_scale,
 ):
+    """计算 refiner 的全状态 loss。
+
+    Args:
+        refined_all: [B, K, T, D] refined trajectories
+        fut: [B, T, D] ground truth future
+        op_mask: [B, T, D] or [B, T] validity mask
+        aux: dict with delta_end, gate, control_points, delta_regularizer
+        fde_weight: weight for final displacement error
+        theta_weight: weight for heading angle loss
+        v_weight: weight for velocity loss
+        kin_weight: weight for kinematic consistency loss
+        delta_weight: weight for delta regularizer
+        gate_weight: weight for gate regularization
+        fut_dt: time step for kinematic computation
+        v_scale: std of v for normalization
+    """
     valid = normalize_traj_valid_mask(op_mask, fut).bool()
+    bsz, k_size, t_len, feat_dim = refined_all.shape
+
+    # 1. XY loss (time-weighted)
     target_xy = fut[..., :2].unsqueeze(1)
     pred_xy = refined_all[..., :2]
     dist = torch.linalg.norm(pred_xy - target_xy, dim=-1)
-    bsz, k_size, t_len = dist.shape
     time_weight = torch.linspace(
         1.0 / max(t_len, 1),
         1.0,
@@ -101,19 +124,77 @@ def compute_refiner_loss(
     final_dist = dist.gather(2, final_idx.view(bsz, 1, 1).expand(bsz, k_size, 1)).squeeze(2)
     final_dist = final_dist * has_valid.float().unsqueeze(1)
 
+    # 2. Theta loss
+    theta_loss = torch.zeros(bsz, k_size, device=refined_all.device, dtype=refined_all.dtype)
+    if feat_dim >= 3 and float(theta_weight) > 0:
+        target_theta = fut[..., 2].unsqueeze(1)  # [B, 1, T]
+        pred_theta = refined_all[..., 2]           # [B, K, T]
+        theta_diff = torch.atan2(
+            torch.sin(pred_theta - target_theta),
+            torch.cos(pred_theta - target_theta),
+        )
+        theta_loss_map = theta_diff.abs()
+        theta_loss = (theta_loss_map * weighted_valid).sum(dim=2) / (weighted_valid.sum(dim=2) + 1e-6)
+
+    # 3. V loss (normalized by v_scale)
+    v_loss = torch.zeros(bsz, k_size, device=refined_all.device, dtype=refined_all.dtype)
+    if feat_dim >= 4 and float(v_weight) > 0:
+        target_v = fut[..., 3].unsqueeze(1)  # [B, 1, T]
+        pred_v = refined_all[..., 3]           # [B, K, T]
+        v_scale_clamped = max(float(v_scale), 1e-6)
+        v_loss_map = ((pred_v - target_v) / v_scale_clamped).abs()
+        v_loss = (v_loss_map * weighted_valid).sum(dim=2) / (weighted_valid.sum(dim=2) + 1e-6)
+
+    # 4. Kinematic consistency loss
+    kin_loss = torch.zeros(bsz, k_size, device=refined_all.device, dtype=refined_all.dtype)
+    if feat_dim >= 4 and float(kin_weight) > 0:
+        from method_diffusion.utils.trajectory_kinematics import compute_kinematic_residual
+        residual = compute_kinematic_residual(refined_all, fut_dt)
+        kin_loss_map = residual.abs().mean(dim=-1)  # [B, K, T]
+        kin_loss = (kin_loss_map * weighted_valid).sum(dim=2) / (weighted_valid.sum(dim=2) + 1e-6)
+
+    # 5. Regularization terms
     delta_norm = aux.get("delta_regularizer", torch.linalg.norm(aux["delta_end"], dim=-1))
-    gate = aux["gate"].squeeze(-1)
+    gate_raw = aux["gate"]
+    # Average gate across state dimensions if needed (for full-state mode)
+    if gate_raw.dim() == 3 and gate_raw.size(-1) > 1:
+        gate = gate_raw.mean(dim=-1)  # [B, K]
+    else:
+        gate = gate_raw.squeeze(-1)  # [B, K]
+
+    # 6. Total loss
     loss_k = (
         xy_loss
         + float(fde_weight) * final_dist
+        + float(theta_weight) * theta_loss
+        + float(v_weight) * v_loss
+        + float(kin_weight) * kin_loss
         + float(delta_weight) * delta_norm
         + float(gate_weight) * gate
     )
     best_idx = torch.argmin((xy_loss + float(fde_weight) * final_dist).detach(), dim=1)
     selected_loss = loss_k.gather(1, best_idx.unsqueeze(1)).squeeze(1)
+
+    # Handle empty valid case to avoid NaN
+    if not torch.any(has_valid):
+        # Create a zero loss that still has grad_fn for backward compatibility
+        zero_loss = (selected_loss * 0.0).sum()
+        return zero_loss, {
+            "xy_loss": (xy_loss * 0.0).sum().detach(),
+            "fde_loss": (final_dist * 0.0).sum().detach(),
+            "theta_loss": (theta_loss * 0.0).sum().detach(),
+            "v_loss": (v_loss * 0.0).sum().detach(),
+            "kin_loss": (kin_loss * 0.0).sum().detach(),
+            "delta_norm": (delta_norm * 0.0).sum().detach(),
+            "gate": (gate * 0.0).sum().detach(),
+        }
+
     return selected_loss[has_valid].mean(), {
         "xy_loss": xy_loss.gather(1, best_idx.unsqueeze(1)).squeeze(1)[has_valid].mean().detach(),
         "fde_loss": final_dist.gather(1, best_idx.unsqueeze(1)).squeeze(1)[has_valid].mean().detach(),
+        "theta_loss": theta_loss.gather(1, best_idx.unsqueeze(1)).squeeze(1)[has_valid].mean().detach(),
+        "v_loss": v_loss.gather(1, best_idx.unsqueeze(1)).squeeze(1)[has_valid].mean().detach(),
+        "kin_loss": kin_loss.gather(1, best_idx.unsqueeze(1)).squeeze(1)[has_valid].mean().detach(),
         "delta_norm": delta_norm.gather(1, best_idx.unsqueeze(1)).squeeze(1)[has_valid].mean().detach(),
         "gate": gate.gather(1, best_idx.unsqueeze(1)).squeeze(1)[has_valid].mean().detach(),
     }
@@ -125,6 +206,9 @@ def train_epoch(args, fut_model, refiner, dataloader, optimizer, device, epoch):
         "loss": 0.0,
         "xy_loss": 0.0,
         "fde_loss": 0.0,
+        "theta_loss": 0.0,
+        "v_loss": 0.0,
+        "kin_loss": 0.0,
         "delta_norm": 0.0,
         "gate": 0.0,
     }
@@ -142,8 +226,13 @@ def train_epoch(args, fut_model, refiner, dataloader, optimizer, device, epoch):
             op_mask,
             aux,
             args.fut_refiner_fde_weight,
+            getattr(args, "fut_refiner_theta_weight", 0.0),
+            getattr(args, "fut_refiner_v_weight", 0.0),
+            getattr(args, "fut_refiner_kin_weight", 0.0),
             args.fut_refiner_delta_weight,
             args.fut_refiner_gate_weight,
+            fut_model.fut_dt,
+            fut_model.fut_std[3] if hasattr(fut_model, 'fut_std') else 1.0,
         )
 
         optimizer.zero_grad()
@@ -194,6 +283,9 @@ def write_csv_row(csv_path, epoch, train_stats, baseline_summary, refined_summar
         "train_loss": train_stats["loss"],
         "train_xy_loss": train_stats["xy_loss"],
         "train_fde_loss": train_stats["fde_loss"],
+        "train_theta_loss": train_stats.get("theta_loss", 0.0),
+        "train_v_loss": train_stats.get("v_loss", 0.0),
+        "train_kin_loss": train_stats.get("kin_loss", 0.0),
         "train_delta_norm": train_stats["delta_norm"],
         "train_gate": train_stats["gate"],
         "baseline_rmse": baseline_summary["rmse_per_step_m"][last_idx].item(),
