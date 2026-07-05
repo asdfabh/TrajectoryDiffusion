@@ -79,17 +79,21 @@ class TemporalBasisResidualRefiner(nn.Module):
         return acc
 
     @staticmethod
-    def sequence_features(traj, include_time=False):
+    def sequence_motion_state(step, dt):
+        step_dt = max(float(dt), 1e-6)
+        theta = torch.atan2(step[..., 1], step[..., 0]).unsqueeze(-1)
+        speed = torch.linalg.norm(step, dim=-1, keepdim=True) / step_dt
+        return torch.cat([theta, speed], dim=-1)
+
+    @staticmethod
+    def sequence_features(traj, include_time=False, dt=1.0):
         xy = traj[..., :2]
         step = TemporalBasisResidualRefiner.prepend_zero_step(xy)
         acc = TemporalBasisResidualRefiner.sequence_acc(step)
-        speed = torch.linalg.norm(step, dim=-1, keepdim=True)
+        step_norm = torch.linalg.norm(step, dim=-1, keepdim=True)
         acc_norm = torch.linalg.norm(acc, dim=-1, keepdim=True)
-        if traj.size(-1) >= 4:
-            state = traj[..., 2:4]
-        else:
-            state = traj.new_zeros(*traj.shape[:-1], 2)
-        features = [xy, step, speed, acc, acc_norm, state]
+        theta_v = TemporalBasisResidualRefiner.sequence_motion_state(step, dt)
+        features = [xy, step, step_norm, acc, acc_norm, theta_v]
         if not include_time:
             return torch.cat(features, dim=-1)
 
@@ -161,11 +165,11 @@ class TemporalBasisResidualRefiner(nn.Module):
             raise ValueError(f"Expected trajectory feature dim >= 4, got {traj.size(-1)}")
 
         bsz, k_size, t_len, _ = traj.shape
-        hist_feat = self.sequence_features(hist, include_time=False)
+        hist_feat = self.sequence_features(hist, include_time=False, dt=dt)
         _, hist_hidden = self.hist_encoder(hist_feat)
         hist_embed = hist_hidden[-1].unsqueeze(1).expand(-1, k_size, -1)
 
-        traj_feat = self.sequence_features(traj, include_time=True)
+        traj_feat = self.sequence_features(traj, include_time=True, dt=dt)
         traj_feat_flat = traj_feat.reshape(bsz * k_size, t_len, TRAJ_SEQUENCE_FEATURE_DIM)
         _, traj_hidden = self.traj_encoder(traj_feat_flat)
         traj_embed = traj_hidden[-1].view(bsz, k_size, -1)

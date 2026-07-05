@@ -56,6 +56,8 @@ def compute_kinematic_residual(traj, dt):
 class PhysicalDiagnostics:
     """累计基于 xy 的物理诊断指标。"""
 
+    kin_res_thresholds = (0.1, 0.15, 0.2)
+
     def __init__(
         self,
         dt,
@@ -92,6 +94,9 @@ class PhysicalDiagnostics:
             "kin_res_max": 0.0,
             "kin_res_count": 0.0,
         }
+        for threshold in self.kin_res_thresholds:
+            self.totals[f"kin_res_violation_{self._threshold_suffix(threshold)}"] = 0.0
+        self.kin_res_values = []
 
     @staticmethod
     def _update_scalar(totals, prefix, values, limit=None):
@@ -104,6 +109,29 @@ class PhysicalDiagnostics:
         if limit is not None:
             totals[f"{prefix}_violation"] += float((values > float(limit)).sum().item())
 
+    @staticmethod
+    def _threshold_suffix(threshold):
+        return f"{float(threshold):.2f}".replace(".", "p")
+
+    @staticmethod
+    def _nearest_rank_quantile(values, q):
+        """用 nearest-rank 口径计算一维分位数，避免 torch.quantile 的超大张量限制。"""
+        if values.numel() == 0:
+            return 0.0
+        flat = values.detach().flatten()
+        rank = int(round(float(q) * (flat.numel() - 1))) + 1
+        rank = min(max(rank, 1), flat.numel())
+        return float(torch.kthvalue(flat, rank).values.item())
+
+    def _update_kin_res_distribution(self, values):
+        if values.numel() == 0:
+            return
+        values = values.detach().flatten()
+        self.kin_res_values.append(values.float().cpu())
+        for threshold in self.kin_res_thresholds:
+            suffix = self._threshold_suffix(threshold)
+            self.totals[f"kin_res_violation_{suffix}"] += float((values > threshold).sum().item())
+
     def update(self, pred, valid_mask=None):
         pred = pred.detach()
         valid = normalize_traj_valid_mask(valid_mask, pred).bool()
@@ -114,14 +142,11 @@ class PhysicalDiagnostics:
             vel_mask = valid[:, 1:] & valid[:, :-1]
             speed = torch.linalg.norm(delta, dim=-1) / self.dt
             if pred.size(-1) >= 4:
-                theta = pred[:, :-1, 2]
-                v = pred[:, :-1, 3]
-                kin_step = torch.stack(
-                    (v * torch.cos(theta) * self.dt, v * torch.sin(theta) * self.dt),
-                    dim=-1,
-                )
-                kin_res = torch.linalg.norm(delta - kin_step, dim=-1)
-                self._update_scalar(self.totals, "kin_res", kin_res[vel_mask])
+                residual = compute_kinematic_residual(pred, self.dt)
+                kin_res = torch.linalg.norm(residual, dim=-1)
+                valid_kin_res = kin_res[valid]
+                self._update_scalar(self.totals, "kin_res", valid_kin_res)
+                self._update_kin_res_distribution(valid_kin_res)
         else:
             delta = None
             speed = None
@@ -155,6 +180,19 @@ class PhysicalDiagnostics:
             out[f"{prefix}_max"] = self.totals[f"{prefix}_max"]
             if f"{prefix}_violation" in self.totals:
                 out[f"{prefix}_violation_rate"] = self.totals[f"{prefix}_violation"] / count
+        kin_count = max(self.totals["kin_res_count"], 1.0)
+        if self.kin_res_values:
+            kin_res_values = torch.cat(self.kin_res_values)
+            out["kin_res_median"] = self._nearest_rank_quantile(kin_res_values, 0.50)
+            out["kin_res_p90"] = self._nearest_rank_quantile(kin_res_values, 0.90)
+            out["kin_res_p95"] = self._nearest_rank_quantile(kin_res_values, 0.95)
+        else:
+            out["kin_res_median"] = 0.0
+            out["kin_res_p90"] = 0.0
+            out["kin_res_p95"] = 0.0
+        for threshold in self.kin_res_thresholds:
+            suffix = self._threshold_suffix(threshold)
+            out[f"kin_res_violation_{suffix}_rate"] = self.totals[f"kin_res_violation_{suffix}"] / kin_count
         return out
 
 
@@ -179,4 +217,25 @@ def print_kinematic_diagnostics(summary, title):
             f"{summary[f'{key}_max']:<12.6f} | "
             f"{violation_text}"
         )
+    print("-" * 65)
+    print(
+        f"{'kin_res_dist':<24} | "
+        f"{'Median':<12} | {'P90':<12} | {'P95':<12}"
+    )
+    print(
+        f"{'':<24} | "
+        f"{summary['kin_res_median']:<12.6f} | "
+        f"{summary['kin_res_p90']:<12.6f} | "
+        f"{summary['kin_res_p95']:<12.6f}"
+    )
+    print(
+        f"{'kin_res_violation':<24} | "
+        f"{'>0.10m':<12} | {'>0.15m':<12} | {'>0.20m':<12}"
+    )
+    print(
+        f"{'':<24} | "
+        f"{summary['kin_res_violation_0p10_rate']:<12.6f} | "
+        f"{summary['kin_res_violation_0p15_rate']:<12.6f} | "
+        f"{summary['kin_res_violation_0p20_rate']:<12.6f}"
+    )
     print("=" * 65)
