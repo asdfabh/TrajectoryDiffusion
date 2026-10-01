@@ -80,8 +80,6 @@ def evaluate(
     fut_k,
     enable_eval_vis,
     mask_ratio,
-    random_mask_ratio,
-    block_mask_start,
     dataset_name=None,
     enable_latent_bridge=False,
     residual_refiner=None,
@@ -89,12 +87,12 @@ def evaluate(
 ):
     model_hist.eval()
     model_fut.eval()
-    metrics = TrajectoryMetrics(model_fut.T)
-    refined_metrics = TrajectoryMetrics(model_fut.T) if residual_refiner is not None else None
+    metrics = TrajectoryMetrics(model_fut.T, num_candidates=max(1, int(fut_k)))
+    refined_metrics = TrajectoryMetrics(model_fut.T, num_candidates=max(1, int(fut_k))) if residual_refiner is not None else None
     baseline_physics = PhysicalDiagnostics(model_fut.fut_dt)
     refined_physics = PhysicalDiagnostics(model_fut.fut_dt) if residual_refiner is not None else None
     k_samples = max(1, int(fut_k))
-    eval_name = f"Joint Fut ClosestGT-RMSE@{k_samples}" if k_samples > 1 else "Joint Fut single-mode"
+    eval_name = f"Joint Fut BestOfK@{k_samples}" if k_samples > 1 else "Joint Fut single-mode"
     print(f"[JointEval] dt={model_fut.fut_dt:.3f}s | refine={int(residual_refiner is not None)}")
 
     pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc=eval_name, ncols=140)
@@ -108,8 +106,6 @@ def evaluate(
             batch,
             feature_dim,
             mask_ratio=mask_ratio,
-            random_mask_ratio=random_mask_ratio,
-            block_mask_start=block_mask_start,
             device=device,
         )
         hist_outputs = model_hist.forward_eval(hist, hist_masked, device, return_tokens=enable_latent_bridge)
@@ -149,41 +145,41 @@ def evaluate(
                 refined_pred_all=refined_all if show_refined_vis else None,
                 refined_pred_best_idx=refined_best_idx if show_refined_vis else None,
                 title="Joint Hist Reconstruction + Future Prediction",
-                highlight_label="Best",
+                highlight_label="Best RMSE (full trajectory)",
                 hist_masked=hist_masked,
                 hist_reconstructed=pred_hist,
                 dataset_name=dataset_name,
             )
 
-        metrics.update(pred_fut, fut, op_mask)
+        metrics.update(all_preds, fut, op_mask)
         baseline_physics.update(pred_fut, op_mask)
         if residual_refiner is not None:
-            refined_metrics.update(refined_pred, fut, op_mask)
+            refined_metrics.update(refined_all, fut, op_mask)
             refined_physics.update(refined_pred, op_mask)
             summary = refined_metrics.summary()
         else:
             summary = metrics.summary()
         last_idx = min(model_fut.T, len(summary["rmse_per_step_m"])) - 1
-        last_sec = int(model_fut.T * 0.2)
+        last_sec = int(round(model_fut.T * model_fut.fut_dt))
         pbar.set_postfix({
-            f"ade_{last_sec}s": f"{summary['ade_per_step_m'][last_idx]:.4f}",
-            f"fde_{last_sec}s": f"{summary['fde_per_step_m'][last_idx]:.4f}",
+            f"minADE_{last_sec}s": f"{summary['min_ade_per_step_m'][last_idx]:.4f}",
+            f"minFDE_{last_sec}s": f"{summary['min_fde_per_step_m'][last_idx]:.4f}",
             f"rmse_{last_sec}s": f"{summary['rmse_per_step_m'][last_idx]:.4f}",
             f"theta_{last_sec}s": f"{summary['theta_mae_per_step_deg'][last_idx]:.4f}",
             f"v_{last_sec}s": f"{summary['v_mae_per_step_mps'][last_idx]:.4f}",
         })
 
         if batch_idx % 100 == 0:
-            print_metrics(metrics.summary(), f"Joint Test Iteration {batch_idx}")
+            print_metrics(metrics.summary(), f"Joint Test Iteration {batch_idx}", dt=model_fut.fut_dt)
             if residual_refiner is not None:
-                print_metrics(refined_metrics.summary(), f"Joint + TABR Test Iteration {batch_idx}")
+                print_metrics(refined_metrics.summary(), f"Joint + TABR Test Iteration {batch_idx}", dt=model_fut.fut_dt)
 
     final_metrics = metrics.summary()
-    print_metrics(final_metrics, "Joint Final Test Result")
+    print_metrics(final_metrics, "Joint Final Test Result", dt=model_fut.fut_dt)
     print_kinematic_diagnostics(baseline_physics.summary(), "Joint Physical Diagnostics")
     if residual_refiner is not None:
         refined_final_metrics = refined_metrics.summary()
-        print_metrics(refined_final_metrics, "Joint + TABR Final Test Result")
+        print_metrics(refined_final_metrics, "Joint + TABR Final Test Result", dt=model_fut.fut_dt)
         print_kinematic_diagnostics(refined_physics.summary(), "Joint + TABR Physical Diagnostics")
         return refined_final_metrics
     return final_metrics
@@ -221,8 +217,6 @@ def main():
         fut_k=args.fut_k,
         enable_eval_vis=int(args.fut_enable_eval_vis) > 0,
         mask_ratio=max(0.0, min(1.0, float(args.mask_prob))),
-        random_mask_ratio=max(0.0, min(1.0, float(args.random_mask_ratio))),
-        block_mask_start=int(args.block_mask_start) > 0,
         dataset_name=args.dataset,
         enable_latent_bridge=int(args.enable_past_fut_latent_bridge) > 0,
         residual_refiner=residual_refiner,

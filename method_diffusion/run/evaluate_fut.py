@@ -18,6 +18,8 @@ from method_diffusion.utils.fut_utils import (
     SampleImprovementStats,
     TrajectoryMetrics,
     print_sample_improvement,
+    get_horizon_pairs,
+    print_trajectory_metrics,
     select_closest_prediction,
 )
 from method_diffusion.utils.trajectory_kinematics import PhysicalDiagnostics, print_kinematic_diagnostics
@@ -81,44 +83,12 @@ def load_residual_refiner(args, checkpoint_dir, device):
     return refiner
 
 
-def get_time_pairs(fut_steps):
-    """按未来步数生成 (label, index) 对。dt=0.2s/步。"""
-    if fut_steps >= 25:
-        return [("1s", 4), ("2s", 9), ("3s", 14), ("4s", 19), ("5s", 24)]
-    # RounD: 20 步 → 4s
-    pairs = []
-    for t_sec in (1, 2, 3, 4):
-        idx = int(t_sec / 0.2) - 1
-        if idx < fut_steps:
-            pairs.append((f"{t_sec}s", idx))
-    return pairs
+def get_time_pairs(fut_steps, dt=0.2):
+    return get_horizon_pairs(fut_steps, dt)
 
 
-def print_metrics(metrics, title):
-    time_pairs = get_time_pairs(len(metrics["rmse_per_step_m"]))
-    valid_pairs = [(label, idx) for label, idx in time_pairs if idx < len(metrics["rmse_per_step_m"])]
-
-    print("\n" + "=" * 30 + f" {title} " + "=" * 30)
-    if not valid_pairs:
-        print("No valid per-second horizon in current prediction length.")
-        print("=" * 75)
-        return
-
-    print(
-        f"{'Horizon':<8} | {'RMSE (m)':<10} | {'ADE (m)':<10} | "
-        f"{'FDE (m)':<10} | {'Theta (deg)':<10} | {'V (m/s)':<10}"
-    )
-    print("-" * 75)
-    for label, idx in valid_pairs:
-        print(
-            f"{label:<8} | "
-            f"{metrics['rmse_per_step_m'][idx].item():<10f} | "
-            f"{metrics['ade_per_step_m'][idx].item():<10f} | "
-            f"{metrics['fde_per_step_m'][idx].item():<10f} | "
-            f"{metrics['theta_mae_per_step_deg'][idx].item():<10f} | "
-            f"{metrics['v_mae_per_step_mps'][idx].item():<10f}"
-        )
-    print("=" * 75)
+def print_metrics(metrics, title, dt=0.2):
+    print_trajectory_metrics(metrics, title, dt)
 
 
 # 构建 TestSet dataloader。
@@ -145,15 +115,15 @@ def build_test_loader(args):
 @torch.no_grad()
 def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis, fut_vis_enable_refine, dataset_name, residual_refiner):
     model.eval()
-    baseline_metrics = TrajectoryMetrics(model.T)
-    refined_metrics = TrajectoryMetrics(model.T) if residual_refiner is not None else None
+    baseline_metrics = TrajectoryMetrics(model.T, num_candidates=max(1, int(fut_k)))
+    refined_metrics = TrajectoryMetrics(model.T, num_candidates=max(1, int(fut_k))) if residual_refiner is not None else None
     k_samples = max(1, int(fut_k))
     _, _, d_s, _ = get_time_params(dataset_name)
     fut_dt = get_raw_dt(dataset_name) * int(d_s)
     baseline_physics = PhysicalDiagnostics(fut_dt)
     refined_physics = PhysicalDiagnostics(fut_dt) if residual_refiner is not None else None
     sample_stats = SampleImprovementStats() if residual_refiner is not None else None
-    eval_name = f"Fut ClosestGT-RMSE@{k_samples}" if k_samples > 1 else "Fut single-mode"
+    eval_name = f"Fut BestOfK@{k_samples}" if k_samples > 1 else "Fut single-mode"
     print(f"[FutEval] dt={fut_dt:.3f}s | refine={int(residual_refiner is not None)}")
 
     pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc=eval_name, ncols=120)
@@ -186,7 +156,7 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis, fut
                     refined_pred_best_idx=refined_best_idx if show_refined_vis else None,
                     batch_idx=0,
                     title="Future Prediction: Raw + Refined" if show_refined_vis else "Future Prediction",
-                    highlight_label="Best",
+                    highlight_label="Best RMSE (full trajectory)",
                     dataset_name=dataset_name,
                 )
         else:
@@ -194,39 +164,40 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis, fut
             pred_fut = all_preds.squeeze(1)
             refined_pred_fut = None
             if residual_refiner is not None:
-                refined_pred_fut, _ = residual_refiner(hist, pred_fut, fut_dt)
+                refined_all_preds, _ = residual_refiner(hist, all_preds, fut_dt)
+                refined_pred_fut = refined_all_preds[:, 0]
 
-        baseline_metrics.update(pred_fut, fut, op_mask)
+        baseline_metrics.update(all_preds, fut, op_mask)
         baseline_physics.update(pred_fut, op_mask)
         if residual_refiner is not None:
-            refined_metrics.update(refined_pred_fut, fut, op_mask)
+            refined_metrics.update(refined_all_preds, fut, op_mask)
             refined_physics.update(refined_pred_fut, op_mask)
-            sample_stats.update(pred_fut, refined_pred_fut, fut, op_mask)
+            sample_stats.update(all_preds, refined_all_preds, fut, op_mask)
             summary = refined_metrics.summary()
         else:
             summary = baseline_metrics.summary()
         last_idx = min(model.T, len(summary["rmse_per_step_m"])) - 1
-        last_sec = int(model.T * 0.2)
+        last_sec = int(round(model.T * fut_dt))
         pbar.set_postfix({
-            f"ade_{last_sec}s": f"{summary['ade_per_step_m'][last_idx]:.4f}",
-            f"fde_{last_sec}s": f"{summary['fde_per_step_m'][last_idx]:.4f}",
+            f"minADE_{last_sec}s": f"{summary['min_ade_per_step_m'][last_idx]:.4f}",
+            f"minFDE_{last_sec}s": f"{summary['min_fde_per_step_m'][last_idx]:.4f}",
             f"rmse_{last_sec}s": f"{summary['rmse_per_step_m'][last_idx]:.4f}",
             f"theta_{last_sec}s": f"{summary['theta_mae_per_step_deg'][last_idx]:.4f}",
             f"v_{last_sec}s": f"{summary['v_mae_per_step_mps'][last_idx]:.4f}",
         })
 
         if batch_idx % 100 == 0:
-            print_metrics(baseline_metrics.summary(), f"Baseline Test Iteration {batch_idx}")
+            print_metrics(baseline_metrics.summary(), f"Baseline Test Iteration {batch_idx}", dt=fut_dt)
             if residual_refiner is not None:
-                print_metrics(refined_metrics.summary(), f"TABR-temporal-basis-refiner Test Iteration {batch_idx}")
+                print_metrics(refined_metrics.summary(), f"TABR-temporal-basis-refiner Test Iteration {batch_idx}", dt=fut_dt)
     baseline_final_metrics = baseline_metrics.summary()
-    print_metrics(baseline_final_metrics, "Baseline Final Test Result")
+    print_metrics(baseline_final_metrics, "Baseline Final Test Result", dt=fut_dt)
     print_kinematic_diagnostics(baseline_physics.summary(), "Baseline Physical Diagnostics")
     if residual_refiner is None:
         return baseline_final_metrics
     refined_final_metrics = refined_metrics.summary()
     postprocess_title = "TABR-temporal-basis-refiner"
-    print_metrics(refined_final_metrics, f"{postprocess_title} Final Test Result")
+    print_metrics(refined_final_metrics, f"{postprocess_title} Final Test Result", dt=fut_dt)
     print_kinematic_diagnostics(refined_physics.summary(), f"{postprocess_title} Physical Diagnostics")
     print_sample_improvement(sample_stats.summary(), f"{postprocess_title} Sample Improvement")
     return refined_final_metrics

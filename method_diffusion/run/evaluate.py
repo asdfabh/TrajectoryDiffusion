@@ -12,7 +12,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.dataset.build import build_hist_dataset, get_test_split_path
 from method_diffusion.config import get_args_parser
-from method_diffusion.utils.mask_util import mixed_mask
+from method_diffusion.utils.mask_util import random_mask
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 HIST_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "hist"
@@ -22,7 +22,7 @@ def get_eval_args():
     return get_args_parser().parse_args()
 
 
-def prepare_input_data(batch, feature_dim, mask_ratio=0.5, random_mask_ratio=0.7, block_mask_start=False, device='cuda'):
+def prepare_input_data(batch, feature_dim, mask_ratio=0.5, device='cuda'):
     hist = batch['hist']  # [B, T, 2]
     va = batch['va']  # [B, T, 2]
     lane = batch['lane']  # [B, T, 1]
@@ -37,12 +37,7 @@ def prepare_input_data(batch, feature_dim, mask_ratio=0.5, random_mask_ratio=0.7
     else:
         hist = hist.to(device)
 
-    hist_mask = mixed_mask(
-        hist,
-        p=mask_ratio,
-        random_ratio=random_mask_ratio,
-        block_start=block_mask_start,
-    )
+    hist_mask = random_mask(hist, p=mask_ratio)
 
     hist_mask = hist_mask.to(device)
 
@@ -244,13 +239,9 @@ class HistReconstructionMetrics:
         }
 
 
-def print_metrics(summary, title, mask_ratio, random_mask_ratio, block_mask_start):
+def print_metrics(summary, title, mask_ratio):
     print('\n' + '=' * 20 + f' {title} ' + '=' * 20)
-    print(
-        f"Mask Ratio: {mask_ratio:.4f} | "
-        f"Random Mask Ratio: {random_mask_ratio:.4f} | "
-        f"Block Start: {bool(block_mask_start)}"
-    )
+    print(f"Mask Probability: {mask_ratio:.4f}")
     print(f"Masked XY ADE (m): {summary['xy_ade_m']['masked']:.6f}")
     print(f"Masked XY RMSE (m): {summary['xy_rmse_m']['masked']:.6f}")
     print('-' * 96)
@@ -306,8 +297,6 @@ def main():
     load_checkpoint(model, args.resume_hist, args.checkpoint_dir, device, model_name="HistModel")
     metrics = HistReconstructionMetrics()
     mask_ratio = max(0.0, min(1.0, float(args.mask_prob)))
-    random_mask_ratio = max(0.0, min(1.0, float(args.random_mask_ratio)))
-    block_mask_start = int(args.block_mask_start) > 0
 
     with torch.no_grad():
         pbar = tqdm(enumerate(test_loader, start=1), total=len(test_loader), desc="Eval Hist Recon", dynamic_ncols=True)
@@ -321,8 +310,6 @@ def main():
                 batch,
                 args.feature_dim,
                 mask_ratio=mask_ratio,
-                random_mask_ratio=random_mask_ratio,
-                block_mask_start=block_mask_start,
                 device=device,
             )
 
@@ -340,10 +327,10 @@ def main():
             })
 
             if batch_idx % 100 == 0:
-                print_metrics(summary, f"Hist Test Iteration {batch_idx}", mask_ratio, random_mask_ratio, block_mask_start)
+                print_metrics(summary, f"Hist Test Iteration {batch_idx}", mask_ratio)
 
     final_summary = metrics.summary()
-    print_metrics(final_summary, "Hist Reconstruction Result", mask_ratio, random_mask_ratio, block_mask_start)
+    print_metrics(final_summary, "Hist Reconstruction Result", mask_ratio)
 
 
 if __name__ == '__main__':

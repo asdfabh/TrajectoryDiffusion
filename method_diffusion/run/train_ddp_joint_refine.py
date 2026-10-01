@@ -23,7 +23,7 @@ from method_diffusion.run.train_joint_refine import (
     write_csv_row,
 )
 from method_diffusion.run.train_refine import compute_refiner_loss
-from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_closest_prediction
+from method_diffusion.utils.fut_utils import TrajectoryMetrics, DistributedEvalSampler, reduce_trajectory_metrics, print_trajectory_metrics, write_horizon_metrics
 
 LOSS_KEYS = [
     "loss",
@@ -65,23 +65,6 @@ def load_frozen_joint_fut_model_for_rank(args, dataset_name, device, rank):
     with open(os.devnull, "w", encoding="utf-8") as devnull:
         with contextlib.redirect_stdout(devnull):
             return load_frozen_joint_fut_model(args, dataset_name, device)
-
-
-def reduce_trajectory_metrics(metrics, device):
-    if not dist.is_initialized():
-        return metrics
-
-    for name in [
-        "total_coord_se",
-        "total_de",
-        "total_theta_abs_deg",
-        "total_v_abs",
-        "total_counts",
-    ]:
-        value = getattr(metrics, name).to(device=device, dtype=torch.float64)
-        dist.all_reduce(value, op=dist.ReduceOp.SUM)
-        setattr(metrics, name, value.cpu())
-    return metrics
 
 
 def train_epoch(args, hist_model, fut_model, refiner, dataloader, optimizer, device, epoch, dataset_name, enable_latent_bridge, rank):
@@ -150,8 +133,8 @@ def train_epoch(args, hist_model, fut_model, refiner, dataloader, optimizer, dev
 @torch.no_grad()
 def evaluate(args, hist_model, fut_model, refiner, dataloader, device, epoch, dataset_name, enable_latent_bridge, rank):
     refiner.eval()
-    baseline_metrics = TrajectoryMetrics(fut_model.T)
-    refined_metrics = TrajectoryMetrics(fut_model.T)
+    baseline_metrics = TrajectoryMetrics(fut_model.T, num_candidates=fut_model.fut_k)
+    refined_metrics = TrajectoryMetrics(fut_model.T, num_candidates=fut_model.fut_k)
     refiner_model = refiner.module if hasattr(refiner, "module") else refiner
     pbar = tqdm(
         dataloader,
@@ -171,23 +154,24 @@ def evaluate(args, hist_model, fut_model, refiner, dataloader, device, epoch, da
             dataset_name,
             enable_latent_bridge,
         )
-        pred_fut, _, _ = select_closest_prediction(all_preds, fut, op_mask)
         refined_all, _ = refiner_model(pred_hist, all_preds, fut_model.fut_dt)
-        refined_pred, _, _ = select_closest_prediction(refined_all, fut, op_mask)
-        baseline_metrics.update(pred_fut, fut, op_mask)
-        refined_metrics.update(refined_pred, fut, op_mask)
+        baseline_metrics.update(all_preds, fut, op_mask)
+        refined_metrics.update(refined_all, fut, op_mask)
 
         if is_main_process(rank):
             summary = refined_metrics.summary()
-            last_idx = refined_pred.size(1) - 1
+            last_idx = fut_model.T - 1
             pbar.set_postfix({
                 "rmse": f"{summary['rmse_per_step_m'][last_idx]:.4f}",
-                "ade": f"{summary['ade_per_step_m'][last_idx]:.4f}",
-                "fde": f"{summary['fde_per_step_m'][last_idx]:.4f}",
+                "minADE": f"{summary['min_ade_per_step_m'][last_idx]:.4f}",
+                "minFDE": f"{summary['min_fde_per_step_m'][last_idx]:.4f}",
             })
 
     baseline_metrics = reduce_trajectory_metrics(baseline_metrics, device)
     refined_metrics = reduce_trajectory_metrics(refined_metrics, device)
+    if is_main_process(rank):
+        print_trajectory_metrics(baseline_metrics.summary(), f"Baseline Val epoch {epoch}", fut_model.fut_dt)
+        print_trajectory_metrics(refined_metrics.summary(), f"Refined Val epoch {epoch}", fut_model.fut_dt)
     return baseline_metrics.summary(), refined_metrics.summary()
 
 
@@ -196,7 +180,7 @@ def main():
     args = get_args_parser().parse_args()
     dataset_name = normalize_dataset_name(args.dataset)
     checkpoint_dir = get_joint_refiner_checkpoint_dir(dataset_name)
-    csv_path = checkpoint_dir / "train_log.csv"
+    csv_path = checkpoint_dir / "train_log_bestofk.csv"
     enable_latent_bridge = int(args.enable_past_fut_latent_bridge) > 0
 
     try:
@@ -227,7 +211,7 @@ def main():
             feature_dim=args.feature_dim,
         )
         train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
-        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
+        val_sampler = DistributedEvalSampler(val_dataset, num_replicas=world_size, rank=rank)
         train_loader = build_distributed_loader(train_dataset, args.batch_size, args.num_workers, train_sampler, drop_last=True)
         val_loader = build_distributed_loader(val_dataset, args.batch_size, args.num_workers, val_sampler, drop_last=False)
 
@@ -255,7 +239,6 @@ def main():
         best_rmse = float("inf")
         for epoch in range(1, int(args.num_epochs) + 1):
             train_sampler.set_epoch(epoch)
-            val_sampler.set_epoch(epoch)
 
             train_stats = train_epoch(
                 args,
@@ -285,7 +268,7 @@ def main():
             scheduler.step()
 
             last_idx = len(refined_summary["rmse_per_step_m"]) - 1
-            selection_score = float(refined_summary["rmse_per_step_m"][last_idx].item())
+            selection_score = float(refined_summary["rmse_full_m"].item())
             is_best = selection_score < best_rmse
             if is_best:
                 best_rmse = selection_score
@@ -293,14 +276,17 @@ def main():
             if is_main_process(rank):
                 current_lr = optimizer.param_groups[0]["lr"]
                 write_csv_row(csv_path, epoch, train_stats, baseline_summary, refined_summary, current_lr)
+                write_horizon_metrics(checkpoint_dir / "val_metrics_per_second.csv", epoch, baseline_summary, fut_model.fut_dt, stage="Baseline")
+                write_horizon_metrics(checkpoint_dir / "val_metrics_per_second.csv", epoch, refined_summary, fut_model.fut_dt, stage="Refined")
                 print(
                     f"Epoch {epoch}/{args.num_epochs} | "
                     f"loss={train_stats['loss']:.6f} | "
                     f"gate={train_stats['gate']:.4f} | "
+                    f"rmse_full_selection_m={selection_score:.4f} | "
                     f"baseline_rmse={baseline_summary['rmse_per_step_m'][last_idx].item():.4f} | "
                     f"refined_rmse={refined_summary['rmse_per_step_m'][last_idx].item():.4f} | "
-                    f"refined_ade={refined_summary['ade_per_step_m'][last_idx].item():.4f} | "
-                    f"refined_fde={refined_summary['fde_per_step_m'][last_idx].item():.4f}"
+                    f"refined_minADE={refined_summary['min_ade_per_step_m'][last_idx].item():.4f} | "
+                    f"refined_minFDE={refined_summary['min_fde_per_step_m'][last_idx].item():.4f}"
                 )
 
                 refiner_state = refiner.module.state_dict() if hasattr(refiner, "module") else refiner.state_dict()
@@ -310,6 +296,8 @@ def main():
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
                     "best_rmse_m": best_rmse,
+                    "selection_metric": "rmse_full_m",
+                    "eval_rmse_full_m": selection_score,
                     "refiner_type": "temporal_basis",
                     "resume_hist": args.resume_hist,
                     "resume_fut": args.resume_fut,

@@ -20,7 +20,6 @@ from method_diffusion.run.train_fut import prepare_input_data
 from method_diffusion.run.train_joint import (
     JOINT_FUT_CHECKPOINT_DIR,
     build_hist_outputs,
-    compute_horizon_rmse_stats,
     get_joint_report_horizon,
     hist_checkpoint_dirs_for_dataset,
     init_csv_log,
@@ -29,7 +28,11 @@ from method_diffusion.run.train_joint import (
     normalize_dataset_name,
     write_csv_log,
 )
-from method_diffusion.utils.fut_utils import compute_batch_kinematic_metrics, compute_batch_metric, select_closest_prediction
+from method_diffusion.utils.fut_utils import (
+    DistributedEvalSampler,
+    TrajectoryMetrics, reduce_trajectory_metrics, print_trajectory_metrics,
+    validation_metric_values, write_horizon_metrics,
+)
 
 
 def setup_ddp():
@@ -122,8 +125,6 @@ def train_epoch(
     feature_dim,
     rank,
     mask_ratio,
-    random_mask_ratio,
-    block_mask_start,
     enable_latent_bridge,
 ):
     model_fut.train()
@@ -141,8 +142,6 @@ def train_epoch(
             model_hist=model_hist,
             hist=hist,
             mask_ratio=mask_ratio,
-            random_mask_ratio=random_mask_ratio,
-            block_mask_start=block_mask_start,
             device=device,
             return_tokens=enable_latent_bridge,
         )
@@ -193,123 +192,47 @@ def evaluate(
     feature_dim,
     rank,
     mask_ratio,
-    random_mask_ratio,
-    block_mask_start,
     horizon_idx,
     horizon_label,
     enable_latent_bridge,
+    return_summary=False,
 ):
     was_fut_training = model_fut.training
     was_hist_training = model_hist.training
     fut_model = model_fut.module if hasattr(model_fut, "module") else model_fut
     model_fut.eval()
     model_hist.eval()
-
-    total_rmse = 0.0
-    total_ade = 0.0
-    total_fde = 0.0
-    total_theta_deg = 0.0
-    total_v_mps = 0.0
-    total_horizon_sse = 0.0
-    total_horizon_count = 0.0
-    num_batches = 0
-
-    if len(dataloader) == 0:
-        if was_fut_training:
-            model_fut.train()
-        if was_hist_training:
-            model_hist.train()
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-
-    pbar = tqdm(
-        dataloader,
-        total=len(dataloader),
-        desc=f"Ep{epoch} Val",
-        ncols=120,
-        disable=not is_main_process(rank),
-    )
-
+    metrics = TrajectoryMetrics(fut_model.T, num_candidates=fut_model.fut_k)
+    pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Val", dynamic_ncols=True, disable=not is_main_process(rank))
     for batch in pbar:
-        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
-            batch,
-            feature_dim,
-            device=device,
-        )
+        hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
         pred_hist, past_latent_tokens = build_hist_outputs(
-            model_hist=model_hist,
-            hist=hist,
-            mask_ratio=mask_ratio,
-            random_mask_ratio=random_mask_ratio,
-            block_mask_start=block_mask_start,
-            device=device,
-            return_tokens=enable_latent_bridge,
+            model_hist=model_hist, hist=hist, mask_ratio=mask_ratio,
+            device=device, return_tokens=enable_latent_bridge,
         )
-        if int(fut_model.fut_k) > 1:
-            all_preds = fut_model.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, device, K=fut_model.fut_k, past_latent_tokens=past_latent_tokens)
-            pred_fut, _, _ = select_closest_prediction(all_preds, fut, op_mask)
-        else:
-            all_preds = fut_model.forwardEvalMulti(pred_hist, hist_nbrs, mask, temporal_mask, device, K=1, past_latent_tokens=past_latent_tokens)
-            pred_fut = all_preds.squeeze(1)
-        eval_rmse, eval_ade, eval_fde = compute_batch_metric(pred_fut, fut, op_mask)
-        eval_theta_deg, eval_v_mps = compute_batch_kinematic_metrics(pred_fut, fut, op_mask)
-        horizon_sse, horizon_count = compute_horizon_rmse_stats(pred_fut, fut, op_mask, horizon_idx)
-        eval_rmse = float(eval_rmse.item())
-        eval_ade = float(eval_ade.item())
-        eval_fde = float(eval_fde.item())
-        eval_theta_deg = float(eval_theta_deg.item())
-        eval_v_mps = float(eval_v_mps.item())
-        horizon_sse = float(horizon_sse.item())
-        horizon_count = float(horizon_count.item())
-
-        total_rmse += eval_rmse
-        total_ade += eval_ade
-        total_fde += eval_fde
-        total_theta_deg += eval_theta_deg
-        total_v_mps += eval_v_mps
-        total_horizon_sse += horizon_sse
-        total_horizon_count += horizon_count
-        num_batches += 1
-
+        all_preds = fut_model.forwardEvalMulti(
+            pred_hist, hist_nbrs, mask, temporal_mask, device, K=fut_model.fut_k,
+            past_latent_tokens=past_latent_tokens,
+        )
+        metrics.update(all_preds, fut, op_mask)
         if is_main_process(rank):
-            avg_horizon_rmse = (total_horizon_sse / max(total_horizon_count, 1.0)) ** 0.5
+            summary = metrics.summary()
             pbar.set_postfix({
-                "avg_rmse_m": f"{(total_rmse / num_batches):.4f}",
-                f"rmse_{horizon_label}": f"{avg_horizon_rmse:.4f}",
-                "avg_ade_m": f"{(total_ade / num_batches):.4f}",
-                "avg_fde_m": f"{(total_fde / num_batches):.4f}",
-                "avg_theta_deg": f"{(total_theta_deg / num_batches):.4f}",
-                "avg_v_mps": f"{(total_v_mps / num_batches):.4f}",
+                "RMSE_full_selection": f"{summary['rmse_full_m']:.4f}",
+                "RMSE_final_horizon": f"{summary['rmse_per_step_m'][-1]:.4f}",
+                "minADE_final_horizon": f"{summary['min_ade_per_step_m'][-1]:.4f}",
+                "minFDE_final_horizon": f"{summary['min_fde_per_step_m'][-1]:.4f}",
             })
-
-    stats = torch.tensor(
-        [
-            total_rmse,
-            total_ade,
-            total_fde,
-            total_theta_deg,
-            total_v_mps,
-            total_horizon_sse,
-            total_horizon_count,
-            float(num_batches),
-        ],
-        device=device,
-        dtype=torch.float64,
-    )
-    stats = reduce_tensor(stats)
-    if was_fut_training:
-        model_fut.train()
-    if was_hist_training:
-        model_hist.train()
-    denom = max(int(stats[7].item()), 1)
-    horizon_rmse = (float(stats[5].item()) / max(float(stats[6].item()), 1.0)) ** 0.5
-    return (
-        float(stats[0].item()) / denom,
-        horizon_rmse,
-        float(stats[1].item()) / denom,
-        float(stats[2].item()) / denom,
-        float(stats[3].item()) / denom,
-        float(stats[4].item()) / denom,
-    )
+    metrics = reduce_trajectory_metrics(metrics, device)
+    summary = metrics.summary()
+    if is_main_process(rank):
+        print_trajectory_metrics(summary, f"Val epoch {epoch}", fut_model.fut_dt)
+    model_fut.train(was_fut_training)
+    model_hist.train(was_hist_training)
+    if return_summary:
+        return summary
+    full_rmse, ade, fde, horizon_rmse, theta, velocity = validation_metric_values(summary, horizon_idx)
+    return full_rmse, horizon_rmse, ade, fde, theta, velocity
 
 
 def main():
@@ -325,7 +248,7 @@ def main():
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         tensorboard_log_dir = checkpoint_dir / "log"
         tensorboard_log_dir.mkdir(parents=True, exist_ok=True)
-        log_csv_path = tensorboard_log_dir / "train_log.csv"
+        log_csv_path = tensorboard_log_dir / "train_log_bestofk.csv"
         if not log_csv_path.exists() or args.resume_fut in ("none", "", None):
             init_csv_log(log_csv_path)
         writer = SummaryWriter(log_dir=str(tensorboard_log_dir))
@@ -350,7 +273,7 @@ def main():
     )
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
+    val_sampler = DistributedEvalSampler(val_dataset, num_replicas=world_size, rank=rank)
 
     train_loader = build_distributed_loader(train_dataset, args.batch_size, args.num_workers, train_sampler, drop_last=True)
     val_loader = build_distributed_loader(val_dataset, args.batch_size, args.num_workers, val_sampler, drop_last=False)
@@ -379,8 +302,6 @@ def main():
             model_fut = DDP(model_fut, find_unused_parameters=False)
 
     mask_ratio = max(0.0, min(1.0, float(args.mask_prob)))
-    random_mask_ratio = max(0.0, min(1.0, float(args.random_mask_ratio)))
-    block_mask_start = int(args.block_mask_start) > 0
     report_horizon_s, report_horizon_idx, report_horizon_label = get_joint_report_horizon(dataset_name)
     enable_latent_bridge = int(args.enable_past_fut_latent_bridge) > 0
 
@@ -404,11 +325,9 @@ def main():
             feature_dim=args.feature_dim,
             rank=rank,
             mask_ratio=mask_ratio,
-            random_mask_ratio=random_mask_ratio,
-            block_mask_start=block_mask_start,
             enable_latent_bridge=enable_latent_bridge,
         )
-        eval_rmse, eval_horizon_rmse, eval_ade, eval_fde, eval_theta_deg, eval_v_mps = evaluate(
+        eval_summary = evaluate(
             model_fut=model_fut,
             model_hist=model_hist,
             dataloader=val_loader,
@@ -417,15 +336,16 @@ def main():
             feature_dim=args.feature_dim,
             rank=rank,
             mask_ratio=mask_ratio,
-            random_mask_ratio=random_mask_ratio,
-            block_mask_start=block_mask_start,
             horizon_idx=report_horizon_idx,
             horizon_label=report_horizon_label,
             enable_latent_bridge=enable_latent_bridge,
+            return_summary=True,
         )
+        eval_rmse, eval_ade, eval_fde, eval_horizon_rmse, eval_theta_deg, eval_v_mps = validation_metric_values(eval_summary, report_horizon_idx)
 
         if is_main_process(rank):
             current_lr_fut = float(optimizer.param_groups[0]["lr"])
+            write_horizon_metrics(checkpoint_dir / "log" / "val_metrics_per_second.csv", epoch + 1, eval_summary, model_fut.module.fut_dt if hasattr(model_fut, "module") else model_fut.fut_dt, writer=writer)
             write_csv_log(
                 log_csv_path,
                 epoch + 1,
@@ -441,10 +361,10 @@ def main():
             )
             writer.add_scalar("Loss/Train", train_stats["loss"], epoch + 1)
             writer.add_scalar("Loss/TrainFut", train_stats["loss_fut"], epoch + 1)
-            writer.add_scalar("Eval/RMSE_m", eval_rmse, epoch + 1)
+            writer.add_scalar("Eval/RMSE_full_selection_m", eval_rmse, epoch + 1)
             writer.add_scalar(f"Eval/RMSE_{report_horizon_label}", eval_horizon_rmse, epoch + 1)
-            writer.add_scalar("Eval/ADE_m", eval_ade, epoch + 1)
-            writer.add_scalar("Eval/FDE_m", eval_fde, epoch + 1)
+            writer.add_scalar("Eval/minADE_final_horizon_m", eval_ade, epoch + 1)
+            writer.add_scalar("Eval/minFDE_final_horizon_m", eval_fde, epoch + 1)
             writer.add_scalar("Eval/Theta_deg", eval_theta_deg, epoch + 1)
             writer.add_scalar("Eval/V_mps", eval_v_mps, epoch + 1)
             writer.add_scalar("LR", current_lr_fut, epoch + 1)
@@ -452,10 +372,10 @@ def main():
                 f"Epoch {epoch + 1}/{args.num_epochs} | "
                 f"train={train_stats['loss']:.6f} | "
                 f"fut={train_stats['loss_fut']:.6f} | "
-                f"rmse_m={eval_rmse:.4f} | "
+                f"rmse_full_selection_m={eval_rmse:.4f} | "
                 f"rmse_{report_horizon_label}={eval_horizon_rmse:.4f} | "
-                f"ade_m={eval_ade:.4f} | "
-                f"fde_m={eval_fde:.4f} | "
+                f"minADE_final_horizon_m={eval_ade:.4f} | "
+                f"minFDE_final_horizon_m={eval_fde:.4f} | "
                 f"theta_deg={eval_theta_deg:.4f} | "
                 f"v_mps={eval_v_mps:.4f}"
             )
@@ -474,14 +394,16 @@ def main():
                 "scheduler_state_dict": scheduler.state_dict(),
                 "loss": train_stats["loss"],
                 "loss_fut": train_stats["loss_fut"],
-                "eval_rmse_m": eval_rmse,
+                "eval_rmse_full_m": eval_rmse,
                 "eval_horizon_s": report_horizon_s,
                 "eval_horizon_rmse_m": eval_horizon_rmse,
-                "eval_ade_m": eval_ade,
-                "eval_fde_m": eval_fde,
+                "eval_min_ade_final_horizon_m": eval_ade,
+                "eval_min_fde_final_horizon_m": eval_fde,
                 "eval_theta_deg": eval_theta_deg,
                 "eval_v_mps": eval_v_mps,
                 "selection_score": selection_score,
+                "selection_metric": "rmse_full_m",
+                "eval_metrics": eval_summary,
                 "best_score": best_rmse,
                 "best_rmse_m": best_rmse,
                 "resume_hist": args.resume_hist,

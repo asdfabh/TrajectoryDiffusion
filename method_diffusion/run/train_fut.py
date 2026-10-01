@@ -14,7 +14,10 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.build import build_trajectory_dataset, get_split_path
 from method_diffusion.models.fut_model import DiffusionFut
-from method_diffusion.utils.fut_utils import compute_batch_kinematic_metrics, compute_batch_metric, select_closest_prediction
+from method_diffusion.utils.fut_utils import (
+    TrajectoryMetrics, reduce_trajectory_metrics, print_trajectory_metrics,
+    validation_metric_values, write_horizon_metrics,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
@@ -62,7 +65,8 @@ def load_checkpoint(resume_arg, checkpoint_dir, model, optimizer, scheduler, dev
         except Exception:
             pass
         start_epoch = int(state.get("epoch", 0))
-        best_rmse = float(state.get("best_rmse_m", state.get("best_score", best_rmse)))
+        best_rmse = (float(state.get("best_rmse_m", state.get("best_score", best_rmse)))
+                     if state.get("selection_metric") == "rmse_full_m" else float("inf"))
         print(f"Resumed from {ckpt_path} @ epoch {start_epoch}")
 
     return start_epoch, best_rmse
@@ -81,10 +85,10 @@ def write_csv_log(csv_path, epoch, train_stats, eval_rmse, eval_ade, eval_fde, e
         "train_kin_res_mean": train_stats["kin_res_mean"],
         "train_assign_same_rate": train_stats["assign_same_rate"],
         "train_assign_max_win_ratio": train_stats["assign_max_win_ratio"],
-        "val_rmse_m": eval_rmse,
-        "val_ade_m": eval_ade,
-        "val_fde_m": eval_fde,
-        "val_rmse_5s_m": eval_rmse_5s,
+        "val_rmse_full_selection_m": eval_rmse,
+        "val_min_ade_final_horizon_m": eval_ade,
+        "val_min_fde_final_horizon_m": eval_fde,
+        "val_rmse_final_horizon_m": eval_rmse_5s,
         "val_theta_deg": eval_theta_deg,
         "val_v_mps": eval_v_mps,
         "lr": lr,
@@ -107,10 +111,10 @@ def init_csv_log(csv_path):
         "train_kin_res_mean",
         "train_assign_same_rate",
         "train_assign_max_win_ratio",
-        "val_rmse_m",
-        "val_ade_m",
-        "val_fde_m",
-        "val_rmse_5s_m",
+        "val_rmse_full_selection_m",
+        "val_min_ade_final_horizon_m",
+        "val_min_fde_final_horizon_m",
+        "val_rmse_final_horizon_m",
         "val_theta_deg",
         "val_v_mps",
         "lr",
@@ -132,10 +136,10 @@ def write_tensorboard_log(writer, epoch, train_stats, eval_rmse, eval_ade, eval_
     writer.add_scalar("Loss/KinematicResidualMean", train_stats["kin_res_mean"], epoch)
     writer.add_scalar("Train/AssignSameRate", train_stats["assign_same_rate"], epoch)
     writer.add_scalar("Train/AssignMaxWinRatio", train_stats["assign_max_win_ratio"], epoch)
-    writer.add_scalar("Eval/RMSE_m", eval_rmse, epoch)
-    writer.add_scalar("Eval/ADE_m", eval_ade, epoch)
-    writer.add_scalar("Eval/FDE_m", eval_fde, epoch)
-    writer.add_scalar("Eval/RMSE_5s_m", eval_rmse_5s, epoch)
+    writer.add_scalar("Eval/RMSE_full_selection_m", eval_rmse, epoch)
+    writer.add_scalar("Eval/minADE_final_horizon_m", eval_ade, epoch)
+    writer.add_scalar("Eval/minFDE_final_horizon_m", eval_fde, epoch)
+    writer.add_scalar("Eval/RMSE_final_horizon_m", eval_rmse_5s, epoch)
     writer.add_scalar("Eval/Theta_deg", eval_theta_deg, epoch)
     writer.add_scalar("Eval/V_mps", eval_v_mps, epoch)
     writer.add_scalar("LR", lr, epoch)
@@ -155,10 +159,10 @@ def print_eval_summary(epoch, total_epochs, train_stats, eval_rmse, eval_ade, ev
         f"kin_res={train_stats['kin_res_mean']:.6f} | "
         f"assign_same={train_stats['assign_same_rate']:.4f} | "
         f"assign_max={train_stats['assign_max_win_ratio']:.4f} | "
-        f"rmse_m={eval_rmse:.4f} | "
-        f"ade_m={eval_ade:.4f} | "
-        f"fde_m={eval_fde:.4f} | "
-        f"rmse_5s_m={eval_rmse_5s:.4f} | "
+        f"rmse_full_selection_m={eval_rmse:.4f} | "
+        f"minADE_final_horizon_m={eval_ade:.4f} | "
+        f"minFDE_final_horizon_m={eval_fde:.4f} | "
+        f"rmse_final_horizon_m={eval_rmse_5s:.4f} | "
         f"theta_deg={eval_theta_deg:.4f} | "
         f"v_mps={eval_v_mps:.4f}"
     )
@@ -225,73 +229,27 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim):
 
 @torch.no_grad()
 # 使用完整验证集评估模型并返回平均指标。
-def evaluate(model, dataloader, device, epoch, feature_dim):
+def evaluate(model, dataloader, device, epoch, feature_dim, return_summary=False):
+    was_training = model.training
+    fut_model = model.module if hasattr(model, "module") else model
     model.eval()
-    total_rmse = 0.0
-    total_ade = 0.0
-    total_fde = 0.0
-    total_rmse_5s_se = 0.0
-    total_rmse_5s_count = 0.0
-    total_theta_deg = 0.0
-    total_v_mps = 0.0
-    num_batches = 0
-
-    if len(dataloader) == 0:
-        model.train()
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-
+    metrics = TrajectoryMetrics(fut_model.T, num_candidates=fut_model.fut_k)
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Ep{epoch} Val", dynamic_ncols=True)
     for batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(batch, feature_dim, device=device)
-        if int(model.fut_k) > 1:
-            all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, device, K=model.fut_k)
-            pred_fut, _, _ = select_closest_prediction(all_preds, fut, op_mask)
-        else:
-            all_preds = model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, device, K=1)
-            pred_fut = all_preds.squeeze(1)
-        eval_rmse, eval_ade, eval_fde = compute_batch_metric(pred_fut, fut, op_mask)
-        eval_theta_deg, eval_v_mps = compute_batch_kinematic_metrics(pred_fut, fut, op_mask)
-        rmse_5s_idx = pred_fut.size(1) - 1  # last valid future step
-        final_valid_mask = (op_mask[:, rmse_5s_idx, 0] > 0.5).float()
-        final_diff = pred_fut[:, rmse_5s_idx, :2] - fut[:, rmse_5s_idx, :2]
-        final_dist_sq = torch.sum(final_diff.square(), dim=-1)
-        total_rmse_5s_se += float((final_dist_sq * final_valid_mask).sum().item())
-        total_rmse_5s_count += float(final_valid_mask.sum().item())
-        eval_rmse = float(eval_rmse.item())
-        eval_ade = float(eval_ade.item())
-        eval_fde = float(eval_fde.item())
-        eval_theta_deg = float(eval_theta_deg.item())
-        eval_v_mps = float(eval_v_mps.item())
-
-        total_rmse += eval_rmse
-        total_ade += eval_ade
-        total_fde += eval_fde
-        total_theta_deg += eval_theta_deg
-        total_v_mps += eval_v_mps
-        num_batches += 1
+        all_preds = fut_model.forwardEvalMulti(hist, hist_nbrs, mask, temporal_mask, device, K=fut_model.fut_k)
+        metrics.update(all_preds, fut, op_mask)
+        summary = metrics.summary()
         pbar.set_postfix({
-            "avg_rmse_m": f"{(total_rmse / num_batches):.4f}",
-            "avg_ade_m": f"{(total_ade / num_batches):.4f}",
-            "avg_fde_m": f"{(total_fde / num_batches):.4f}",
-            "rmse_5s_m": f"{(total_rmse_5s_se / max(total_rmse_5s_count, 1e-6)) ** 0.5:.4f}",
-            "avg_theta_deg": f"{(total_theta_deg / num_batches):.4f}",
-            "avg_v_mps": f"{(total_v_mps / num_batches):.4f}",
+            "RMSE_full_selection": f"{summary['rmse_full_m']:.4f}",
+            "RMSE_final_horizon": f"{summary['rmse_per_step_m'][-1]:.4f}",
+            "minADE_final_horizon": f"{summary['min_ade_per_step_m'][-1]:.4f}",
+            "minFDE_final_horizon": f"{summary['min_fde_per_step_m'][-1]:.4f}",
         })
-
-    model.train()
-    if num_batches == 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-
-    denom = float(num_batches)
-    eval_rmse_5s = (total_rmse_5s_se / max(total_rmse_5s_count, 1e-6)) ** 0.5
-    return (
-        total_rmse / denom,
-        total_ade / denom,
-        total_fde / denom,
-        eval_rmse_5s,
-        total_theta_deg / denom,
-        total_v_mps / denom,
-    )
+    summary = metrics.summary()
+    print_trajectory_metrics(summary, f"Val epoch {epoch}", fut_model.fut_dt)
+    model.train(was_training)
+    return summary if return_summary else validation_metric_values(summary)
 
 
 # 初始化训练组件并执行 fut 训练主流程。
@@ -344,10 +302,12 @@ def main():
 
     for epoch in range(start_epoch, args.num_epochs):
         train_stats = train_epoch(model, train_loader, optimizer, device, epoch + 1, args.feature_dim)
-        eval_rmse, eval_ade, eval_fde, eval_rmse_5s, eval_theta_deg, eval_v_mps = evaluate(
-            model, val_loader, device, epoch + 1, args.feature_dim)
+        eval_summary = evaluate(
+            model, val_loader, device, epoch + 1, args.feature_dim, return_summary=True)
+        eval_rmse, eval_ade, eval_fde, eval_rmse_5s, eval_theta_deg, eval_v_mps = validation_metric_values(eval_summary)
         selection_score = float(eval_rmse)
         current_lr = optimizer.param_groups[0]["lr"]
+        write_horizon_metrics(checkpoint_dir / "log" / "val_metrics_per_second.csv", epoch + 1, eval_summary, model.module.fut_dt if hasattr(model, "module") else model.fut_dt, writer=writer)
         write_csv_log(log_csv_path, epoch + 1, train_stats, eval_rmse, eval_ade, eval_fde, eval_rmse_5s, eval_theta_deg, eval_v_mps, current_lr)
         write_tensorboard_log(writer, epoch + 1, train_stats, eval_rmse, eval_ade, eval_fde, eval_rmse_5s, eval_theta_deg, eval_v_mps, current_lr)
         print_eval_summary(epoch + 1, args.num_epochs, train_stats, eval_rmse, eval_ade, eval_fde, eval_rmse_5s, eval_theta_deg, eval_v_mps)
@@ -363,13 +323,15 @@ def main():
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "loss": train_stats["loss"],
-            "eval_rmse_m": eval_rmse,
-            "eval_ade_m": eval_ade,
-            "eval_fde_m": eval_fde,
-            "eval_rmse_5s_m": eval_rmse_5s,
+            "eval_rmse_full_m": eval_rmse,
+            "eval_min_ade_final_horizon_m": eval_ade,
+            "eval_min_fde_final_horizon_m": eval_fde,
+            "eval_rmse_final_horizon_m": eval_rmse_5s,
             "eval_theta_deg": eval_theta_deg,
             "eval_v_mps": eval_v_mps,
             "selection_score": selection_score,
+            "selection_metric": "rmse_full_m",
+            "eval_metrics": eval_summary,
             "best_score": best_rmse,
             "best_rmse_m": best_rmse,
         }

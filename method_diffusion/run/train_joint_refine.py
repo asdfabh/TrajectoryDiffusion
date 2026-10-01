@@ -24,7 +24,7 @@ from method_diffusion.run.train_joint import (
     resolve_fut_checkpoint,
 )
 from method_diffusion.run.train_refine import compute_refiner_loss
-from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_closest_prediction
+from method_diffusion.utils.fut_utils import TrajectoryMetrics, reduce_trajectory_metrics, print_trajectory_metrics, write_horizon_metrics
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 JOINT_REFINER_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "joint_refine"
@@ -93,8 +93,6 @@ def build_joint_proposals(args, hist_model, fut_model, batch, device, dataset_na
         model_hist=hist_model,
         hist=hist,
         mask_ratio=max(0.0, min(1.0, float(args.mask_prob))),
-        random_mask_ratio=max(0.0, min(1.0, float(args.random_mask_ratio))),
-        block_mask_start=int(args.block_mask_start) > 0,
         device=device,
         return_tokens=enable_latent_bridge,
     )
@@ -169,8 +167,8 @@ def train_epoch(args, hist_model, fut_model, refiner, dataloader, optimizer, dev
 @torch.no_grad()
 def evaluate(args, hist_model, fut_model, refiner, dataloader, device, epoch, dataset_name, enable_latent_bridge):
     refiner.eval()
-    baseline_metrics = TrajectoryMetrics(fut_model.T)
-    refined_metrics = TrajectoryMetrics(fut_model.T)
+    baseline_metrics = TrajectoryMetrics(fut_model.T, num_candidates=fut_model.fut_k)
+    refined_metrics = TrajectoryMetrics(fut_model.T, num_candidates=fut_model.fut_k)
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"JointRefine Ep{epoch} Val", dynamic_ncols=True)
 
     for batch in pbar:
@@ -183,19 +181,19 @@ def evaluate(args, hist_model, fut_model, refiner, dataloader, device, epoch, da
             dataset_name,
             enable_latent_bridge,
         )
-        pred_fut, _, _ = select_closest_prediction(all_preds, fut, op_mask)
         refined_all, _ = refiner(pred_hist, all_preds, fut_model.fut_dt)
-        refined_pred, _, _ = select_closest_prediction(refined_all, fut, op_mask)
-        baseline_metrics.update(pred_fut, fut, op_mask)
-        refined_metrics.update(refined_pred, fut, op_mask)
+        baseline_metrics.update(all_preds, fut, op_mask)
+        refined_metrics.update(refined_all, fut, op_mask)
         summary = refined_metrics.summary()
-        last_idx = refined_pred.size(1) - 1
+        last_idx = fut_model.T - 1
         pbar.set_postfix({
             "rmse": f"{summary['rmse_per_step_m'][last_idx]:.4f}",
-            "ade": f"{summary['ade_per_step_m'][last_idx]:.4f}",
-            "fde": f"{summary['fde_per_step_m'][last_idx]:.4f}",
+            "minADE": f"{summary['min_ade_per_step_m'][last_idx]:.4f}",
+            "minFDE": f"{summary['min_fde_per_step_m'][last_idx]:.4f}",
         })
 
+    print_trajectory_metrics(baseline_metrics.summary(), f"Baseline Val epoch {epoch}", fut_model.fut_dt)
+    print_trajectory_metrics(refined_metrics.summary(), f"Refined Val epoch {epoch}", fut_model.fut_dt)
     return baseline_metrics.summary(), refined_metrics.summary()
 
 
@@ -211,12 +209,14 @@ def write_csv_row(csv_path, epoch, train_stats, baseline_summary, refined_summar
         "train_kin_loss": train_stats.get("kin_loss", 0.0),
         "train_delta_norm": train_stats["delta_norm"],
         "train_gate": train_stats["gate"],
-        "baseline_rmse": baseline_summary["rmse_per_step_m"][last_idx].item(),
-        "baseline_ade": baseline_summary["ade_per_step_m"][last_idx].item(),
-        "baseline_fde": baseline_summary["fde_per_step_m"][last_idx].item(),
-        "refined_rmse": refined_summary["rmse_per_step_m"][last_idx].item(),
-        "refined_ade": refined_summary["ade_per_step_m"][last_idx].item(),
-        "refined_fde": refined_summary["fde_per_step_m"][last_idx].item(),
+        "baseline_rmse_final_horizon": baseline_summary["rmse_per_step_m"][last_idx].item(),
+        "baseline_min_ade": baseline_summary["min_ade_per_step_m"][last_idx].item(),
+        "baseline_min_fde": baseline_summary["min_fde_per_step_m"][last_idx].item(),
+        "refined_rmse_final_horizon": refined_summary["rmse_per_step_m"][last_idx].item(),
+        "refined_min_ade": refined_summary["min_ade_per_step_m"][last_idx].item(),
+        "refined_min_fde": refined_summary["min_fde_per_step_m"][last_idx].item(),
+        "baseline_rmse_full_selection_m": float(baseline_summary["rmse_full_m"]),
+        "refined_rmse_full_selection_m": float(refined_summary["rmse_full_m"]),
         "lr": lr,
     }
     write_header = not csv_path.exists()
@@ -233,7 +233,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint_dir = get_joint_refiner_checkpoint_dir(dataset_name)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = checkpoint_dir / "train_log.csv"
+    csv_path = checkpoint_dir / "train_log_bestofk.csv"
     enable_latent_bridge = int(args.enable_past_fut_latent_bridge) > 0
 
     print(f"[JointRefineTrain] Dataset: {dataset_name}")
@@ -276,17 +276,20 @@ def main():
             enable_latent_bridge,
         )
         last_idx = len(refined_summary["rmse_per_step_m"]) - 1
-        selection_score = float(refined_summary["rmse_per_step_m"][last_idx].item())
+        selection_score = float(refined_summary["rmse_full_m"].item())
         current_lr = optimizer.param_groups[0]["lr"]
         write_csv_row(csv_path, epoch, train_stats, baseline_summary, refined_summary, current_lr)
+        write_horizon_metrics(checkpoint_dir / "val_metrics_per_second.csv", epoch, baseline_summary, fut_model.fut_dt, stage="Baseline")
+        write_horizon_metrics(checkpoint_dir / "val_metrics_per_second.csv", epoch, refined_summary, fut_model.fut_dt, stage="Refined")
         print(
             f"Epoch {epoch}/{args.num_epochs} | "
             f"loss={train_stats['loss']:.6f} | "
             f"gate={train_stats['gate']:.4f} | "
+            f"rmse_full_selection_m={selection_score:.4f} | "
             f"baseline_rmse={baseline_summary['rmse_per_step_m'][last_idx].item():.4f} | "
             f"refined_rmse={refined_summary['rmse_per_step_m'][last_idx].item():.4f} | "
-            f"refined_ade={refined_summary['ade_per_step_m'][last_idx].item():.4f} | "
-            f"refined_fde={refined_summary['fde_per_step_m'][last_idx].item():.4f}"
+            f"refined_minADE={refined_summary['min_ade_per_step_m'][last_idx].item():.4f} | "
+            f"refined_minFDE={refined_summary['min_fde_per_step_m'][last_idx].item():.4f}"
         )
         scheduler.step()
 
@@ -299,6 +302,8 @@ def main():
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "best_rmse_m": best_rmse,
+            "selection_metric": "rmse_full_m",
+            "eval_rmse_full_m": selection_score,
             "refiner_type": "temporal_basis",
             "resume_hist": args.resume_hist,
             "resume_fut": args.resume_fut,

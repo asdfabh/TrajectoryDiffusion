@@ -1,16 +1,11 @@
 import torch
 
-from method_diffusion.utils.mask_util import mixed_mask
+from method_diffusion.utils.mask_util import random_mask
 
 
-def build_hist_mask(hist, mask_ratio=0.4, random_mask_ratio=0.7, block_mask_start=False):
+def build_hist_mask(hist, mask_ratio=0.4):
     """为 future / joint 工具构造历史观测掩码。"""
-    return mixed_mask(
-        hist,
-        p=mask_ratio,
-        random_ratio=random_mask_ratio,
-        block_start=block_mask_start,
-    )
+    return random_mask(hist, p=mask_ratio)
 
 
 def wrap_angle(angle):
@@ -67,12 +62,8 @@ def compute_batch_kinematic_metrics(pred, target, valid_mask=None):
 
 def select_closest_prediction(all_preds, target, valid_mask=None):
     """从多模态预测中选择整段 future RMSE 最小的轨迹。"""
-    target_xy = target[..., :2].unsqueeze(1)
-    valid_mask = normalize_traj_valid_mask(valid_mask, all_preds[:, 0]).unsqueeze(1)
-
-    diff = all_preds[..., :2] - target_xy
-    dist_sq = torch.sum(diff ** 2, dim=-1)
-    mse_k = (dist_sq * valid_mask).sum(dim=2) / (valid_mask.sum(dim=2) + 1e-6)
+    _, dist_sq, _, valid = candidate_xy_errors(all_preds, target, valid_mask)
+    mse_k = dist_sq.sum(dim=2) / valid.sum(dim=1).clamp(min=1).unsqueeze(1)
     best_idx = torch.argmin(mse_k, dim=1)
 
     bsz, _, t_len, feat_dim = all_preds.shape
@@ -81,24 +72,31 @@ def select_closest_prediction(all_preds, target, valid_mask=None):
     return best_pred, best_idx, torch.sqrt(mse_k)
 
 
+def candidate_xy_errors(pred, target, valid_mask=None):
+    """返回所有完整候选的逐点误差；无效真值不参与计算。"""
+    if pred.dim() == 3:
+        pred = pred.unsqueeze(1)
+    if pred.dim() != 4 or pred.size(1) == 0:
+        raise ValueError("Predictions must have shape [B,K,T,D] with K >= 1.")
+    valid = normalize_traj_valid_mask(valid_mask, pred[:, 0]).bool()
+    diff = pred[..., :2] - target[:, None, :, :2]
+    diff = torch.where(valid[:, None, :, None], diff, 0.0).double()
+    dist_sq = diff.square().sum(dim=-1)
+    return pred, dist_sq, dist_sq.sqrt(), valid
+
+
 def sample_xy_errors(pred, target, valid_mask=None):
-    """返回每个样本的 RMSE/ADE/FDE。"""
-    pred_xy = pred[..., :2]
-    target_xy = target[..., :2]
-    valid_mask = normalize_traj_valid_mask(valid_mask, pred_xy)
-
-    diff = pred_xy - target_xy
-    dist_sq = torch.sum(diff.square(), dim=-1)
-    dist = torch.sqrt(dist_sq)
-    valid_count = valid_mask.sum(dim=1).clamp(min=1.0)
-    rmse = torch.sqrt((dist_sq * valid_mask).sum(dim=1) / valid_count)
-    ade = (dist * valid_mask).sum(dim=1) / valid_count
-
-    valid_counts_long = valid_mask.sum(dim=1).long()
-    has_valid = valid_counts_long > 0
-    last_idx = torch.clamp(valid_counts_long - 1, min=0)
-    fde = dist.gather(1, last_idx.unsqueeze(1)).squeeze(1)
-    fde = fde * has_valid.float()
+    """逐样本返回整段最优 RMSE/ADE/FDE；三项分别选择完整候选。"""
+    _, dist_sq, dist, valid = candidate_xy_errors(pred, target, valid_mask)
+    counts = valid.sum(dim=1)
+    has_valid = counts > 0
+    denom = counts.clamp(min=1).unsqueeze(1)
+    rmse = (dist_sq.sum(dim=2) / denom).sqrt().min(dim=1).values
+    ade = (dist.sum(dim=2) / denom).min(dim=1).values
+    positions = torch.arange(valid.size(1), device=valid.device)
+    last_idx = torch.where(valid, positions, -1).max(dim=1).values.clamp(min=0)
+    endpoint = dist.gather(2, last_idx[:, None, None].expand(-1, dist.size(1), 1))
+    fde = endpoint.squeeze(2).min(dim=1).values
     return rmse, ade, fde, has_valid
 
 
@@ -169,11 +167,11 @@ def print_sample_improvement(summary, title):
         f"{summary['rmse_worse_rate']:.6f}, mean_delta={summary['mean_delta_rmse']:.8f} m"
     )
     print(
-        f"ADE  improved/worse: {summary['ade_improved_rate']:.6f} / "
+        f"minADE improved/worse: {summary['ade_improved_rate']:.6f} / "
         f"{summary['ade_worse_rate']:.6f}, mean_delta={summary['mean_delta_ade']:.8f} m"
     )
     print(
-        f"FDE  improved/worse: {summary['fde_improved_rate']:.6f} / "
+        f"minFDE improved/worse: {summary['fde_improved_rate']:.6f} / "
         f"{summary['fde_worse_rate']:.6f}, mean_delta={summary['mean_delta_fde']:.8f} m"
     )
     print("=" * 75)
@@ -211,61 +209,182 @@ def ddim_step(scheduler, pred_x0, sample, current_timestep, next_timestep):
 
 
 class TrajectoryMetrics:
-    """
-    累计逐时刻 RMSE / FDE，以及逐时刻前缀 ADE。
+    """累计整段 RMSE（checkpoint 选择）及逐时刻 RMSE/minADE@K/minFDE@K。
 
-    口径约定：
-    - RMSE/FDE: 只统计当前时刻 t
-    - ADE: 统计从起点到当前时刻 t 的前缀平均
-    - RMSE 按 TAME 口径，以点数量为分母
+    RMSE 沿用整段 RMSE 最优候选的逐时刻误差。
+    ADE 在每个 horizon 上先对每条候选计算前缀均值，再选择完整候选。
+    FDE 在每个 horizon 上按终点误差选择完整候选。绝不逐点拼接候选。
+    同一 horizon 的三项指标均只统计该时刻有有效真值的样本。
     """
 
-    def __init__(self, pred_len):
+    stat_names = (
+        "total_coord_se", "total_min_ade", "total_min_fde",
+        "total_theta_abs_deg", "total_v_abs", "total_counts",
+    )
+
+    def __init__(self, pred_len, num_candidates=1):
         self.pred_len = int(pred_len)
-        self.total_coord_se = torch.zeros(self.pred_len, dtype=torch.float64)
-        self.total_de = torch.zeros(self.pred_len, dtype=torch.float64)
-        self.total_theta_abs_deg = torch.zeros(self.pred_len, dtype=torch.float64)
-        self.total_v_abs = torch.zeros(self.pred_len, dtype=torch.float64)
-        self.total_counts = torch.zeros(self.pred_len, dtype=torch.float64)
+        self.num_candidates = int(num_candidates)
+        for name in self.stat_names:
+            setattr(self, name, torch.zeros(self.pred_len, dtype=torch.float64))
 
     @staticmethod
     def normalize_valid_mask(valid_mask, pred):
-        """将不同形状的有效位掩码统一成 `[B, T]` 浮点张量。"""
         return normalize_traj_valid_mask(valid_mask, pred)
 
+    @torch.no_grad()
     def update(self, pred, target, valid_mask=None):
-        """累积一个 batch 的逐时刻平方误差、位移误差和有效样本数。"""
-        pred = pred[:, :self.pred_len]
+        if pred.dim() == 3:
+            pred = pred.unsqueeze(1)
+        pred = pred[:, :, :self.pred_len]
         target = target[:, :self.pred_len]
-        valid_mask = self.normalize_valid_mask(valid_mask, pred)[:, :pred.size(1)]
+        if valid_mask is not None:
+            valid_mask = valid_mask[:, :self.pred_len]
+        pred, dist_sq, dist, valid = candidate_xy_errors(pred, target, valid_mask)
+        self.num_candidates = pred.size(1)
+        t_len = pred.size(2)
+        region = slice(0, t_len)
 
-        diff = pred[..., :2] - target[..., :2]
-        dist_sq = torch.sum(diff ** 2, dim=-1)
-        dist = torch.sqrt(dist_sq)
+        # 每条样本先选一条整段 RMSE 最优轨迹，逐秒 RMSE 均来自这条轨迹。
+        best_rmse_idx = dist_sq.sum(dim=2).argmin(dim=1)
+        batch_idx = torch.arange(pred.size(0), device=pred.device)
+        best_pred = pred[batch_idx, best_rmse_idx]
+        best_dist_sq = dist_sq[batch_idx, best_rmse_idx]
+        self.total_coord_se[region] += best_dist_sq.sum(dim=0).cpu()
 
-        self.total_coord_se += torch.sum(dist_sq * valid_mask, dim=0).double().cpu()
-        self.total_de += torch.sum(dist * valid_mask, dim=0).double().cpu()
+        # 先对同一条候选的完整前缀求 ADE，再在候选维选择；禁止先逐点取 min。
+        prefix_counts = valid.cumsum(dim=1).clamp(min=1)
+        ade_candidates = dist.cumsum(dim=2) / prefix_counts[:, None, :]
+        best_ade_idx = ade_candidates.argmin(dim=1, keepdim=True)
+        best_ade = ade_candidates.gather(1, best_ade_idx).squeeze(1)
+        best_fde_idx = dist.argmin(dim=1, keepdim=True)
+        best_fde = dist.gather(1, best_fde_idx).squeeze(1)
+        self.total_min_ade[region] += torch.where(valid, best_ade, 0.0).sum(dim=0).cpu()
+        self.total_min_fde[region] += torch.where(valid, best_fde, 0.0).sum(dim=0).cpu()
+        self.total_counts[region] += valid.sum(dim=0).double().cpu()
+
+        # 其他状态指标继续来自 RMSE 最优候选。
         if pred.size(-1) >= 3 and target.size(-1) >= 3:
-            theta_diff_deg = wrap_angle(pred[..., 2] - target[..., 2]).abs() * (180.0 / torch.pi)
-            self.total_theta_abs_deg += torch.sum(theta_diff_deg * valid_mask, dim=0).double().cpu()
+            theta_diff = wrap_angle(best_pred[..., 2] - target[..., 2]).abs().double()
+            self.total_theta_abs_deg[region] += torch.where(valid, theta_diff, 0.0).sum(dim=0).cpu() * (180.0 / torch.pi)
         if pred.size(-1) >= 4 and target.size(-1) >= 4:
-            v_diff = (pred[..., 3] - target[..., 3]).abs()
-            self.total_v_abs += torch.sum(v_diff * valid_mask, dim=0).double().cpu()
-        self.total_counts += torch.sum(valid_mask, dim=0).double().cpu()
+            v_diff = (best_pred[..., 3] - target[..., 3]).abs().double()
+            self.total_v_abs[region] += torch.where(valid, v_diff, 0.0).sum(dim=0).cpu()
 
     def summary(self):
-        """输出逐时刻 RMSE / FDE 与逐时刻前缀 ADE。"""
-        counts = self.total_counts.clamp(min=1.0)
-        rmse_per_step_m = torch.sqrt(self.total_coord_se / counts)
-        fde_per_step_m = self.total_de / counts
-        ade_per_step_m = torch.cumsum(self.total_de, dim=0) / torch.cumsum(self.total_counts, dim=0).clamp(min=1.0)
-        theta_mae_per_step_deg = self.total_theta_abs_deg / counts
-        v_mae_per_step_mps = self.total_v_abs / counts
-
+        # 没有该 horizon 真值时返回 NaN，避免把未评估的 horizon 显示成零误差。
+        counts = self.total_counts
+        ade = self.total_min_ade / counts
+        fde = self.total_min_fde / counts
         return {
-            "rmse_per_step_m": rmse_per_step_m,
-            "fde_per_step_m": fde_per_step_m,
-            "ade_per_step_m": ade_per_step_m,
-            "theta_mae_per_step_deg": theta_mae_per_step_deg,
-            "v_mae_per_step_mps": v_mae_per_step_mps,
+            "rmse_full_m": (self.total_coord_se.sum() / counts.sum()).sqrt(),
+            "rmse_per_step_m": (self.total_coord_se / counts).sqrt(),
+            "min_ade_per_step_m": ade,
+            "min_fde_per_step_m": fde,
+            "theta_mae_per_step_deg": self.total_theta_abs_deg / counts,
+            "v_mae_per_step_mps": self.total_v_abs / counts,
+            "valid_counts": counts.clone(),
+            "num_candidates": self.num_candidates,
         }
+
+
+def reduce_trajectory_metrics(metrics, device):
+    """DDP 合并原始累计量，合并后再开方/求均值。"""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        for name in metrics.stat_names:
+            value = getattr(metrics, name).to(device)
+            torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
+            setattr(metrics, name, value.cpu())
+    return metrics
+
+
+class DistributedEvalSampler(torch.utils.data.Sampler):
+    """验证集按 rank 分片，不补齐重复样本。"""
+
+    def __init__(self, dataset, num_replicas, rank):
+        self.dataset = dataset
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self):
+        return max(0, (len(self.dataset) - self.rank + self.num_replicas - 1) // self.num_replicas)
+
+
+def get_horizon_pairs(pred_len, dt=0.2):
+    """返回能精确对应采样时间步的逐秒 horizon。"""
+    import math
+    if dt <= 0:
+        raise ValueError("Prediction step duration must be positive.")
+    pairs = []
+    for second in range(1, int(math.floor(pred_len * dt + 1e-6)) + 1):
+        step = int(round(second / dt))
+        if step <= pred_len and math.isclose(step * dt, second, abs_tol=1e-6):
+            pairs.append((f"{second}s", step - 1))
+    return pairs
+
+
+def horizon_metric_rows(summary, dt=0.2):
+    """逐秒三项指标与 AVG；AVG 是所报告逐秒数值的算术平均。"""
+    pairs = get_horizon_pairs(len(summary["rmse_per_step_m"]), dt)
+    rows = []
+    for label, idx in pairs:
+        rows.append({
+            "horizon": label,
+            "rmse_m": float(summary["rmse_per_step_m"][idx]),
+            "min_ade_m": float(summary["min_ade_per_step_m"][idx]),
+            "min_fde_m": float(summary["min_fde_per_step_m"][idx]),
+            "valid_samples": int(summary["valid_counts"][idx]),
+        })
+    if rows:
+        avg = {"horizon": "AVG", "valid_samples": ""}
+        for key in ("rmse_m", "min_ade_m", "min_fde_m"):
+            values = [row[key] for row in rows if row["valid_samples"] > 0]
+            avg[key] = sum(values) / len(values) if values else float("nan")
+        rows.append(avg)
+    return rows
+
+
+def print_trajectory_metrics(summary, title, dt=0.2):
+    k = summary["num_candidates"]
+    print(f"\n{title} | K={k}")
+    print(f"{'Horizon':<8} | {'RMSE (m)':<12} | {f'minADE@{k} (m)':<16} | {f'minFDE@{k} (m)':<16} | Samples")
+    for row in horizon_metric_rows(summary, dt):
+        print(f"{row['horizon']:<8} | {row['rmse_m']:<12.6f} | {row['min_ade_m']:<16.6f} | {row['min_fde_m']:<16.6f} | {row['valid_samples']}")
+
+
+def write_horizon_metrics(csv_path, epoch, summary, dt=0.2, stage="Eval", writer=None):
+    """逐秒指标写入独立 CSV/TensorBoard，整段 RMSE 单独标明选择用途。"""
+    import csv
+    from pathlib import Path
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = horizon_metric_rows(summary, dt)
+    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+    fieldnames = ("epoch", "stage", "k", "horizon", "rmse_m", "min_ade_m", "min_fde_m", "valid_samples")
+    with csv_path.open("a", newline="", encoding="utf-8") as f:
+        csv_writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            csv_writer.writeheader()
+        for row in rows:
+            csv_writer.writerow({"epoch": epoch, "stage": stage, "k": summary["num_candidates"], **row})
+            if writer is not None:
+                for key, metric in (("rmse_m", "RMSE"), ("min_ade_m", "minADE"), ("min_fde_m", "minFDE")):
+                    writer.add_scalar(f"{stage}/{metric}/{row['horizon']}", row[key], epoch)
+    if writer is not None:
+        writer.add_scalar(f"{stage}/RMSE_full_selection_m", summary["rmse_full_m"], epoch)
+
+
+def validation_metric_values(summary, horizon_idx=None):
+    """兼容训练摘要的六项标量；第一项为整段 RMSE，其余为指定 horizon。"""
+    idx = len(summary["rmse_per_step_m"]) - 1 if horizon_idx is None else int(horizon_idx)
+    return (
+        float(summary["rmse_full_m"]),
+        float(summary["min_ade_per_step_m"][idx]),
+        float(summary["min_fde_per_step_m"][idx]),
+        float(summary["rmse_per_step_m"][idx]),
+        float(summary["theta_mae_per_step_deg"][idx]),
+        float(summary["v_mae_per_step_mps"][idx]),
+    )
