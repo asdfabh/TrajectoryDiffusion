@@ -313,7 +313,6 @@ def main():
 
     for epoch in range(start_epoch, args.num_epochs):
         train_sampler.set_epoch(epoch)
-        val_sampler.set_epoch(epoch)
 
         train_stats = train_epoch(
             model_fut=model_fut,
