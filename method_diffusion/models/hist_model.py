@@ -111,12 +111,23 @@ class DiffusionPast(nn.Module):
 
     def init_loss_weights(self):
         return {
-            "xy_unknown": 1.50,
-            "xy_known": 0.40,
-            "va_unknown": 1.50,
-            "va_known": 0.20,
-            "discrete_unknown": 1.00,
-            "discrete_known": 0.20,
+            "xy_unknown": 1.0,
+            "va_unknown": 0.5,
+            "discrete_unknown": 0.3,
+        }
+
+    def get_loss_config(self):
+        return {
+            "scope": "missing_timestamps_only",
+            "state_space": "normalized",
+            "weights": {"xy": self.loss_weights["xy_unknown"],
+                        "v": self.loss_weights["va_unknown"],
+                        "a": self.loss_weights["va_unknown"],
+                        "lane": self.loss_weights["discrete_unknown"],
+                        "class": self.loss_weights["discrete_unknown"]},
+            "errors": {"xy": "coordinate_mean_l1", "v": "l1",
+                       "a": "smooth_l1_beta_1", "lane": "mse", "class": "mse"},
+            "batch_reduction": "mean_of_samples_with_missing_timestamps",
         }
 
     def masked_loss_mean(self, loss_map, mask):
@@ -125,14 +136,17 @@ class DiffusionPast(nn.Module):
             mask = mask.unsqueeze(-1)
         mask = mask.expand_as(loss_map)
         numer = (loss_map * mask).sum(dim=tuple(range(1, loss_map.dim())))
-        denom = mask.sum(dim=tuple(range(1, mask.dim()))) + 1e-6
-        return (numer / denom).mean()
+        counts = mask.sum(dim=tuple(range(1, mask.dim())))
+        has_missing = counts > 0
+        sample_loss = numer / counts.clamp(min=1)
+        return (sample_loss * has_missing).sum() / has_missing.sum().clamp(min=1)
 
     def compute_motion_loss(self, pred, target, mask):
         """
         pred: [B, T, D]
         target: [B, T, D]
         mask: [B, T, 1] (1 for known/observed, 0 for unknown/masked)
+        Losses are computed on normalized states, at missing timestamps only.
         """
         known_mask = mask.view(mask.shape[0], mask.shape[1], 1).to(pred.device).float()
         unknown_mask = 1.0 - known_mask
@@ -142,49 +156,32 @@ class DiffusionPast(nn.Module):
         loss_a_map = F.smooth_l1_loss(pred[..., 3:4], target[..., 3:4], reduction="none")
 
         loss_xy_unknown = self.masked_loss_mean(loss_xy_map, unknown_mask)
-        loss_xy_known = self.masked_loss_mean(loss_xy_map, known_mask)
         loss_v_unknown = self.masked_loss_mean(loss_v_map, unknown_mask)
-        loss_v_known = self.masked_loss_mean(loss_v_map, known_mask)
         loss_a_unknown = self.masked_loss_mean(loss_a_map, unknown_mask)
-        loss_a_known = self.masked_loss_mean(loss_a_map, known_mask)
         loss_lane_unknown = pred.new_tensor(0.0)
-        loss_lane_known = pred.new_tensor(0.0)
         loss_class_unknown = pred.new_tensor(0.0)
-        loss_class_known = pred.new_tensor(0.0)
 
         if pred.size(-1) == 6:
             loss_lane_map = F.mse_loss(pred[..., 4:5], target[..., 4:5], reduction="none")
             loss_class_map = F.mse_loss(pred[..., 5:6], target[..., 5:6], reduction="none")
             loss_lane_unknown = self.masked_loss_mean(loss_lane_map, unknown_mask)
-            loss_lane_known = self.masked_loss_mean(loss_lane_map, known_mask)
             loss_class_unknown = self.masked_loss_mean(loss_class_map, unknown_mask)
-            loss_class_known = self.masked_loss_mean(loss_class_map, known_mask)
 
         total_loss = (
             self.loss_weights["xy_unknown"] * loss_xy_unknown
-            + self.loss_weights["xy_known"] * loss_xy_known
             + self.loss_weights["va_unknown"] * loss_v_unknown
-            + self.loss_weights["va_known"] * loss_v_known
             + self.loss_weights["va_unknown"] * loss_a_unknown
-            + self.loss_weights["va_known"] * loss_a_known
             + self.loss_weights["discrete_unknown"] * loss_lane_unknown
-            + self.loss_weights["discrete_known"] * loss_lane_known
             + self.loss_weights["discrete_unknown"] * loss_class_unknown
-            + self.loss_weights["discrete_known"] * loss_class_known
         )
 
         parts = {
             "loss_total": total_loss.detach(),
             "loss_xy_unknown": loss_xy_unknown.detach(),
-            "loss_xy_known": loss_xy_known.detach(),
             "loss_v_unknown": loss_v_unknown.detach(),
-            "loss_v_known": loss_v_known.detach(),
             "loss_a_unknown": loss_a_unknown.detach(),
-            "loss_a_known": loss_a_known.detach(),
             "loss_lane_unknown": loss_lane_unknown.detach(),
-            "loss_lane_known": loss_lane_known.detach(),
             "loss_class_unknown": loss_class_unknown.detach(),
-            "loss_class_known": loss_class_known.detach(),
         }
         return total_loss, parts
 

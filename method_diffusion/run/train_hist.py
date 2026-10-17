@@ -71,11 +71,8 @@ def init_csv_log(csv_path):
         "epoch",
         "train_loss",
         "train_xy_unknown",
-        "train_xy_known",
         "train_v_unknown",
-        "train_v_known",
         "train_a_unknown",
-        "train_a_known",
         "val_loss",
         "val_masked_ade_m",
         "lr",
@@ -90,11 +87,8 @@ def write_csv_log(csv_path, epoch, train_stats, eval_stats, lr):
         "epoch": epoch,
         "train_loss": train_stats["loss_total"],
         "train_xy_unknown": train_stats["loss_xy_unknown"],
-        "train_xy_known": train_stats["loss_xy_known"],
         "train_v_unknown": train_stats["loss_v_unknown"],
-        "train_v_known": train_stats["loss_v_known"],
         "train_a_unknown": train_stats["loss_a_unknown"],
-        "train_a_known": train_stats["loss_a_known"],
         "val_loss": eval_stats["loss"],
         "val_masked_ade_m": eval_stats["masked_ade_m"],
         "lr": lr,
@@ -160,11 +154,8 @@ def train_epoch(model, dataloader, optimizer, device, epoch, feature_dim, mask_r
     total_stats = {
         "loss_total": 0.0,
         "loss_xy_unknown": 0.0,
-        "loss_xy_known": 0.0,
         "loss_v_unknown": 0.0,
-        "loss_v_known": 0.0,
         "loss_a_unknown": 0.0,
-        "loss_a_known": 0.0,
     }
     num_batches = 0
 
@@ -323,11 +314,8 @@ def main():
 
         writer.add_scalar("Loss/Train", train_stats["loss_total"], epoch + 1)
         writer.add_scalar("Loss/TrainXYUnknown", train_stats["loss_xy_unknown"], epoch + 1)
-        writer.add_scalar("Loss/TrainXYKnown", train_stats["loss_xy_known"], epoch + 1)
         writer.add_scalar("Loss/TrainVUnknown", train_stats["loss_v_unknown"], epoch + 1)
-        writer.add_scalar("Loss/TrainVKnown", train_stats["loss_v_known"], epoch + 1)
         writer.add_scalar("Loss/TrainAUnknown", train_stats["loss_a_unknown"], epoch + 1)
-        writer.add_scalar("Loss/TrainAKnown", train_stats["loss_a_known"], epoch + 1)
         writer.add_scalar("Eval/Loss", eval_stats["loss"], epoch + 1)
         writer.add_scalar("Eval/MaskedADE_m", eval_stats["masked_ade_m"], epoch + 1)
 
@@ -335,11 +323,8 @@ def main():
             f"Epoch {epoch + 1}/{args.num_epochs} | "
             f"train={train_stats['loss_total']:.6f} | "
             f"xy_u={train_stats['loss_xy_unknown']:.6f} | "
-            f"xy_k={train_stats['loss_xy_known']:.6f} | "
             f"v_u={train_stats['loss_v_unknown']:.6f} | "
-            f"v_k={train_stats['loss_v_known']:.6f} | "
             f"a_u={train_stats['loss_a_unknown']:.6f} | "
-            f"a_k={train_stats['loss_a_known']:.6f} | "
             f"mask_prob={mask_ratio:.2f} | "
             f"val_loss={eval_stats['loss']:.6f} | "
             f"mask_ade={eval_stats['masked_ade_m']:.4f}m"
@@ -359,6 +344,7 @@ def main():
             "eval_loss": eval_stats["loss"],
             "eval_masked_ade": eval_stats["masked_ade_m"],
             "best_loss": best_loss,
+            "hist_loss_config": model.get_loss_config(),
             **experiment_metadata(args, history_source="masked"),
         }
 
