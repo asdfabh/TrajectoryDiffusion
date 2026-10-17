@@ -10,6 +10,8 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from method_diffusion.utils.ral_physics import configure_refiner_jerk, jerk_excess_loss, evaluation_collectors, finish_physics
+from method_diffusion.utils.experiment import ensure_training_destination, experiment_metadata, seed_run
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.build import build_trajectory_dataset, get_split_path
 from method_diffusion.models.trajectory_refiner import build_trajectory_refiner
@@ -34,6 +36,7 @@ LOSS_KEYS = [
     "kin_loss",
     "delta_norm",
     "gate",
+    "jerk_loss",
 ]
 
 
@@ -103,6 +106,8 @@ def train_epoch(args, hist_model, fut_model, refiner, dataloader, optimizer, dev
             args.fut_refiner_gate_weight,
             fut_model.fut_dt,
             fut_model.fut_std[3] if hasattr(fut_model, "fut_std") else 1.0,
+            jerk_weight=args.fut_refiner_jerk_weight,
+            jerk_threshold=getattr(args, "fut_refiner_jerk_threshold", None),
         )
 
         optimizer.zero_grad()
@@ -135,6 +140,7 @@ def evaluate(args, hist_model, fut_model, refiner, dataloader, device, epoch, da
     refiner.eval()
     baseline_metrics = TrajectoryMetrics(fut_model.T, num_candidates=fut_model.fut_k)
     refined_metrics = TrajectoryMetrics(fut_model.T, num_candidates=fut_model.fut_k)
+    physics = evaluation_collectors(args, fut_model.fut_dt, refined=True)
     refiner_model = refiner.module if hasattr(refiner, "module") else refiner
     pbar = tqdm(
         dataloader,
@@ -157,6 +163,9 @@ def evaluate(args, hist_model, fut_model, refiner, dataloader, device, epoch, da
         refined_all, _ = refiner_model(pred_hist, all_preds, fut_model.fut_dt)
         baseline_metrics.update(all_preds, fut, op_mask)
         refined_metrics.update(refined_all, fut, op_mask)
+        physics["proposal"].update(all_preds, op_mask)
+        physics["refined"].update(refined_all, op_mask)
+        physics["ground_truth"].update(fut, op_mask)
 
         if is_main_process(rank):
             summary = refined_metrics.summary()
@@ -172,14 +181,22 @@ def evaluate(args, hist_model, fut_model, refiner, dataloader, device, epoch, da
     if is_main_process(rank):
         print_trajectory_metrics(baseline_metrics.summary(), f"Baseline Val epoch {epoch}", fut_model.fut_dt)
         print_trajectory_metrics(refined_metrics.summary(), f"Refined Val epoch {epoch}", fut_model.fut_dt)
-    return baseline_metrics.summary(), refined_metrics.summary()
+    motion = finish_physics(physics, distributed=True, print_results=is_main_process(rank))
+    baseline = baseline_metrics.summary()
+    refined = refined_metrics.summary()
+    baseline["physics"] = motion["proposal"]
+    refined["physics"] = motion["refined"]
+    refined["ground_truth_physics"] = motion["ground_truth"]
+    return baseline, refined
 
 
 def main():
     rank, local_rank, world_size, device = setup_ddp()
     args = get_args_parser().parse_args()
+    seed_run(args.seed + rank)
     dataset_name = normalize_dataset_name(args.dataset)
-    checkpoint_dir = get_joint_refiner_checkpoint_dir(dataset_name)
+    checkpoint_dir = get_joint_refiner_checkpoint_dir(dataset_name, args)
+    ensure_training_destination(checkpoint_dir)
     csv_path = checkpoint_dir / "train_log_bestofk.csv"
     enable_latent_bridge = int(args.enable_past_fut_latent_bridge) > 0
 
@@ -217,6 +234,7 @@ def main():
 
         hist_model = load_frozen_hist_model_for_rank(args, dataset_name, device, rank)
         fut_model = load_frozen_joint_fut_model_for_rank(args, dataset_name, device, rank)
+        configure_refiner_jerk(args, fut_model.fut_dt)
         refiner = build_trajectory_refiner(args).to(device)
         optimizer = torch.optim.AdamW(refiner.parameters(), lr=args.fut_refiner_lr, weight_decay=1e-5)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(int(args.num_epochs), 1))
@@ -302,7 +320,8 @@ def main():
                     "resume_hist": args.resume_hist,
                     "resume_fut": args.resume_fut,
                     "enable_past_fut_latent_bridge": int(enable_latent_bridge),
-                    "args": vars(args),
+                    **experiment_metadata(args, hist_model=hist_model, fut_model=fut_model),
+                    "refiner_physics": args.refiner_physics,
                 }
                 if epoch % int(args.save_interval) == 0:
                     torch.save(state, checkpoint_dir / f"epoch_{epoch}.pth")

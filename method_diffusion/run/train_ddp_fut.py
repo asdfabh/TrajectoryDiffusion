@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from method_diffusion.utils.experiment import checkpoint_directory, ensure_training_destination, experiment_metadata, seed_run
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.build import build_trajectory_dataset, get_split_path
 from method_diffusion.models.fut_model import DiffusionFut
@@ -164,8 +165,10 @@ def evaluate(model, dataloader, device, epoch, feature_dim, rank, return_summary
 def main():
     rank, local_rank, world_size, device = setup_ddp()
     args = get_args_parser().parse_args()
+    seed_run(args.seed + rank)
     dataset_name = str(args.dataset).lower()
-    checkpoint_dir = FUT_CHECKPOINT_DIR / dataset_name
+    checkpoint_dir = checkpoint_directory(args, "fut", dataset_name)
+    ensure_training_destination(checkpoint_dir, args.resume_fut)
 
     writer = None
     log_csv_path = None
@@ -256,6 +259,7 @@ def main():
             state = {
                 "epoch": epoch + 1,
                 "model_state_dict": model_state,
+                **experiment_metadata(args, history_source="full"),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "loss": train_stats["loss"],

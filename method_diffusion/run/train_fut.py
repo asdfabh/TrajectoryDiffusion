@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from method_diffusion.utils.experiment import checkpoint_directory, ensure_training_destination, experiment_metadata, seed_run
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.build import build_trajectory_dataset, get_split_path
 from method_diffusion.models.fut_model import DiffusionFut
@@ -255,8 +256,10 @@ def evaluate(model, dataloader, device, epoch, feature_dim, return_summary=False
 # 初始化训练组件并执行 fut 训练主流程。
 def main():
     args = get_args_parser().parse_args()
+    seed_run(args.seed)
     dataset_name = str(args.dataset).lower()
-    checkpoint_dir = FUT_CHECKPOINT_DIR / dataset_name
+    checkpoint_dir = checkpoint_directory(args, "fut", dataset_name)
+    ensure_training_destination(checkpoint_dir, args.resume_fut)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     tensorboard_log_dir = checkpoint_dir / "log"
     tensorboard_log_dir.mkdir(parents=True, exist_ok=True)
@@ -320,6 +323,7 @@ def main():
         state = {
             "epoch": epoch + 1,
             "model_state_dict": model.state_dict(),
+            **experiment_metadata(args, history_source="full"),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "loss": train_stats["loss"],

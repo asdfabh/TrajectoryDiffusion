@@ -267,6 +267,21 @@ class RoundDataset(Dataset):
             neighborsdistance.append(distance)
             grid_positions.append((row, col))
 
+        # masked_scatter consumes one neighbor per occupied cell, in grid order.
+        # Keep the nearest vehicle when multiple tracks map to the same cell.
+        selected = {}
+        for index, cell in enumerate(grid_positions):
+            previous = selected.get(cell)
+            if previous is None or neighborsdistance[index][-1, 0] < neighborsdistance[previous][-1, 0]:
+                selected[cell] = index
+        order = [selected[cell] for cell in sorted(selected, key=lambda cell: cell[1] * self.grid_size[0] + cell[0])]
+        neighbors = [neighbors[index] for index in order]
+        neighborsva = [neighborsva[index] for index in order]
+        neighborslane = [neighborslane[index] for index in order]
+        neighborsclass = [neighborsclass[index] for index in order]
+        neighborsdistance = [neighborsdistance[index] for index in order]
+        grid_positions = [grid_positions[index] for index in order]
+
         lat_enc = np.zeros(3, dtype=np.float32)
         lat_class_raw = int(self.D[idx, 12])
         if lat_class_raw in (1, 4, 8):

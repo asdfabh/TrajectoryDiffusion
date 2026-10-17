@@ -11,7 +11,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from method_diffusion.models.hist_model import DiffusionPast
 from method_diffusion.dataset.build import build_hist_dataset, get_test_split_path
+from method_diffusion.utils.experiment import checkpoint_directory, experiment_metadata, record_checkpoint_source, seed_run
 from method_diffusion.config import get_args_parser
+from method_diffusion.utils.ral_physics import save_evaluation
 from method_diffusion.utils.mask_util import random_mask
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -105,6 +107,7 @@ def load_checkpoint(model, resume_arg, checkpoint_dir, device, model_name="Model
         new_state_dict[k.replace("module.", "")] = v
 
     model.load_state_dict(new_state_dict, strict=False)
+    record_checkpoint_source(model, ckpt_path, checkpoint)
     model.eval()
     return model
 
@@ -273,8 +276,9 @@ def print_metrics(summary, title, mask_ratio):
 
 def main():
     args = get_eval_args()
+    seed_run(args.seed)
     dataset_name = str(args.dataset).lower()
-    args.checkpoint_dir = str(HIST_CHECKPOINT_DIR / dataset_name)
+    args.checkpoint_dir = str(checkpoint_directory(args, "hist", dataset_name))
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -331,6 +335,8 @@ def main():
 
     final_summary = metrics.summary()
     print_metrics(final_summary, "Hist Reconstruction Result", mask_ratio)
+    save_evaluation(args.eval_output, final_summary,
+                    metadata=experiment_metadata(args, hist_model=model, history_source="masked"))
 
 
 if __name__ == '__main__':

@@ -9,6 +9,8 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from method_diffusion.utils.ral_physics import configure_refiner_jerk, jerk_excess_loss, evaluation_collectors, finish_physics
+from method_diffusion.utils.experiment import checkpoint_directory, ensure_training_destination, experiment_metadata, record_checkpoint_source, seed_run
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.build import build_trajectory_dataset, get_split_path
 from method_diffusion.models.fut_model import DiffusionFut
@@ -30,8 +32,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 JOINT_REFINER_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "joint_refine"
 
 
-def get_joint_refiner_checkpoint_dir(dataset_name):
-    return JOINT_REFINER_CHECKPOINT_DIR / normalize_dataset_name(dataset_name)
+def get_joint_refiner_checkpoint_dir(dataset_name, args=None):
+    return checkpoint_directory(args, "joint_refine", normalize_dataset_name(dataset_name)) if args is not None else JOINT_REFINER_CHECKPOINT_DIR / normalize_dataset_name(dataset_name)
 
 
 def build_loader(args, dataset_name, split, shuffle, drop_last):
@@ -51,7 +53,7 @@ def build_loader(args, dataset_name, split, shuffle, drop_last):
 
 
 def load_frozen_joint_fut_model(args, dataset_name, device):
-    checkpoint_dir = JOINT_FUT_CHECKPOINT_DIR / dataset_name
+    checkpoint_dir = checkpoint_directory(args, "joint", "fut", dataset_name)
     resume_fut = "best" if args.resume_fut in ("none", "", None) else args.resume_fut
     ckpt_path = resolve_fut_checkpoint(resume_fut, checkpoint_dir)
     if ckpt_path is None or not ckpt_path.exists():
@@ -63,6 +65,7 @@ def load_frozen_joint_fut_model(args, dataset_name, device):
     model = DiffusionFut(args).to(device)
     state = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(state["model_state_dict"], strict=False)
+    record_checkpoint_source(model, ckpt_path, state)
     model.eval()
     for param in model.parameters():
         param.requires_grad_(False)
@@ -75,7 +78,7 @@ def load_frozen_hist_model(args, dataset_name, device):
     load_hist_checkpoint(
         model,
         args.resume_hist,
-        hist_checkpoint_dirs_for_dataset(dataset_name),
+        hist_checkpoint_dirs_for_dataset(dataset_name, args),
         device,
         trainable=False,
         dataset_name=dataset_name,
@@ -119,6 +122,7 @@ def train_epoch(args, hist_model, fut_model, refiner, dataloader, optimizer, dev
         "kin_loss": 0.0,
         "delta_norm": 0.0,
         "gate": 0.0,
+        "jerk_loss": 0.0,
     }
     num_batches = 0
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"JointRefine Ep{epoch} Train", dynamic_ncols=True)
@@ -147,6 +151,8 @@ def train_epoch(args, hist_model, fut_model, refiner, dataloader, optimizer, dev
             args.fut_refiner_gate_weight,
             fut_model.fut_dt,
             fut_model.fut_std[3] if hasattr(fut_model, 'fut_std') else 1.0,
+            jerk_weight=args.fut_refiner_jerk_weight,
+            jerk_threshold=getattr(args, "fut_refiner_jerk_threshold", None),
         )
 
         optimizer.zero_grad()
@@ -169,6 +175,7 @@ def evaluate(args, hist_model, fut_model, refiner, dataloader, device, epoch, da
     refiner.eval()
     baseline_metrics = TrajectoryMetrics(fut_model.T, num_candidates=fut_model.fut_k)
     refined_metrics = TrajectoryMetrics(fut_model.T, num_candidates=fut_model.fut_k)
+    physics = evaluation_collectors(args, fut_model.fut_dt, refined=True)
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"JointRefine Ep{epoch} Val", dynamic_ncols=True)
 
     for batch in pbar:
@@ -184,6 +191,9 @@ def evaluate(args, hist_model, fut_model, refiner, dataloader, device, epoch, da
         refined_all, _ = refiner(pred_hist, all_preds, fut_model.fut_dt)
         baseline_metrics.update(all_preds, fut, op_mask)
         refined_metrics.update(refined_all, fut, op_mask)
+        physics["proposal"].update(all_preds, op_mask)
+        physics["refined"].update(refined_all, op_mask)
+        physics["ground_truth"].update(fut, op_mask)
         summary = refined_metrics.summary()
         last_idx = fut_model.T - 1
         pbar.set_postfix({
@@ -194,7 +204,13 @@ def evaluate(args, hist_model, fut_model, refiner, dataloader, device, epoch, da
 
     print_trajectory_metrics(baseline_metrics.summary(), f"Baseline Val epoch {epoch}", fut_model.fut_dt)
     print_trajectory_metrics(refined_metrics.summary(), f"Refined Val epoch {epoch}", fut_model.fut_dt)
-    return baseline_metrics.summary(), refined_metrics.summary()
+    motion = finish_physics(physics)
+    baseline = baseline_metrics.summary()
+    refined = refined_metrics.summary()
+    baseline["physics"] = motion["proposal"]
+    refined["physics"] = motion["refined"]
+    refined["ground_truth_physics"] = motion["ground_truth"]
+    return baseline, refined
 
 
 def write_csv_row(csv_path, epoch, train_stats, baseline_summary, refined_summary, lr):
@@ -207,6 +223,7 @@ def write_csv_row(csv_path, epoch, train_stats, baseline_summary, refined_summar
         "train_theta_loss": train_stats.get("theta_loss", 0.0),
         "train_v_loss": train_stats.get("v_loss", 0.0),
         "train_kin_loss": train_stats.get("kin_loss", 0.0),
+        "train_jerk_loss": train_stats.get("jerk_loss", 0.0),
         "train_delta_norm": train_stats["delta_norm"],
         "train_gate": train_stats["gate"],
         "baseline_rmse_final_horizon": baseline_summary["rmse_per_step_m"][last_idx].item(),
@@ -219,6 +236,11 @@ def write_csv_row(csv_path, epoch, train_stats, baseline_summary, refined_summar
         "refined_rmse_full_selection_m": float(refined_summary["rmse_full_m"]),
         "lr": lr,
     }
+    for prefix, summary in (("baseline", baseline_summary), ("refined", refined_summary)):
+        jerk = summary.get("physics", {}).get("jerk", {})
+        row[f"{prefix}_jerk_mean"] = jerk.get("mean")
+        row[f"{prefix}_jerk_p95"] = jerk.get("quantiles", {}).get("0.95")
+        row[f"{prefix}_jerk_er"] = jerk.get("point_violation_rate")
     write_header = not csv_path.exists()
     with csv_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))
@@ -229,9 +251,11 @@ def write_csv_row(csv_path, epoch, train_stats, baseline_summary, refined_summar
 
 def main():
     args = get_args_parser().parse_args()
+    seed_run(args.seed)
     dataset_name = normalize_dataset_name(args.dataset)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint_dir = get_joint_refiner_checkpoint_dir(dataset_name)
+    checkpoint_dir = get_joint_refiner_checkpoint_dir(dataset_name, args)
+    ensure_training_destination(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     csv_path = checkpoint_dir / "train_log_bestofk.csv"
     enable_latent_bridge = int(args.enable_past_fut_latent_bridge) > 0
@@ -245,6 +269,7 @@ def main():
 
     hist_model = load_frozen_hist_model(args, dataset_name, device)
     fut_model = load_frozen_joint_fut_model(args, dataset_name, device)
+    configure_refiner_jerk(args, fut_model.fut_dt)
     refiner = build_trajectory_refiner(args).to(device)
     print("[JointRefineTrain] Refiner: TABR-temporal-basis")
     optimizer = torch.optim.AdamW(refiner.parameters(), lr=args.fut_refiner_lr, weight_decay=1e-5)
@@ -308,7 +333,8 @@ def main():
             "resume_hist": args.resume_hist,
             "resume_fut": args.resume_fut,
             "enable_past_fut_latent_bridge": int(enable_latent_bridge),
-            "args": vars(args),
+            **experiment_metadata(args, hist_model=hist_model, fut_model=fut_model),
+            "refiner_physics": args.refiner_physics,
         }
         if epoch % int(args.save_interval) == 0:
             torch.save(state, checkpoint_dir / f"epoch_{epoch}.pth")

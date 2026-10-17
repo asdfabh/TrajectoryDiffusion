@@ -9,6 +9,8 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from method_diffusion.utils.experiment import checkpoint_directory, experiment_metadata, record_checkpoint_source, seed_run
+from method_diffusion.utils.ral_physics import evaluation_collectors, finish_physics, save_evaluation
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.build import build_trajectory_dataset, get_raw_dt, get_test_split_path, get_time_params
 from method_diffusion.models.fut_model import DiffusionFut
@@ -30,8 +32,8 @@ FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
 REFINER_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "refine"
 
 
-def get_refiner_checkpoint_dir(dataset_name):
-    return REFINER_CHECKPOINT_DIR / str(dataset_name).strip().lower()
+def get_refiner_checkpoint_dir(dataset_name, args=None):
+    return checkpoint_directory(args, "refine", str(dataset_name).strip().lower()) if args is not None else REFINER_CHECKPOINT_DIR / str(dataset_name).strip().lower()
 
 
 # 解析 fut checkpoint 标识并返回实际文件路径。
@@ -61,6 +63,7 @@ def load_checkpoint(model, resume_arg, checkpoint_dir, device):
 
     state = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(state["model_state_dict"], strict=False)
+    record_checkpoint_source(model, ckpt_path, state)
     model.eval()
     print(f"[FutEval] Loaded checkpoint: {ckpt_path}")
     return model
@@ -77,6 +80,7 @@ def load_residual_refiner(args, checkpoint_dir, device):
     refiner = build_trajectory_refiner(args).to(device)
     state = torch.load(ckpt_path, map_location=device)
     refiner.load_state_dict(state["model_state_dict"], strict=True)
+    record_checkpoint_source(refiner, ckpt_path, state)
     refiner.eval()
     print(f"[FutEval] Loaded residual refiner checkpoint: {ckpt_path}")
     print("[FutEval] Refiner: TABR-temporal-basis")
@@ -113,7 +117,7 @@ def build_test_loader(args):
 
 # 执行 TestSet 评估并打印周期性与最终指标。
 @torch.no_grad()
-def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis, fut_vis_enable_refine, dataset_name, residual_refiner):
+def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis, fut_vis_enable_refine, dataset_name, residual_refiner, physics_args=None):
     model.eval()
     baseline_metrics = TrajectoryMetrics(model.T, num_candidates=max(1, int(fut_k)))
     refined_metrics = TrajectoryMetrics(model.T, num_candidates=max(1, int(fut_k))) if residual_refiner is not None else None
@@ -122,6 +126,7 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis, fut
     fut_dt = get_raw_dt(dataset_name) * int(d_s)
     baseline_physics = PhysicalDiagnostics(fut_dt)
     refined_physics = PhysicalDiagnostics(fut_dt) if residual_refiner is not None else None
+    motion_collectors = evaluation_collectors(physics_args, fut_dt, refined=residual_refiner is not None) if physics_args is not None else None
     sample_stats = SampleImprovementStats() if residual_refiner is not None else None
     eval_name = f"Fut BestOfK@{k_samples}" if k_samples > 1 else "Fut single-mode"
     print(f"[FutEval] dt={fut_dt:.3f}s | refine={int(residual_refiner is not None)}")
@@ -167,6 +172,11 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis, fut
                 refined_all_preds, _ = residual_refiner(hist, all_preds, fut_dt)
                 refined_pred_fut = refined_all_preds[:, 0]
 
+        if motion_collectors is not None:
+            motion_collectors["proposal"].update(all_preds, op_mask)
+            motion_collectors["ground_truth"].update(fut, op_mask)
+            if residual_refiner is not None:
+                motion_collectors["refined"].update(refined_all_preds, op_mask)
         baseline_metrics.update(all_preds, fut, op_mask)
         baseline_physics.update(pred_fut, op_mask)
         if residual_refiner is not None:
@@ -190,23 +200,32 @@ def evaluate(model, dataloader, device, feature_dim, fut_k, enable_eval_vis, fut
             print_metrics(baseline_metrics.summary(), f"Baseline Test Iteration {batch_idx}", dt=fut_dt)
             if residual_refiner is not None:
                 print_metrics(refined_metrics.summary(), f"TABR-temporal-basis-refiner Test Iteration {batch_idx}", dt=fut_dt)
+    motion = finish_physics(motion_collectors) if motion_collectors is not None else {}
     baseline_final_metrics = baseline_metrics.summary()
+    baseline_final_metrics["physics"] = motion.get("proposal")
+    baseline_final_metrics["ground_truth_physics"] = motion.get("ground_truth")
     print_metrics(baseline_final_metrics, "Baseline Final Test Result", dt=fut_dt)
     print_kinematic_diagnostics(baseline_physics.summary(), "Baseline Physical Diagnostics")
     if residual_refiner is None:
+        if physics_args is not None:
+            save_evaluation(physics_args.eval_output, baseline_final_metrics, metadata=experiment_metadata(physics_args, fut_model=model, history_source="full", refiner_model=residual_refiner))
         return baseline_final_metrics
     refined_final_metrics = refined_metrics.summary()
     postprocess_title = "TABR-temporal-basis-refiner"
     print_metrics(refined_final_metrics, f"{postprocess_title} Final Test Result", dt=fut_dt)
     print_kinematic_diagnostics(refined_physics.summary(), f"{postprocess_title} Physical Diagnostics")
     print_sample_improvement(sample_stats.summary(), f"{postprocess_title} Sample Improvement")
+    refined_final_metrics["physics"] = motion.get("refined")
+    if physics_args is not None:
+        save_evaluation(physics_args.eval_output, baseline_final_metrics, refined_final_metrics, experiment_metadata(physics_args, fut_model=model, history_source="full", refiner_model=residual_refiner))
     return refined_final_metrics
 
 
 # 初始化模型、数据与 checkpoint，并执行 fut 测试评估。
 def main():
     args = get_args_parser().parse_args()
-    args.checkpoint_dir = str(FUT_CHECKPOINT_DIR / str(args.dataset).strip().lower())
+    seed_run(args.seed)
+    args.checkpoint_dir = str(checkpoint_directory(args, "fut", str(args.dataset).strip().lower()))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"[FutEval] Device: {device}")
@@ -218,9 +237,9 @@ def main():
     load_checkpoint(model, args.resume_fut, args.checkpoint_dir, device)
     residual_refiner = None
     if int(args.enable_refine) > 0:
-        residual_refiner = load_residual_refiner(args, get_refiner_checkpoint_dir(args.dataset), device)
+        residual_refiner = load_residual_refiner(args, get_refiner_checkpoint_dir(args.dataset, args), device)
     evaluate(model, test_loader, device, args.feature_dim, args.fut_k, enable_eval_vis=int(args.fut_enable_eval_vis) > 0,
-        fut_vis_enable_refine=args.fut_vis_enable_refine, dataset_name=args.dataset, residual_refiner=residual_refiner)
+        fut_vis_enable_refine=args.fut_vis_enable_refine, dataset_name=args.dataset, residual_refiner=residual_refiner, physics_args=args)
 
 if __name__ == "__main__":
     main()

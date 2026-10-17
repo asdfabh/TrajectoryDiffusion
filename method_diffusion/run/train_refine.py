@@ -10,6 +10,8 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from method_diffusion.utils.ral_physics import configure_refiner_jerk, jerk_excess_loss, evaluation_collectors, finish_physics
+from method_diffusion.utils.experiment import checkpoint_directory, ensure_training_destination, experiment_metadata, record_checkpoint_source, seed_run
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.build import build_trajectory_dataset, get_split_path
 from method_diffusion.models.fut_model import DiffusionFut
@@ -22,8 +24,8 @@ FUT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "fut"
 REFINER_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints" / "refine"
 
 
-def get_refiner_checkpoint_dir(dataset_name):
-    return REFINER_CHECKPOINT_DIR / str(dataset_name).strip().lower()
+def get_refiner_checkpoint_dir(dataset_name, args=None):
+    return checkpoint_directory(args, "refine", str(dataset_name).strip().lower()) if args is not None else REFINER_CHECKPOINT_DIR / str(dataset_name).strip().lower()
 
 
 def resolve_checkpoint_path(resume_arg, checkpoint_dir):
@@ -40,7 +42,7 @@ def resolve_checkpoint_path(resume_arg, checkpoint_dir):
 
 
 def load_frozen_fut_model(args, device):
-    checkpoint_dir = FUT_CHECKPOINT_DIR / str(args.dataset).strip().lower()
+    checkpoint_dir = checkpoint_directory(args, "fut", str(args.dataset).strip().lower())
     ckpt_path = resolve_checkpoint_path(args.resume_fut, checkpoint_dir)
     if ckpt_path is None or not ckpt_path.exists():
         raise FileNotFoundError(f"Fut checkpoint not found: resume_fut={args.resume_fut}, dir={checkpoint_dir}")
@@ -48,6 +50,7 @@ def load_frozen_fut_model(args, device):
     model = DiffusionFut(args).to(device)
     state = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(state["model_state_dict"], strict=False)
+    record_checkpoint_source(model, ckpt_path, state)
     model.eval()
     for param in model.parameters():
         param.requires_grad_(False)
@@ -84,6 +87,8 @@ def compute_refiner_loss(
     gate_weight,
     fut_dt,
     v_scale,
+    jerk_weight=0.0,
+    jerk_threshold=None,
 ):
     """计算 refiner 的全状态 loss。
 
@@ -187,9 +192,12 @@ def compute_refiner_loss(
             "kin_loss": (kin_loss * 0.0).sum().detach(),
             "delta_norm": (delta_norm * 0.0).sum().detach(),
             "gate": (gate * 0.0).sum().detach(),
+            "jerk_loss": zero_loss.detach(),
         }
 
-    return selected_loss[has_valid].mean(), {
+    base_loss = selected_loss[has_valid].mean()
+    jerk_loss = jerk_excess_loss(refined_all, valid, fut_dt, jerk_threshold) if jerk_weight > 0 else base_loss.new_zeros(())
+    return base_loss + float(jerk_weight) * jerk_loss, {
         "xy_loss": xy_loss.gather(1, best_idx.unsqueeze(1)).squeeze(1)[has_valid].mean().detach(),
         "fde_loss": final_dist.gather(1, best_idx.unsqueeze(1)).squeeze(1)[has_valid].mean().detach(),
         "theta_loss": theta_loss.gather(1, best_idx.unsqueeze(1)).squeeze(1)[has_valid].mean().detach(),
@@ -197,6 +205,7 @@ def compute_refiner_loss(
         "kin_loss": kin_loss.gather(1, best_idx.unsqueeze(1)).squeeze(1)[has_valid].mean().detach(),
         "delta_norm": delta_norm.gather(1, best_idx.unsqueeze(1)).squeeze(1)[has_valid].mean().detach(),
         "gate": gate.gather(1, best_idx.unsqueeze(1)).squeeze(1)[has_valid].mean().detach(),
+        "jerk_loss": jerk_loss.detach(),
     }
 
 
@@ -211,6 +220,7 @@ def train_epoch(args, fut_model, refiner, dataloader, optimizer, device, epoch):
         "kin_loss": 0.0,
         "delta_norm": 0.0,
         "gate": 0.0,
+        "jerk_loss": 0.0,
     }
     num_batches = 0
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Refine Ep{epoch} Train", dynamic_ncols=True)
@@ -233,6 +243,8 @@ def train_epoch(args, fut_model, refiner, dataloader, optimizer, device, epoch):
             args.fut_refiner_gate_weight,
             fut_model.fut_dt,
             fut_model.fut_std[3] if hasattr(fut_model, 'fut_std') else 1.0,
+            jerk_weight=args.fut_refiner_jerk_weight,
+            jerk_threshold=getattr(args, "fut_refiner_jerk_threshold", None),
         )
 
         optimizer.zero_grad()
@@ -255,6 +267,7 @@ def evaluate(args, fut_model, refiner, dataloader, device, epoch):
     refiner.eval()
     baseline_metrics = TrajectoryMetrics(fut_model.T, num_candidates=fut_model.fut_k)
     refined_metrics = TrajectoryMetrics(fut_model.T, num_candidates=fut_model.fut_k)
+    physics = evaluation_collectors(args, fut_model.fut_dt, refined=True)
     pbar = tqdm(dataloader, total=len(dataloader), desc=f"Refine Ep{epoch} Val", dynamic_ncols=True)
 
     for batch_idx, batch in enumerate(pbar, start=1):
@@ -263,6 +276,9 @@ def evaluate(args, fut_model, refiner, dataloader, device, epoch):
         refined_all, _ = refiner(hist, all_preds, fut_model.fut_dt)
         baseline_metrics.update(all_preds, fut, op_mask)
         refined_metrics.update(refined_all, fut, op_mask)
+        physics["proposal"].update(all_preds, op_mask)
+        physics["refined"].update(refined_all, op_mask)
+        physics["ground_truth"].update(fut, op_mask)
         summary = refined_metrics.summary()
         last_idx = fut_model.T - 1
         pbar.set_postfix({
@@ -273,7 +289,13 @@ def evaluate(args, fut_model, refiner, dataloader, device, epoch):
 
     print_trajectory_metrics(baseline_metrics.summary(), f"Baseline Val epoch {epoch}", fut_model.fut_dt)
     print_trajectory_metrics(refined_metrics.summary(), f"Refined Val epoch {epoch}", fut_model.fut_dt)
-    return baseline_metrics.summary(), refined_metrics.summary()
+    motion = finish_physics(physics)
+    baseline = baseline_metrics.summary()
+    refined = refined_metrics.summary()
+    baseline["physics"] = motion["proposal"]
+    refined["physics"] = motion["refined"]
+    refined["ground_truth_physics"] = motion["ground_truth"]
+    return baseline, refined
 
 
 def write_csv_row(csv_path, epoch, train_stats, baseline_summary, refined_summary, lr):
@@ -286,6 +308,7 @@ def write_csv_row(csv_path, epoch, train_stats, baseline_summary, refined_summar
         "train_theta_loss": train_stats.get("theta_loss", 0.0),
         "train_v_loss": train_stats.get("v_loss", 0.0),
         "train_kin_loss": train_stats.get("kin_loss", 0.0),
+        "train_jerk_loss": train_stats.get("jerk_loss", 0.0),
         "train_delta_norm": train_stats["delta_norm"],
         "train_gate": train_stats["gate"],
         "baseline_rmse_final_horizon": baseline_summary["rmse_per_step_m"][last_idx].item(),
@@ -298,6 +321,11 @@ def write_csv_row(csv_path, epoch, train_stats, baseline_summary, refined_summar
         "refined_rmse_full_selection_m": float(refined_summary["rmse_full_m"]),
         "lr": lr,
     }
+    for prefix, summary in (("baseline", baseline_summary), ("refined", refined_summary)):
+        jerk = summary.get("physics", {}).get("jerk", {})
+        row[f"{prefix}_jerk_mean"] = jerk.get("mean")
+        row[f"{prefix}_jerk_p95"] = jerk.get("quantiles", {}).get("0.95")
+        row[f"{prefix}_jerk_er"] = jerk.get("point_violation_rate")
     write_header = not csv_path.exists()
     with csv_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))
@@ -308,9 +336,11 @@ def write_csv_row(csv_path, epoch, train_stats, baseline_summary, refined_summar
 
 def main():
     args = get_args_parser().parse_args()
+    seed_run(args.seed)
     dataset_name = str(args.dataset).strip().lower()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint_dir = get_refiner_checkpoint_dir(dataset_name)
+    checkpoint_dir = get_refiner_checkpoint_dir(dataset_name, args)
+    ensure_training_destination(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     csv_path = checkpoint_dir / "train_log_bestofk.csv"
 
@@ -321,6 +351,7 @@ def main():
     val_loader = build_loader(args, dataset_name, "Val", shuffle=False, drop_last=False)
 
     fut_model = load_frozen_fut_model(args, device)
+    configure_refiner_jerk(args, fut_model.fut_dt)
     refiner = build_trajectory_refiner(args).to(device)
     print("[RefineTrain] Refiner: TABR-temporal-basis")
     optimizer = torch.optim.AdamW(refiner.parameters(), lr=args.fut_refiner_lr, weight_decay=1e-5)
@@ -360,7 +391,8 @@ def main():
             "selection_metric": "rmse_full_m",
             "eval_rmse_full_m": selection_score,
             "refiner_type": "temporal_basis",
-            "args": vars(args),
+            **experiment_metadata(args, fut_model=fut_model, history_source="full"),
+            "refiner_physics": args.refiner_physics,
         }
         if epoch % int(args.save_interval) == 0:
             torch.save(state, checkpoint_dir / f"epoch_{epoch}.pth")

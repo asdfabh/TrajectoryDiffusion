@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 from method_diffusion.utils.mask_util import random_mask
@@ -219,12 +221,15 @@ class TrajectoryMetrics:
 
     stat_names = (
         "total_coord_se", "total_min_ade", "total_min_fde",
-        "total_theta_abs_deg", "total_v_abs", "total_counts",
+        "total_theta_abs_deg", "total_v_abs", "total_counts", "total_misses",
     )
 
-    def __init__(self, pred_len, num_candidates=1):
+    def __init__(self, pred_len, num_candidates=1, miss_threshold_m=2.0):
         self.pred_len = int(pred_len)
         self.num_candidates = int(num_candidates)
+        self.miss_threshold_m = float(miss_threshold_m)
+        if not math.isfinite(self.miss_threshold_m) or self.miss_threshold_m <= 0:
+            raise ValueError("miss_threshold_m must be positive and finite")
         for name in self.stat_names:
             setattr(self, name, torch.zeros(self.pred_len, dtype=torch.float64))
 
@@ -262,6 +267,7 @@ class TrajectoryMetrics:
         self.total_min_ade[region] += torch.where(valid, best_ade, 0.0).sum(dim=0).cpu()
         self.total_min_fde[region] += torch.where(valid, best_fde, 0.0).sum(dim=0).cpu()
         self.total_counts[region] += valid.sum(dim=0).double().cpu()
+        self.total_misses[region] += ((best_fde > self.miss_threshold_m) & valid).sum(dim=0).double().cpu()
 
         # 其他状态指标继续来自 RMSE 最优候选。
         if pred.size(-1) >= 3 and target.size(-1) >= 3:
@@ -285,6 +291,8 @@ class TrajectoryMetrics:
             "v_mae_per_step_mps": self.total_v_abs / counts,
             "valid_counts": counts.clone(),
             "num_candidates": self.num_candidates,
+            "miss_rate_per_step": self.total_misses / counts,
+            "miss_threshold_m": self.miss_threshold_m,
         }
 
 
@@ -337,10 +345,11 @@ def horizon_metric_rows(summary, dt=0.2):
             "min_ade_m": float(summary["min_ade_per_step_m"][idx]),
             "min_fde_m": float(summary["min_fde_per_step_m"][idx]),
             "valid_samples": int(summary["valid_counts"][idx]),
+            "miss_rate": float(summary["miss_rate_per_step"][idx]),
         })
     if rows:
         avg = {"horizon": "AVG", "valid_samples": ""}
-        for key in ("rmse_m", "min_ade_m", "min_fde_m"):
+        for key in ("rmse_m", "min_ade_m", "min_fde_m", "miss_rate"):
             values = [row[key] for row in rows if row["valid_samples"] > 0]
             avg[key] = sum(values) / len(values) if values else float("nan")
         rows.append(avg)
@@ -350,9 +359,9 @@ def horizon_metric_rows(summary, dt=0.2):
 def print_trajectory_metrics(summary, title, dt=0.2):
     k = summary["num_candidates"]
     print(f"\n{title} | K={k}")
-    print(f"{'Horizon':<8} | {'RMSE (m)':<12} | {f'minADE@{k} (m)':<16} | {f'minFDE@{k} (m)':<16} | Samples")
+    print(f"{'Horizon':<8} | {'RMSE (m)':<12} | {f'minADE@{k} (m)':<16} | {f'minFDE@{k} (m)':<16} | MR@{k} | Samples")
     for row in horizon_metric_rows(summary, dt):
-        print(f"{row['horizon']:<8} | {row['rmse_m']:<12.6f} | {row['min_ade_m']:<16.6f} | {row['min_fde_m']:<16.6f} | {row['valid_samples']}")
+        print(f"{row['horizon']:<8} | {row['rmse_m']:<12.6f} | {row['min_ade_m']:<16.6f} | {row['min_fde_m']:<16.6f} | {row['miss_rate']:.6f} | {row['valid_samples']}")
 
 
 def write_horizon_metrics(csv_path, epoch, summary, dt=0.2, stage="Eval", writer=None):
@@ -363,7 +372,7 @@ def write_horizon_metrics(csv_path, epoch, summary, dt=0.2, stage="Eval", writer
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     rows = horizon_metric_rows(summary, dt)
     write_header = not csv_path.exists() or csv_path.stat().st_size == 0
-    fieldnames = ("epoch", "stage", "k", "horizon", "rmse_m", "min_ade_m", "min_fde_m", "valid_samples")
+    fieldnames = ("epoch", "stage", "k", "horizon", "rmse_m", "min_ade_m", "min_fde_m", "miss_rate", "valid_samples")
     with csv_path.open("a", newline="", encoding="utf-8") as f:
         csv_writer = csv.DictWriter(f, fieldnames=fieldnames)
         if write_header:
@@ -371,7 +380,7 @@ def write_horizon_metrics(csv_path, epoch, summary, dt=0.2, stage="Eval", writer
         for row in rows:
             csv_writer.writerow({"epoch": epoch, "stage": stage, "k": summary["num_candidates"], **row})
             if writer is not None:
-                for key, metric in (("rmse_m", "RMSE"), ("min_ade_m", "minADE"), ("min_fde_m", "minFDE")):
+                for key, metric in (("rmse_m", "RMSE"), ("min_ade_m", "minADE"), ("min_fde_m", "minFDE"), ("miss_rate", "MR")):
                     writer.add_scalar(f"{stage}/{metric}/{row['horizon']}", row[key], epoch)
     if writer is not None:
         writer.add_scalar(f"{stage}/RMSE_full_selection_m", summary["rmse_full_m"], epoch)

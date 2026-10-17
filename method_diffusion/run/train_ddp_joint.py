@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from method_diffusion.utils.experiment import checkpoint_directory, ensure_training_destination, experiment_metadata, seed_run
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.build import build_trajectory_dataset, get_split_path
 from method_diffusion.models.fut_model import DiffusionFut
@@ -238,8 +239,10 @@ def evaluate(
 def main():
     rank, local_rank, world_size, device = setup_ddp()
     args = get_args_parser().parse_args()
+    seed_run(args.seed + rank)
     dataset_name = normalize_dataset_name(args.dataset)
-    checkpoint_dir = JOINT_FUT_CHECKPOINT_DIR / dataset_name
+    checkpoint_dir = checkpoint_directory(args, "joint", "fut", dataset_name)
+    ensure_training_destination(checkpoint_dir, args.resume_fut)
     args.checkpoint_dir = str(checkpoint_dir)
 
     writer = None
@@ -282,7 +285,7 @@ def main():
     load_hist_checkpoint_for_rank(
         model_hist,
         args.resume_hist,
-        hist_checkpoint_dirs_for_dataset(dataset_name),
+        hist_checkpoint_dirs_for_dataset(dataset_name, args),
         device,
         rank,
         trainable=False,
@@ -387,6 +390,7 @@ def main():
 
         if is_main_process(rank):
             fut_state = {
+                **experiment_metadata(args, hist_model=model_hist),
                 "epoch": epoch + 1,
                 "model_state_dict": model_fut.module.state_dict() if hasattr(model_fut, "module") else model_fut.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),

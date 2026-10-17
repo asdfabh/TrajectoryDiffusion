@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from method_diffusion.utils.experiment import checkpoint_directory, ensure_training_destination, experiment_metadata, record_checkpoint_source, seed_run
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.build import build_trajectory_dataset, get_raw_dt, get_split_path, get_time_params
 from method_diffusion.models.fut_model import DiffusionFut
@@ -35,10 +36,10 @@ def normalize_dataset_name(dataset):
     return str(dataset).strip().lower()
 
 
-def hist_checkpoint_dirs_for_dataset(dataset_name):
+def hist_checkpoint_dirs_for_dataset(dataset_name, args=None):
     dataset_name = normalize_dataset_name(dataset_name)
     return [
-        HIST_CHECKPOINT_DIR / dataset_name,
+        checkpoint_directory(args, "hist", dataset_name) if args is not None else HIST_CHECKPOINT_DIR / dataset_name,
     ]
 
 
@@ -170,6 +171,7 @@ def load_hist_checkpoint(model, resume_arg, checkpoint_dirs, device, trainable=F
         cleaned_state[key.replace("module.", "")] = value
     model.load_state_dict(cleaned_state, strict=False)
 
+    record_checkpoint_source(model, ckpt_path, state)
     model.eval()
     for param in model.parameters():
         param.requires_grad = bool(trainable)
@@ -346,8 +348,10 @@ def evaluate(
 
 def main():
     args = get_args_parser().parse_args()
+    seed_run(args.seed)
     dataset_name = normalize_dataset_name(args.dataset)
-    checkpoint_dir = JOINT_FUT_CHECKPOINT_DIR / dataset_name
+    checkpoint_dir = checkpoint_directory(args, "joint", "fut", dataset_name)
+    ensure_training_destination(checkpoint_dir, args.resume_fut)
     args.checkpoint_dir = str(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     tensorboard_log_dir = checkpoint_dir / "log"
@@ -402,7 +406,7 @@ def main():
     load_hist_checkpoint(
         model_hist,
         args.resume_hist,
-        hist_checkpoint_dirs_for_dataset(dataset_name),
+        hist_checkpoint_dirs_for_dataset(dataset_name, args),
         device,
         trainable=False,
         dataset_name=dataset_name,
@@ -493,6 +497,7 @@ def main():
             best_rmse = selection_score
 
         fut_state = {
+            **experiment_metadata(args, hist_model=model_hist),
             "epoch": epoch + 1,
             "model_state_dict": model_fut.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),

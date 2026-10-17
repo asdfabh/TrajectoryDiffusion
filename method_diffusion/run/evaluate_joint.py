@@ -7,6 +7,8 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from method_diffusion.utils.experiment import checkpoint_directory, experiment_metadata, record_checkpoint_source, seed_run
+from method_diffusion.utils.ral_physics import evaluation_collectors, finish_physics, save_evaluation
 from method_diffusion.config import get_args_parser
 from method_diffusion.models.fut_model import DiffusionFut
 from method_diffusion.models.hist_model import DiffusionPast
@@ -38,19 +40,20 @@ def get_eval_args():
     return get_args_parser().parse_args()
 
 
-def resolve_hist_checkpoint_dir(resume_hist, dataset_name):
+def resolve_hist_checkpoint_dir(resume_hist, dataset_name, args=None):
     resume_path = Path(str(resume_hist))
     if resume_path.exists():
         return resume_path.parent
 
-    candidate = HIST_CHECKPOINT_DIR / dataset_name / "checkpoint_best.pth"
+    directory = checkpoint_directory(args, "hist", dataset_name) if args is not None else HIST_CHECKPOINT_DIR / dataset_name
+    candidate = directory / "checkpoint_best.pth"
     if candidate.exists():
         return candidate.parent
-    return HIST_CHECKPOINT_DIR / dataset_name
+    return directory
 
 
-def get_joint_refiner_checkpoint_dir(dataset_name):
-    return JOINT_REFINER_CHECKPOINT_DIR / str(dataset_name).strip().lower()
+def get_joint_refiner_checkpoint_dir(dataset_name, args=None):
+    return checkpoint_directory(args, "joint_refine", str(dataset_name).strip().lower()) if args is not None else JOINT_REFINER_CHECKPOINT_DIR / str(dataset_name).strip().lower()
 
 
 def load_joint_refiner(args, checkpoint_dir, device):
@@ -64,6 +67,7 @@ def load_joint_refiner(args, checkpoint_dir, device):
     refiner = build_trajectory_refiner(args).to(device)
     state = torch.load(ckpt_path, map_location=device)
     refiner.load_state_dict(state["model_state_dict"], strict=True)
+    record_checkpoint_source(refiner, ckpt_path, state)
     refiner.eval()
     print(f"[JointEval] Loaded joint refiner checkpoint: {ckpt_path}")
     print("[JointEval] Refiner: TABR-temporal-basis")
@@ -84,6 +88,7 @@ def evaluate(
     enable_latent_bridge=False,
     residual_refiner=None,
     fut_vis_enable_refine=0,
+    physics_args=None,
 ):
     model_hist.eval()
     model_fut.eval()
@@ -91,6 +96,7 @@ def evaluate(
     refined_metrics = TrajectoryMetrics(model_fut.T, num_candidates=max(1, int(fut_k))) if residual_refiner is not None else None
     baseline_physics = PhysicalDiagnostics(model_fut.fut_dt)
     refined_physics = PhysicalDiagnostics(model_fut.fut_dt) if residual_refiner is not None else None
+    motion_collectors = evaluation_collectors(physics_args, model_fut.fut_dt, refined=residual_refiner is not None) if physics_args is not None else None
     k_samples = max(1, int(fut_k))
     eval_name = f"Joint Fut BestOfK@{k_samples}" if k_samples > 1 else "Joint Fut single-mode"
     print(f"[JointEval] dt={model_fut.fut_dt:.3f}s | refine={int(residual_refiner is not None)}")
@@ -151,6 +157,11 @@ def evaluate(
                 dataset_name=dataset_name,
             )
 
+        if motion_collectors is not None:
+            motion_collectors["proposal"].update(all_preds, op_mask)
+            motion_collectors["ground_truth"].update(fut, op_mask)
+            if residual_refiner is not None:
+                motion_collectors["refined"].update(refined_all, op_mask)
         metrics.update(all_preds, fut, op_mask)
         baseline_physics.update(pred_fut, op_mask)
         if residual_refiner is not None:
@@ -174,23 +185,32 @@ def evaluate(
             if residual_refiner is not None:
                 print_metrics(refined_metrics.summary(), f"Joint + TABR Test Iteration {batch_idx}", dt=model_fut.fut_dt)
 
+    motion = finish_physics(motion_collectors) if motion_collectors is not None else {}
     final_metrics = metrics.summary()
+    final_metrics["physics"] = motion.get("proposal")
+    final_metrics["ground_truth_physics"] = motion.get("ground_truth")
     print_metrics(final_metrics, "Joint Final Test Result", dt=model_fut.fut_dt)
     print_kinematic_diagnostics(baseline_physics.summary(), "Joint Physical Diagnostics")
     if residual_refiner is not None:
         refined_final_metrics = refined_metrics.summary()
         print_metrics(refined_final_metrics, "Joint + TABR Final Test Result", dt=model_fut.fut_dt)
         print_kinematic_diagnostics(refined_physics.summary(), "Joint + TABR Physical Diagnostics")
+        refined_final_metrics["physics"] = motion.get("refined")
+        if physics_args is not None:
+            save_evaluation(physics_args.eval_output, final_metrics, refined_final_metrics, experiment_metadata(physics_args, hist_model=model_hist, fut_model=model_fut, refiner_model=residual_refiner))
         return refined_final_metrics
+    if physics_args is not None:
+        save_evaluation(physics_args.eval_output, final_metrics, metadata=experiment_metadata(physics_args, hist_model=model_hist, fut_model=model_fut, refiner_model=residual_refiner))
     return final_metrics
 
 
 def main():
     args = get_eval_args()
+    seed_run(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dataset_name = normalize_dataset_name(args.dataset)
-    hist_checkpoint_dir = resolve_hist_checkpoint_dir(args.resume_hist, dataset_name)
-    fut_checkpoint_dir = JOINT_FUT_CHECKPOINT_DIR / dataset_name
+    hist_checkpoint_dir = resolve_hist_checkpoint_dir(args.resume_hist, dataset_name, args)
+    fut_checkpoint_dir = checkpoint_directory(args, "joint", "fut", dataset_name)
 
     print(f"[JointEval] Device: {device}")
     print(f"[JointEval] Hist checkpoint dir: {hist_checkpoint_dir}")
@@ -207,7 +227,7 @@ def main():
     load_fut_checkpoint(model_fut, args.resume_fut, fut_checkpoint_dir, device)
     residual_refiner = None
     if int(args.enable_joint_refine) > 0:
-        residual_refiner = load_joint_refiner(args, get_joint_refiner_checkpoint_dir(args.dataset), device)
+        residual_refiner = load_joint_refiner(args, get_joint_refiner_checkpoint_dir(args.dataset, args), device)
     evaluate(
         model_hist=model_hist,
         model_fut=model_fut,
@@ -221,6 +241,7 @@ def main():
         enable_latent_bridge=int(args.enable_past_fut_latent_bridge) > 0,
         residual_refiner=residual_refiner,
         fut_vis_enable_refine=args.fut_vis_enable_refine,
+        physics_args=args,
     )
 
 

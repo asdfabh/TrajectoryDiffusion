@@ -4,7 +4,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser("Set diffusion predicter", add_help=False)
 
     # Data
-    parser.add_argument("--dataset", default="round", type=str, choices=["ngsim", "highd", "round"])
+    parser.add_argument("--dataset", default="highd", type=str, choices=["ngsim", "highd", "round"])
     parser.add_argument("--data_root_ngsim", default="/mnt/datasets/ngsimdata", type=str)
     parser.add_argument("--data_root_highd", default="/mnt/datasets/highDdata", type=str)
     parser.add_argument("--data_root_round", default="/mnt/datasets/round", type=str)
@@ -17,6 +17,7 @@ def get_args_parser():
     parser.add_argument("--save_interval", default=5, type=int)
     parser.add_argument("--mask_prob", default=0.5, type=float)
     parser.add_argument("--checkpoint_dir", default="./checkpoints", type=str)
+    parser.add_argument("--seed", default=2026, type=int)
     parser.add_argument("--resume_fut", default="none", type=str)
     parser.add_argument("--resume_hist", default="none", type=str)
     parser.add_argument("--enable_past_fut_latent_bridge", default=1, type=int)
@@ -86,6 +87,10 @@ def get_args_parser():
     parser.add_argument("--fut_refiner_theta_weight", default=0.1, type=float, help="Weight for theta loss in refiner")
     parser.add_argument("--fut_refiner_v_weight", default=0.1, type=float, help="Weight for v loss in refiner")
     parser.add_argument("--fut_refiner_kin_weight", default=0.1, type=float, help="Weight for kinematic consistency loss in refiner")
+    parser.add_argument("--fut_refiner_jerk_weight", default=0.0, type=float,
+                        help="Squared normalized jerk excess on every refined candidate; 0 preserves the original loss")
+    parser.add_argument("--eval_output", default=None, type=str,
+                        help="Optional evaluation JSON output path")
 
     # Fut visualization
     parser.add_argument("--fut_enable_eval_vis", default=0, type=int)

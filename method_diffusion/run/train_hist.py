@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from method_diffusion.utils.experiment import checkpoint_directory, ensure_training_destination, experiment_metadata, seed_run
 from method_diffusion.config import get_args_parser
 from method_diffusion.dataset.build import build_hist_dataset, get_split_path
 from method_diffusion.models.hist_model import DiffusionPast
@@ -248,8 +249,10 @@ def evaluate(model, dataloader, device, epoch, feature_dim, mask_ratio):
 
 def main():
     args = get_args_parser().parse_args()
+    seed_run(args.seed)
     dataset_name = str(args.dataset).lower()
-    args.checkpoint_dir = str(HIST_CHECKPOINT_DIR / dataset_name)
+    args.checkpoint_dir = str(checkpoint_directory(args, "hist", dataset_name))
+    ensure_training_destination(args.checkpoint_dir, args.resume_hist)
     Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
     tensorboard_log_dir = Path(args.checkpoint_dir) / "log"
@@ -356,6 +359,7 @@ def main():
             "eval_loss": eval_stats["loss"],
             "eval_masked_ade": eval_stats["masked_ade_m"],
             "best_loss": best_loss,
+            **experiment_metadata(args, history_source="masked"),
         }
 
         if (epoch + 1) % args.save_interval == 0:
