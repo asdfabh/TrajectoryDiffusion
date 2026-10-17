@@ -197,9 +197,9 @@ class PhysicalDiagnostics:
 
 
 def print_kinematic_diagnostics(summary, title):
-    print("\n" + "=" * 30 + f" {title} " + "=" * 30)
+    print("\n" + f" {title} ".center(80, "="))
     print(f"{'Metric':<24} | {'Mean':<12} | {'Max':<12} | {'Violation':<12}")
-    print("-" * 65)
+    print("-" * 80)
     rows = [
         ("acc", "acceleration"),
         ("jerk", "jerk"),
@@ -217,7 +217,7 @@ def print_kinematic_diagnostics(summary, title):
             f"{summary[f'{key}_max']:<12.6f} | "
             f"{violation_text}"
         )
-    print("-" * 65)
+    print("-" * 80)
     print(
         f"{'kin_res_dist':<24} | "
         f"{'Median':<12} | {'P90':<12} | {'P95':<12}"
@@ -238,4 +238,4 @@ def print_kinematic_diagnostics(summary, title):
         f"{summary['kin_res_violation_0p15_rate']:<12.6f} | "
         f"{summary['kin_res_violation_0p20_rate']:<12.6f}"
     )
-    print("=" * 65)
+    print("=" * 80)

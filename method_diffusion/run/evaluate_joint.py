@@ -31,6 +31,7 @@ from method_diffusion.run.train_joint import (
 )
 from method_diffusion.utils.fut_utils import TrajectoryMetrics, select_closest_prediction
 from method_diffusion.utils.trajectory_kinematics import PhysicalDiagnostics, print_kinematic_diagnostics
+from method_diffusion.utils.physics_metrics import print_motion_statistics
 from method_diffusion.utils.visualization import visualize_scene_prediction
 
 JOINT_REFINER_CHECKPOINT_DIR = Path(__file__).resolve().parent.parent.parent / "checkpoints" / "joint_refine"
@@ -101,7 +102,7 @@ def evaluate(
     eval_name = f"Joint Fut BestOfK@{k_samples}" if k_samples > 1 else "Joint Fut single-mode"
     print(f"[JointEval] dt={model_fut.fut_dt:.3f}s | refine={int(residual_refiner is not None)}")
 
-    pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc=eval_name, ncols=140)
+    pbar = tqdm(enumerate(dataloader, start=1), total=len(dataloader), desc=eval_name, ncols=80)
     for batch_idx, batch in pbar:
         hist, hist_nbrs, mask, temporal_mask, fut, op_mask = prepare_input_data(
             batch,
@@ -185,17 +186,25 @@ def evaluate(
             if residual_refiner is not None:
                 print_metrics(refined_metrics.summary(), f"Joint + TABR Test Iteration {batch_idx}", dt=model_fut.fut_dt)
 
-    motion = finish_physics(motion_collectors) if motion_collectors is not None else {}
+    motion = finish_physics(motion_collectors, print_results=False) if motion_collectors is not None else {}
     final_metrics = metrics.summary()
     final_metrics["physics"] = motion.get("proposal")
     final_metrics["ground_truth_physics"] = motion.get("ground_truth")
+    print("\n" + " Joint Evaluation Summary ".center(80, "="))
     print_metrics(final_metrics, "Joint Final Test Result", dt=model_fut.fut_dt)
+    if motion:
+        print_motion_statistics(motion["proposal"], "SG motion / proposal")
+        print_motion_statistics(motion["ground_truth"], "SG motion / ground_truth")
     print_kinematic_diagnostics(baseline_physics.summary(), "Joint Physical Diagnostics")
     if residual_refiner is not None:
         refined_final_metrics = refined_metrics.summary()
-        print_metrics(refined_final_metrics, "Joint + TABR Final Test Result", dt=model_fut.fut_dt)
-        print_kinematic_diagnostics(refined_physics.summary(), "Joint + TABR Physical Diagnostics")
         refined_final_metrics["physics"] = motion.get("refined")
+        print("\n" + " Joint + TABR Evaluation Summary ".center(80, "="))
+        print_metrics(refined_final_metrics, "Joint + TABR Final Test Result", dt=model_fut.fut_dt)
+        if motion:
+            print_motion_statistics(motion["refined"], "SG motion / refined")
+            print_motion_statistics(motion["ground_truth"], "SG motion / ground_truth")
+        print_kinematic_diagnostics(refined_physics.summary(), "Joint + TABR Physical Diagnostics")
         if physics_args is not None:
             save_evaluation(physics_args.eval_output, final_metrics, refined_final_metrics, experiment_metadata(physics_args, hist_model=model_hist, fut_model=model_fut, refiner_model=residual_refiner))
         return refined_final_metrics

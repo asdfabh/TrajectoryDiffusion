@@ -213,15 +213,11 @@ def load_physics_thresholds(path, dataset, dt, quantile=None, speed_min=MOTION_S
 
 def print_motion_statistics(summary, title):
     print(f"\n{title}: all candidate trajectories, future only")
-    print(f"{'Metric':<20}|{'Mean':>8}|{'P95':>8}|{'P98':>8}|{'P99':>8}|{'Point VR':>8}|{'Traj VR':>8}")
+    print(f"{'Metric':<20}|{'Mean':>9}|{'P95':>9}|{'P98':>9}|{'P99':>9}|{'Point VR':>9}|{'Traj VR':>9}")
     for key in PHYSICS_KEYS:
         item = summary[key]
         values = (item["mean"], *(item["quantiles"].get(str(q)) for q in (0.95, 0.98, 0.99)),
                   item["point_violation_rate"], item["trajectory_violation_rate"])
         rendered = ["-" if value is None else f"{value:.6f}" for value in values]
-        print(f"{key:<20}|" + "|".join(f"{value:>8}" for value in rendered))
-    print("Acc/Dec: sign-conditioned; zero excluded.")
-    print("Point VR denominator: all valid longitudinal points.")
-    if any(not summary[key]["quantiles_exact"] for key in PHYSICS_KEYS):
-        print("P95/P98/P99: estimated from a bounded uniform sample.")
-        print("Moments and violation counts: exact.")
+        rendered = [text if len(text) <= 9 else f"{value:.3e}" for value, text in zip(values, rendered)]
+        print(f"{key:<20}|" + "|".join(f"{value:>9}" for value in rendered))

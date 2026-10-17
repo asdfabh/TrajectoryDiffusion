@@ -359,9 +359,9 @@ def horizon_metric_rows(summary, dt=0.2):
 def print_trajectory_metrics(summary, title, dt=0.2):
     k = summary["num_candidates"]
     print(f"\n{title} | K={k}")
-    print(f"{'Horizon':<8} | {'RMSE (m)':<12} | {f'minADE@{k} (m)':<16} | {f'minFDE@{k} (m)':<16} | MR@{k} | Samples")
+    print(f"{'Horizon':<8} | {'RMSE (m)':<12} | {f'minADE@{k} (m)':<14} | {f'minFDE@{k} (m)':<14} | MR@{k}")
     for row in horizon_metric_rows(summary, dt):
-        print(f"{row['horizon']:<8} | {row['rmse_m']:<12.6f} | {row['min_ade_m']:<16.6f} | {row['min_fde_m']:<16.6f} | {row['miss_rate']:.6f} | {row['valid_samples']}")
+        print(f"{row['horizon']:<8} | {row['rmse_m']:<12.6f} | {row['min_ade_m']:<14.6f} | {row['min_fde_m']:<14.6f} | {row['miss_rate']:.6f}")
 
 
 def write_horizon_metrics(csv_path, epoch, summary, dt=0.2, stage="Eval", writer=None):
