@@ -87,10 +87,8 @@ def get_args_parser():
     parser.add_argument("--fut_refiner_theta_weight", default=0.1, type=float, help="Weight for theta loss in refiner")
     parser.add_argument("--fut_refiner_v_weight", default=0.1, type=float, help="Weight for v loss in refiner")
     parser.add_argument("--fut_refiner_kin_weight", default=0.1, type=float, help="Weight for kinematic consistency loss in refiner")
-    parser.add_argument("--fut_refiner_jerk_weight", default=0.0, type=float,
-                        help="Squared normalized jerk excess on every refined candidate; 0 preserves the original loss")
-    parser.add_argument("--eval_output", default=None, type=str,
-                        help="Optional evaluation JSON output path")
+    parser.add_argument("--fut_refiner_jerk_weight", default=0.0, type=float, help="Squared normalized jerk excess on every refined candidate; 0 preserves the original loss")
+    parser.add_argument("--eval_output", default=None, type=str, help="Optional evaluation JSON output path")
 
     # Fut visualization
     parser.add_argument("--fut_enable_eval_vis", default=0, type=int)
